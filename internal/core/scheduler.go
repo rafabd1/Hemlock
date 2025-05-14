@@ -2,11 +2,9 @@ package core
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 
@@ -24,60 +22,36 @@ type ScanTaskResult struct {
 	Error   error
 }
 
-// Scheduler manages the overall scanning process, including task distribution and concurrency.
-// It will utilize the WorkerPool from utils.concurrency and interact with DomainManager and Client.
+// Scheduler orchestrates the scanning process.
+// It manages target URLs, headers to test, concurrency, and coordinates
+// the HTTP client and processor to find vulnerabilities.
 type Scheduler struct {
-	// TODO: Add fields for DomainManager, Client, Processor, WorkerPool, logger, etc.
-	httpClient    *networking.Client
-	domainManager *networking.DomainManager
-	processor     *Processor // TODO: Define and implement Processor
-	// poisoner      *Poisoner  // TODO: Define and implement Poisoner for active attempts
-	logger        utils.Logger
-	workerPool    *utils.WorkerPool
-	appConfig     *config.Config // Full app config for access to various settings
-
-	// For managing task lifecycle and collecting results
-	ctx          context.Context
-	cancelFunc   context.CancelFunc
-	resultsChan  chan ScanTaskResult
-	shutdownOnce sync.Once
-	waitGroup    sync.WaitGroup // To wait for all submitted tasks to be processed by workers
-	headersToTest []string // Loaded headers from wordlist
+	config    *config.Config
+	client    *networking.Client
+	processor *Processor // Uses Processor from internal/core/processor.go
+	logger    utils.Logger
+	findings  []*report.Finding
+	wg        sync.WaitGroup
+	mu        sync.Mutex // For thread-safe access to findings slice
 }
 
 // NewScheduler creates a new Scheduler instance.
-func NewScheduler(appCfg *config.Config, httpClient *networking.Client, domainManager *networking.DomainManager, proc *Processor, logger utils.Logger) (*Scheduler, error) {
-	ctx, cancel := context.WithCancel(context.Background()) // Main context for the scheduler's lifetime
-
-	wp := utils.NewWorkerPool(ctx, appCfg.Workers.NumWorkers, appCfg.Workers.JobQueueSize)
-
-	headers, err := loadHeaders(appCfg.CachePoisoning.HeadersToTestFile, logger)
-	if err != nil {
-		cancel() // Cancel context if scheduler setup fails
-		wp.Shutdown() // Shutdown pool if setup fails
-		return nil, fmt.Errorf("failed to load headers wordlist: %w", err)
+func NewScheduler(cfg *config.Config, client *networking.Client, processor *Processor, logger utils.Logger) *Scheduler {
+	return &Scheduler{
+		config:    cfg,
+		client:    client,
+		processor: processor,
+		logger:    logger,
+		findings:  make([]*report.Finding, 0),
+		// wg and mu are initialized to their zero values, which is appropriate.
 	}
-	if len(headers) == 0 {
-		logger.Warnf("Headers wordlist at '%s' is empty or failed to load any headers.", appCfg.CachePoisoning.HeadersToTestFile)
-		// Continue without headers to test, or make it a fatal error based on policy
-	}
-
-	s := &Scheduler{
-		appConfig:     appCfg,
-		httpClient:    httpClient,
-		domainManager: domainManager,
-		processor:     proc,
-		logger:        logger,
-		workerPool:    wp,
-		ctx:           ctx,
-		cancelFunc:    cancel,
-		resultsChan:   make(chan ScanTaskResult, appCfg.Workers.JobQueueSize), // Buffer similar to worker pool queue
-		headersToTest: headers,
-	}
-
-	go s.collectWorkerPoolOutputs() // Start collecting results and errors from worker pool
-	return s, nil
 }
+
+// TODO: Implement StartScan() method that iterates targets and headers.
+// TODO: Implement worker goroutine logic for performing probes (baseline, A, B) using the client.
+// TODO: Implement conversion from networking.ClientResponseData to core.ProbeData.
+// TODO: Implement logic to call processor.AnalyzeProbes and collect findings.
+// TODO: Implement concurrency management using cfg.Concurrency and the WaitGroup.
 
 // loadHeaders loads headers from the specified wordlist file.
 func loadHeaders(filePath string, logger utils.Logger) ([]string, error) {
@@ -110,228 +84,146 @@ func loadHeaders(filePath string, logger utils.Logger) ([]string, error) {
 // and forwards them or handles them appropriately.
 // For now, it just logs errors from the worker pool itself (e.g., if a job func panics - though our jobs return errors).
 func (s *Scheduler) collectWorkerPoolOutputs() {
-	for {
-		select {
-		case err, ok := <-s.workerPool.Errors():
-			if !ok { // Errors channel closed
-				s.logger.Debugf("Scheduler: WorkerPool errors channel closed.")
-				// If results is also closed, or we are sure no more results will come, we can exit
-				// This needs careful handling to ensure all data is processed.
-				return // Or check other channels
-			}
-			s.logger.Errorf("Error from worker pool (job execution error): %v", err)
-			// A job itself should ideally return ScanTaskResult with its error, not error out the worker pool job func.
-			// This path is more for unexpected panics or fundamental issues in job execution.
-
-		case res, ok := <-s.workerPool.Results():
-			if !ok { // Results channel closed
-				s.logger.Debugf("Scheduler: WorkerPool results channel closed.")
-				// This goroutine can exit if the errors channel is also closed.
-				// However, the main path for scan results is via s.resultsChan, sent by tasks themselves.
-				// This channel (`s.workerPool.Results()`) is for generic results if jobs are not ScanTask.
-				return // Or check other channels
-			}
-			// This path is for generic results. Specific ScanTaskResults are sent directly by the task func.
-			s.logger.Debugf("Generic result from worker pool: %v (should be ScanTaskResult ideally)", res)
-			if scanResult, ok := res.(ScanTaskResult); ok {
-				s.resultsChan <- scanResult
-				s.waitGroup.Done() // Decrement for each task result processed
-			} else {
-				s.logger.Warnf("Received unexpected result type from worker pool: %T. Value: %v", res, res)
-				s.waitGroup.Done() // Still decrement, as a task was processed, albeit with wrong result type
-			}
-
-		case <-s.ctx.Done(): // Scheduler itself is shutting down
-			s.logger.Debugf("Scheduler: Context done, collector exiting.")
-			return
-		}
-	}
+	// Implementation needed
 }
 
 // buildBalancedWorkQueue prepares a list of URLs for processing, attempting to balance load across domains.
 func (s *Scheduler) buildBalancedWorkQueue(urls []string) []string {
-	if len(urls) <= 1 {
-		return urls
-	}
-
-	domains := make(map[string][]string)
-	for _, u := range urls {
-		domain, err := utils.GetDomainFromURL(u)
-		if err != nil {
-			s.logger.Warnf("Error parsing URL %s for domain balancing: %v", u, err)
-			continue // Skip malformed URLs for balancing
-		}
-		domains[domain] = append(domains[domain], u)
-	}
-
-	var domainKeys []string
-	for d := range domains {
-		domainKeys = append(domainKeys, d)
-	}
-	// Sort domain keys to ensure a somewhat deterministic order for round-robin, though true randomness might be better for evasion
-	sort.Strings(domainKeys)
-
-	var balancedQueue []string
-	maxLength := 0
-	for _, dUrls := range domains {
-		if len(dUrls) > maxLength {
-			maxLength = len(dUrls)
-		}
-	}
-
-	for i := 0; i < maxLength; i++ {
-		for _, domainKey := range domainKeys {
-			if i < len(domains[domainKey]) {
-				balancedQueue = append(balancedQueue, domains[domainKey][i])
-			}
-		}
-	}
-	s.logger.Debugf("Built balanced work queue with %d URLs.", len(balancedQueue))
-	return balancedQueue
+	// Implementation needed
+	return nil
 }
 
 // Helper to create ProbeData from httpClient response
 func makeProbeData(url string, reqHeaders http.Header, resp *http.Response, body []byte, err error) ProbeData {
-	pd := ProbeData{URL: url, RequestHeaders: reqHeaders, Error: err}
-	if resp != nil {
-		pd.Response = resp
-		pd.RespHeaders = resp.Header
-	}
-	pd.Body = body // Assign body even if response is nil (e.g. if error occurred before response)
-	return pd
+	// Implementation needed
+	return ProbeData{}
 }
 
 // Schedule starts the scanning process for the given URLs.
 // It returns a channel where ScanTaskResult can be received.
 func (s *Scheduler) Schedule(urls []string) <-chan ScanTaskResult {
-	s.logger.Infof("Scheduler starting with %d raw URLs and %d headers to test per URL.", len(urls), len(s.headersToTest))
-
-	// Preprocess URLs: filter ignored extensions and deduplicate
-	processedUrls := utils.PreprocessURLs(urls, s.appConfig.Input.IgnoredExtensions, true, s.logger) // stripWWW = true, as normalizeURL handles it
-
-	if len(processedUrls) == 0 {
-		s.logger.Warnf("No valid URLs to schedule after preprocessing.")
-		s.closeResultsChan() // Close immediately if nothing to do
-		return s.resultsChan
-	}
-	s.logger.Infof("%d URLs remain after preprocessing.", len(processedUrls))
-
-	balancedUrls := s.buildBalancedWorkQueue(processedUrls)
-	if len(balancedUrls) == 0 {
-		s.logger.Warnf("No valid URLs to schedule after balancing (unexpected if preprocessing yielded URLs).")
-		s.closeResultsChan()
-		return s.resultsChan
-	}
-
-	// Each URL will generate N jobs, one for each header + 1 baseline
-	// However, the waitGroup should count the number of *tasks* that produce a ScanTaskResult.
-	// Each URL scan (which includes baseline + all header probes) is one such task.
-	s.waitGroup.Add(len(balancedUrls))
-
-	go func() {
-		for _, urlStr := range balancedUrls {
-			currentURL := urlStr
-
-			job := func() (interface{}, error) { // This job now represents the entire scan for ONE URL
-				s.logger.Debugf("Worker starting comprehensive scan for URL: %s", currentURL)
-				
-				// 1. Get Baseline
-				baselineResp, baselineBody, baselineRespHeaders, bErr := s.httpClient.GetBaseline(currentURL)
-				_ = baselineRespHeaders // Mark as used for linter
-				baselineProbe := makeProbeData(currentURL, nil, baselineResp, baselineBody, bErr)
-				if bErr != nil {
-					s.logger.Warnf("Error getting baseline for %s: %v", currentURL, bErr)
-					// Return a result indicating baseline failure for this URL, then this task is done.
-					return ScanTaskResult{URL: currentURL, Error: fmt.Errorf("baseline failed for %s: %w", currentURL, bErr)}, nil
-				}
-
-				// 2. Iterate over headers wordlist
-				if len(s.headersToTest) == 0 {
-					s.logger.Debugf("No headers to test for URL: %s. Completing with baseline check only.", currentURL)
-					return ScanTaskResult{URL: currentURL, Finding: nil, Error: nil}, nil // No specific finding if no headers are tested
-				}
-
-				for _, headerName := range s.headersToTest {
-					if s.ctx.Err() != nil { // Check for scheduler shutdown before intensive work
-						s.logger.Infof("Scheduler context cancelled during header testing for %s. Aborting further tests for this URL.", currentURL)
-						return ScanTaskResult{URL: currentURL, Error: fmt.Errorf("scan aborted for %s due to scheduler shutdown", currentURL)}, nil
-					}
-
-					injectedValue := utils.GenerateUniquePayload("hemlock-" + headerName)
-					probeAReqHeaders := http.Header{headerName: []string{injectedValue}}
-					_ = probeAReqHeaders // Mark as used for linter if needed, or use directly in makeProbeData
-
-					// Probe A (with injected header)
-					probeAResp, probeABody, probeARespHeaders, paErr := s.httpClient.ProbeWithHeader(currentURL, headerName, injectedValue)
-					_ = probeARespHeaders // Mark as used for linter
-					probeAData := makeProbeData(currentURL, probeAReqHeaders, probeAResp, probeABody, paErr)
-					if paErr != nil {
-						s.logger.Warnf("Error in Probe A for %s with header %s: %v", currentURL, headerName, paErr)
-						// Continue to next header, or report this specific header probe error?
-						// For now, we log and continue. The processor will also see this error.
-					}
-
-					// Probe B (cache check, no injected header)
-					// We must ensure Probe B is made *after* Probe A has completed and its response potentially cached.
-					// The DomainManager should naturally handle delays if the same domain is hit quickly,
-					// but a small explicit delay might sometimes be useful for cache propagation, though hard to generalize.
-					// time.Sleep(50 * time.Millisecond) // Optional small delay
-					probeBResp, probeBBody, probeBRespHeaders, pbErr := s.httpClient.GetBaseline(currentURL) // Get with no custom headers
-					_ = probeBRespHeaders // Mark as used for linter
-					probeBData := makeProbeData(currentURL, nil, probeBResp, probeBBody, pbErr)
-					if pbErr != nil {
-						s.logger.Warnf("Error in Probe B (cache check) for %s after header %s: %v", currentURL, headerName, pbErr)
-					}
-
-					// Analyze with Processor
-					finding, procErr := s.processor.AnalyzeProbes(currentURL, headerName, injectedValue, baselineProbe, probeAData, probeBData)
-					if procErr != nil {
-						s.logger.Warnf("Processor error for %s with header %s: %v", currentURL, headerName, procErr)
-						// Continue to next header, this specific probe analysis failed.
-						// We don't return a ScanTaskResult here, as one will be returned at the end of the URL scan.
-					}
-					if finding != nil {
-						s.logger.Infof("Finding reported by processor for %s with header %s!", currentURL, headerName)
-						// If a finding is found, we can report it immediately for this URL and stop further header tests for this URL.
-						return ScanTaskResult{URL: currentURL, Finding: finding, Error: nil}, nil
-					}
-				} // End of header iteration
-
-				// If loop completes with no finding for any header
-				s.logger.Debugf("No specific cache poisoning findings for URL: %s after testing all headers.", currentURL)
-				return ScanTaskResult{URL: currentURL, Finding: nil, Error: nil}, nil
-			}
-
-			if err := s.workerPool.Submit(job); err != nil {
-				s.logger.Warnf("Error submitting scan task for URL %s to worker pool: %v. Skipping URL.", currentURL, err)
-				// Send an error result directly to resultsChan as the job won't run
-				s.resultsChan <- ScanTaskResult{URL: currentURL, Error: fmt.Errorf("failed to submit scan task for %s: %w", currentURL, err)}
-				s.waitGroup.Done() // Decrement as this task won't go through the normal result path
-			}
-		}
-	}()
-
-	go func() {
-		s.waitGroup.Wait()
-		s.logger.Infof("All %d URL scan tasks have been processed by workers.", len(balancedUrls)) // Log count of balanced (and thus processed) URLs
-		s.closeResultsChan()
-	}()
-
-	return s.resultsChan
+	// Implementation needed
+	return nil
 }
 
 func (s *Scheduler) closeResultsChan() {
-	s.shutdownOnce.Do(func() {
-		close(s.resultsChan)
-		s.logger.Debugf("Scheduler: Results channel closed.")
-	})
+	// Implementation needed
 }
 
 // Shutdown gracefully stops the scheduler and its worker pool.
 func (s *Scheduler) Shutdown() {
-	s.logger.Infof("Scheduler shutting down...")
-	s.cancelFunc()      // Signal all operations within scheduler to stop
-	s.workerPool.Shutdown() // Shutdown the worker pool
-	s.closeResultsChan()  // Ensure results chan is closed if not already
-	s.logger.Infof("Scheduler shutdown complete.")
-} 
+	// Implementation needed
+}
+
+// buildProbeData converts networking.ClientResponseData to core.ProbeData.
+func buildProbeData(url string, reqData networking.ClientRequestData, respData networking.ClientResponseData) ProbeData {
+	// Note: core.ProbeData is defined in processor.go
+	return ProbeData{
+		URL:            url,
+		RequestHeaders: reqData.CustomHeaders, // Assuming CustomHeaders were the ones sent for this specific probe
+		Response:       respData.Response,
+		Body:           respData.Body,
+		RespHeaders:    respData.RespHeaders,
+		Error:          respData.Error,
+	}
+}
+
+// StartScan begins the scanning process based on the scheduler's configuration.
+func (s *Scheduler) StartScan() []*report.Finding {
+	s.logger.Infof("Starting scan with %d targets and %d headers to test.", len(s.config.Targets), len(s.config.HeadersToTest))
+	s.logger.Debugf("Concurrency level set to: %d", s.config.Concurrency)
+	s.logger.Debugf("Request timeout set to: %s", s.config.RequestTimeout.String())
+
+	if len(s.config.Targets) == 0 {
+		s.logger.Warnf("No targets configured. Aborting scan.")
+		return s.findings
+	}
+	if len(s.config.HeadersToTest) == 0 {
+		s.logger.Warnf("No headers to test configured. Aborting scan.")
+		return s.findings
+	}
+
+	// Use a buffered channel as a semaphore to limit concurrency.
+	concurrencyLimit := s.config.Concurrency
+	if concurrencyLimit <= 0 {
+		concurrencyLimit = 1 // Ensure at least one worker
+	}
+	semaphore := make(chan struct{}, concurrencyLimit)
+
+	for _, targetURL := range s.config.Targets {
+		for _, headerName := range s.config.HeadersToTest {
+			s.wg.Add(1)                   // Increment WaitGroup counter
+			semaphore <- struct{}{}         // Acquire a spot in the semaphore
+
+			go func(url, header string) {
+				defer s.wg.Done()               // Decrement counter when goroutine finishes
+				defer func() { <-semaphore }() // Release the spot in the semaphore
+
+				s.logger.Debugf("Worker starting: URL=%s, Header=%s", url, header)
+
+				// 1. Baseline Request
+				baselineReqData := networking.ClientRequestData{URL: url, Method: "GET"}
+				baselineRespData := s.client.PerformRequest(baselineReqData)
+				baselineProbe := buildProbeData(url, baselineReqData, baselineRespData)
+
+				if baselineProbe.Error != nil {
+					s.logger.Warnf("Baseline request failed for URL %s: %v. Skipping probes for this header.", url, baselineProbe.Error)
+					return
+				}
+				if baselineProbe.Response == nil { // Should not happen if error is nil, but good practice
+					s.logger.Warnf("Baseline response is nil for URL %s, though no error reported. Skipping probes for this header.", url)
+					return
+				}
+
+				injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-" + header)
+
+				// 2. Probe A (with injected header)
+				probeAReqHeaders := http.Header{header: []string{injectedValue}}
+				probeAReqData := networking.ClientRequestData{URL: url, Method: "GET", CustomHeaders: probeAReqHeaders}
+				probeARespData := s.client.PerformRequest(probeAReqData)
+				probeAProbe := buildProbeData(url, probeAReqData, probeARespData)
+
+				if probeAProbe.Error != nil {
+					s.logger.Warnf("Probe A request failed for URL %s, Header %s: %v. Analysis may be incomplete.", url, header, probeAProbe.Error)
+					// We might still proceed to Probe B and analysis, as the processor handles probe errors.
+				}
+
+				// 3. Probe B (cache check - sent after Probe A)
+				// TODO: Consider a small delay here if cache propagation is a concern, though hard to generalize.
+				// time.Sleep(50 * time.Millisecond)
+				probeBReqData := networking.ClientRequestData{URL: url, Method: "GET"} // No special headers for this probe
+				probeBRespData := s.client.PerformRequest(probeBReqData)
+				probeBProbe := buildProbeData(url, probeBReqData, probeBRespData)
+
+				if probeBProbe.Error != nil {
+					s.logger.Warnf("Probe B request failed for URL %s, Header %s (after Probe A): %v. Analysis may be incomplete.", url, header, probeBProbe.Error)
+				}
+
+				// Analyze with Processor
+				s.logger.Debugf("Analyzing probes for URL: %s, Header: %s, Value: %s", url, header, injectedValue)
+				finding, err := s.processor.AnalyzeProbes(url, header, injectedValue, baselineProbe, probeAProbe, probeBProbe)
+				if err != nil {
+					s.logger.Warnf("Processor error during analysis for URL %s, Header %s: %v", url, header, err)
+				}
+
+				if finding != nil {
+					s.mu.Lock()
+					s.findings = append(s.findings, finding)
+					s.mu.Unlock()
+					s.logger.Infof("VULNERABILITY DETECTED: %s on %s with header %s (Payload: %s)", finding.Vulnerability, url, header, injectedValue)
+				}
+
+			}(targetURL, headerName)
+		}
+	}
+
+	s.wg.Wait() // Wait for all goroutines to finish
+	s.logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(s.findings))
+	return s.findings
+}
+
+// TODO: Implement StartScan() method that iterates targets and headers.
+// TODO: Implement worker goroutine logic for performing probes (baseline, A, B) using the client.
+// TODO: Implement conversion from networking.ClientResponseData to core.ProbeData.
+// TODO: Implement logic to call processor.AnalyzeProbes and collect findings.
+// TODO: Implement concurrency management using cfg.Concurrency and the WaitGroup. 

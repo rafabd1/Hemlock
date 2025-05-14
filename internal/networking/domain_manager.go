@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rafabd1/Hemlock/internal/config" // For DomainManagerConfig
+	"github.com/rafabd1/Hemlock/internal/config" // Now using the main Config struct
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
@@ -13,7 +13,7 @@ import (
 type DomainManager struct {
 	mutex        sync.RWMutex
 	domainStatus map[string]*domainInfo
-	config       config.NetworkConfig // Explicitly using config.NetworkConfig
+	config       *config.Config // Changed to use pointer to the main Config struct
 	logger       utils.Logger
 	// TODO: Add fields for default MinRequestDelay, CooldownDuration, logger, etc.
 }
@@ -28,7 +28,7 @@ type domainInfo struct {
 const maxConsecutiveFailuresToBlock = 5 // Example: block after 5 consecutive failures
 
 // NewDomainManager creates a new DomainManager.
-func NewDomainManager(cfg config.NetworkConfig, logger utils.Logger) *DomainManager { // Explicitly using config.NetworkConfig
+func NewDomainManager(cfg *config.Config, logger utils.Logger) *DomainManager { // Changed to use pointer to the main Config struct
 	return &DomainManager{
 		domainStatus: make(map[string]*domainInfo),
 		config:       cfg,

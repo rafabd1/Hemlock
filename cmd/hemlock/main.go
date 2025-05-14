@@ -2,190 +2,157 @@ package main
 
 import (
 	"flag"
-	// "context" // Removed as unused
-	// "fmt" // Removed as unused
+	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
+	"strings"
 
 	"github.com/rafabd1/Hemlock/internal/config"
 	"github.com/rafabd1/Hemlock/internal/core"
-	"github.com/rafabd1/Hemlock/internal/input"
 	"github.com/rafabd1/Hemlock/internal/networking"
 	"github.com/rafabd1/Hemlock/internal/report"
 	"github.com/rafabd1/Hemlock/internal/utils"
-	// "github.com/spf13/viper" // Placeholder for Viper integration
 )
 
+// Variables to be set by CLI flags
 var (
-	configFile = flag.String("config", "", "Path to config file (e.g., config.yaml). If empty, uses default config and environment variables.")
-	targetsFile = flag.String("targets", "", "File containing target URLs, one per line.")
-	useStdin = flag.Bool("stdin", false, "Read target URLs from stdin.")
-	outputFile = flag.String("output", "", "File to save the report (e.g., report.json). Default is stdout.")
-	outputFormat = flag.String("format", "text", "Report format (text, json, csv).")
-	logLevel = flag.String("loglevel", "info", "Log level (debug, info, warn, error, fatal).")
-	numWorkers = flag.Int("workers", 10, "Number of concurrent workers.")
+	configFile     string
+	targetsCLI     string // Comma-separated list of targets
+	targetsFileCLI string // Path to a file containing target URLs
+	outputFileCLI  string
+	outputFormatCLI string
+	verbosityCLI   string
+	concurrencyCLI int
 )
+
+func init() {
+	flag.StringVar(&configFile, "config", "", "Path to the YAML configuration file. If not provided, defaults and other CLI flags are used.")
+	flag.StringVar(&targetsCLI, "targets", "", "Comma-separated target URLs (overrides config file). E.g., http://host1,http://host2")
+	flag.StringVar(&targetsFileCLI, "targets-file", "", "Path to a file containing target URLs (one per line, overrides -targets and config file targets).")
+	flag.StringVar(&targetsFileCLI, "tf", "", "Short for -targets-file.") // Alias
+	flag.StringVar(&outputFileCLI, "output-file", "", "Output file path (overrides config file). E.g., findings.json")
+	flag.StringVar(&outputFormatCLI, "output-format", "", "Output format: json or text (overrides config file). E.g., json")
+	flag.StringVar(&verbosityCLI, "verbosity", "", "Log level: debug, info, warn, error, fatal (overrides config file). E.g., debug")
+	flag.IntVar(&concurrencyCLI, "concurrency", 0, "Number of concurrent workers (overrides config file). E.g., 20")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Hemlock Cache Scanner - Uncover Web Cache Poisoning Vulnerabilities\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -config hemlock_config.yaml\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -targets http://example.com,http://test.com -verbosity debug\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -tf /path/to/targets.txt -output-format text\n", os.Args[0])
+	}
+}
 
 func main() {
 	flag.Parse()
 
-	appConfig := loadConfig()
-	logger := utils.NewDefaultLogger(appConfig.Logging.GetLogLevel())
-
-	logger.Infof("Hemlock Cache Poisoning Detection Tool Initializing...")
-	logger.Debugf("Using User-Agent: %s", appConfig.Network.UserAgent)
-	if len(appConfig.Network.Proxies) > 0 {
-		logger.Infof("Using %d proxies.", len(appConfig.Network.Proxies))
-	}
-
-	domainManager := networking.NewDomainManager(appConfig.Network, logger)
-	logger.Debugf("DomainManager initialized with MinRequestDelay: %dms, Cooldown: %dms", appConfig.Network.MinRequestDelayMs, appConfig.Network.DomainCooldownMs)
-
-	clientConfig := networking.ClientConfig{
-		Timeout:           time.Duration(appConfig.Network.TimeoutSeconds) * time.Second,
-		MaxRetries:        appConfig.Network.MaxRetries,
-		UserAgent:         appConfig.Network.UserAgent,
-		Proxies:           appConfig.Network.Proxies,
-		InsecureSkipVerify: appConfig.Network.InsecureSkipVerify,
-	}
-	httpClient, err := networking.NewClient(clientConfig, domainManager, logger)
+	// 1. Load Configuration
+	cfg, err := config.LoadConfig(configFile) 
 	if err != nil {
-		logger.Fatalf("Error creating HTTP client: %v", err)
+		fmt.Fprintf(os.Stderr, "Error during configuration loading: %v\n", err)
+		os.Exit(1)
 	}
-	logger.Debugf("HTTP Client initialized with timeout: %s, max retries: %d", clientConfig.Timeout, clientConfig.MaxRetries)
 
-	urls, err := readTargets(appConfig, logger)
-	if err != nil {
-		logger.Fatalf("Error reading targets: %v", err)
+	// Override config with CLI flags if they were provided
+	// Note: -targets-file (targetsFileCLI) takes precedence over -targets (targetsCLI)
+	// and both override targets from the config file.
+	if targetsFileCLI != "" {
+		loggerForFileOps := utils.NewDefaultLogger(utils.LevelInfo) // Temporary logger for this operation
+		loggerForFileOps.Infof("Reading targets from file specified by -targets-file/-tf: %s", targetsFileCLI)
+		fileTargets, err := config.LoadLinesFromFile(targetsFileCLI) // Using existing helper from config pkg
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading targets from file '%s': %v\n", targetsFileCLI, err)
+			os.Exit(1)
+		}
+		cfg.Targets = fileTargets // Override completely with file targets
+	} else if targetsCLI != "" {
+		cfg.Targets = strings.Split(targetsCLI, ",")
+		for i := range cfg.Targets {
+			cfg.Targets[i] = strings.TrimSpace(cfg.Targets[i])
+		}
 	}
-	if len(urls) == 0 {
-		logger.Fatalf("No target URLs provided.")
-	}
-	logger.Infof("Loaded %d target URLs.", len(urls))
 
-	processor := core.NewProcessor(appConfig, logger)
+	if outputFileCLI != "" {
+		cfg.OutputFile = outputFileCLI
+	}
+	if outputFormatCLI != "" {
+		cfg.OutputFormat = outputFormatCLI
+	}
+	if verbosityCLI != "" {
+		cfg.Verbosity = verbosityCLI
+	}
+	if concurrencyCLI > 0 {
+		cfg.Concurrency = concurrencyCLI
+	}
+
+	// 2. Initialize Logger (after potential verbosity override from CLI)
+	logLevel := utils.StringToLogLevel(cfg.Verbosity)
+	logger := utils.NewDefaultLogger(logLevel)
+
+	logger.Infof("Hemlock Cache Scanner starting...")
+	if configFile != "" {
+		logger.Infof("Using configuration file: %s", configFile)
+	} else {
+		logger.Infof("No configuration file specified, using defaults and/or CLI arguments.")
+	}
+	logger.Debugf("Effective Configuration:")
+	logger.Debugf("  Targets: %v", cfg.Targets)
+	logger.Debugf("  HeadersToTest (count): %d", len(cfg.HeadersToTest)) 
+	// logger.Debugf("  HeadersToTest: %v", cfg.HeadersToTest) // Avoid logging potentially huge list
+	logger.Debugf("  Concurrency: %d", cfg.Concurrency)
+	logger.Debugf("  RequestTimeout: %s", cfg.RequestTimeout)
+	logger.Debugf("  OutputFile: %s", cfg.OutputFile)
+	logger.Debugf("  OutputFormat: %s", cfg.OutputFormat)
+	logger.Debugf("  Verbosity: %s (parsed as %v)", cfg.Verbosity, logLevel)
+	logger.Debugf("  UserAgent: %s", cfg.UserAgent)
+	logger.Debugf("  ProxyURL: '%s'", cfg.ProxyURL)
+	logger.Debugf("  MinRequestDelayMs: %dms", cfg.MinRequestDelayMs)
+	logger.Debugf("  DomainCooldownMs: %dms", cfg.DomainCooldownMs)
+
+
+	// Basic validation after logger is initialized and CLI overrides applied
+	if len(cfg.Targets) == 0 {
+		logger.Fatalf("No targets specified. Please provide targets via config file or CLI arguments (-targets or -targets-file).")
+	}
+
+	// 3. Initialize HTTP Client
+	httpClient, errClient := networking.NewClient(cfg.RequestTimeout, cfg.UserAgent, cfg.ProxyURL)
+	if errClient != nil {
+		logger.Fatalf("Failed to create HTTP client: %v", errClient)
+	}
+	logger.Debugf("HTTP Client initialized.") 
+
+	// 4. Initialize Processor
+	processor := core.NewProcessor(cfg, logger) 
 	logger.Debugf("Processor initialized.")
 
-	scheduler, err := core.NewScheduler(appConfig, httpClient, domainManager, processor, logger)
-	if err != nil {
-		logger.Fatalf("Error creating scheduler: %v", err)
-	}
+	// 5. Initialize Scheduler
+	scheduler := core.NewScheduler(cfg, httpClient, processor, logger)
 	logger.Debugf("Scheduler initialized.")
 
-	// Graceful shutdown handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		logger.Warnf("Interrupt signal received. Shutting down gracefully...")
-		scheduler.Shutdown() // This will also cancel the context for ongoing operations
-	}()
+	// 6. Start Scan
+	logger.Infof("Starting scan for %d target(s) with %d header(s) each...", len(cfg.Targets), len(cfg.HeadersToTest))
+	findings := scheduler.StartScan() 
 
-	defer scheduler.Shutdown() // Ensure shutdown is called on normal exit or panic
-
-	reporter := report.NewReporter() // TODO: Pass appConfig.Report and logger to NewReporter if needed
-	var findings []report.Finding
-	var errorsEncountered int
-
-	logger.Infof("Starting scan...")
-	resultsChannel := scheduler.Schedule(urls)
-
-	for result := range resultsChannel { // This loop will break when resultsChannel is closed by the scheduler
-		if result.Error != nil {
-			logger.Errorf("Error scanning URL %s: %v", result.URL, result.Error)
-			errorsEncountered++
-		}
-		if result.Finding != nil {
-			logger.Infof("Vulnerability found for URL %s: %s", result.URL, result.Finding.Vulnerability)
-			findings = append(findings, *result.Finding)
-			reporter.AddFinding(*result.Finding) // Assuming AddFinding stores or prints directly for now
-		}
-	}
-
-	logger.Infof("Scan finished. Found %d vulnerabilities. Encountered %d errors during scans.", len(findings), errorsEncountered)
-
-	if err := reporter.GenerateReport(findings, appConfig.Output.File, appConfig.Output.Format);
-	err != nil {
-		logger.Fatalf("Error generating report: %v", err)
-	}
-	logger.Infof("Report generated to %s in %s format.", appConfig.Output.File, appConfig.Output.Format)
-
-	logger.Infof("Hemlock finished.")
-}
-
-// loadConfig simulates loading configuration. Viper would replace this.
-// It prioritizes command-line flags, then config file (not yet implemented), then defaults.
-func loadConfig() *config.Config {
-	cfg := config.DefaultConfig()
-
-	// Override defaults with command-line flags where provided
-	if *logLevel != "" {
-		cfg.Logging.Level = *logLevel
-	}
-	if *outputFile != "" {
-		cfg.Output.File = *outputFile
-	}
-	if *outputFormat != "" {
-		cfg.Output.Format = *outputFormat
-	}
-	if *numWorkers > 0 {
-		cfg.Workers.NumWorkers = *numWorkers
-	}
-    if *targetsFile != "" {
-        cfg.Input.TargetsFile = *targetsFile
-        cfg.Input.Stdin = false // Explicit file overrides stdin from default
-    }
-    if *useStdin {
-        cfg.Input.Stdin = true
-        cfg.Input.TargetsFile = "" // Stdin overrides file from default
-    }
-
-	// TODO: Implement Viper loading from file (*configFile)
-	// if *configFile != "" { ... viper.SetConfigFile(*configFile) ... viper.ReadInConfig() ... viper.Unmarshal(cfg) ... }
-
-	// TODO: Viper can also automatically bind environment variables.
-
-	return cfg
-}
-
-// readTargets centralizes the logic for reading target URLs
-func readTargets(appConfig *config.Config, logger utils.Logger) ([]string, error) {
-	var urls []string
-	var err error
-	inputReader := input.NewReader()
-
-	// Priority: -stdin flag, then -targets flag, then command line args, then config file stdin, then config file targetsFile
-	if *useStdin {
-		logger.Infof("Reading target URLs from stdin...")
-		urls, err = inputReader.ReadURLsFromStdin()
-	} else if *targetsFile != "" {
-		logger.Infof("Reading target URLs from file specified by -targets flag: %s", *targetsFile)
-		urls, err = inputReader.ReadURLsFromFile(*targetsFile)
-	} else if len(flag.Args()) > 0 {
-		// If non-flag arguments are present, treat them as URLs or a single file path
-		if len(flag.Args()) == 1 {
-			// Could be a single URL or a file. Let's try as file first if it looks like one, then as URL.
-			// For simplicity now, assume if one arg, it's a file (as per previous logic)
-			fi, statErr := os.Stat(flag.Arg(0))
-			if statErr == nil && !fi.IsDir() {
-				logger.Infof("Reading target URLs from file provided as argument: %s", flag.Arg(0))
-				urls, err = inputReader.ReadURLsFromFile(flag.Arg(0))
-			} else {
-				logger.Infof("Treating command line arguments as direct URLs.")
-				urls = flag.Args() // Treat as list of URLs
+	// 7. Generate Report
+	logger.Infof("Scan finished. Generating report for %d findings...", len(findings))
+	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+	if errReport != nil {
+		logger.Errorf("Failed to generate report: %v", errReport)
+		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+			logger.Warnf("Attempting to print report to stdout as fallback...")
+			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+			if fbErr != nil {
+				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
 			}
-		} else {
-			logger.Infof("Treating command line arguments as direct URLs.")
-			urls = flag.Args()
 		}
-	} else if appConfig.Input.Stdin { // Check config if no flags/args for stdin
-		logger.Infof("Reading target URLs from stdin (as per config)...")
-		urls, err = inputReader.ReadURLsFromStdin()
-	} else if appConfig.Input.TargetsFile != "" { // Check config for file path
-		logger.Infof("Reading target URLs from file specified in config: %s", appConfig.Input.TargetsFile)
-		urls, err = inputReader.ReadURLsFromFile(appConfig.Input.TargetsFile)
+	} else {
+		logger.Infof("Report generated successfully.")
 	}
-	return urls, err
+
+	// 8. Log completion
+	logger.Infof("Hemlock Cache Scanner finished.")
 } 

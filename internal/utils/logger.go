@@ -3,6 +3,7 @@ package utils
 import (
 	"log"
 	"os"
+	"strings"
 )
 
 // Logger defines a simple interface for logging.
@@ -75,5 +76,25 @@ func (l *defaultLogger) Errorf(format string, v ...interface{}) {
 func (l *defaultLogger) Fatalf(format string, v ...interface{}) {
 	if l.logLevel <= LevelFatal {
 		l.fatalLogger.Fatalf(format, v...)
+	}
+}
+
+// StringToLogLevel converts a log level string to LogLevel type.
+// Defaults to LevelInfo if the string is unrecognized.
+func StringToLogLevel(levelStr string) LogLevel {
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		return LevelDebug
+	case "info":
+		return LevelInfo
+	case "warn", "warning":
+		return LevelWarn
+	case "error":
+		return LevelError
+	case "fatal":
+		return LevelFatal
+	default:
+		log.Printf("Unknown log level string '%s', defaulting to INFO.", levelStr)
+		return LevelInfo
 	}
 } 
