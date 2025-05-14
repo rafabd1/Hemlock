@@ -9,88 +9,122 @@ import (
 	"golang.org/x/net/html"
 )
 
-// AnalyzeBodyChanges (Fase 1) compares probeABody against a baseline URL and a relevantToken.
-// It looks for the relevantToken appearing in the hostname of resolved URLs within
-// common attributes (href, src, action, formaction) of probeABody, where this hostname
-// differs from the baselineURL's original hostname.
-// baselineMODIFIEDURL is the URL from which probeABody was fetched, used to resolve relative links.
-func AnalyzeBodyChanges(probeABody []byte, relevantToken string, baselineMODIFIEDURL string, logger Logger) (bool, string) {
-	if len(probeABody) == 0 || relevantToken == "" || baselineMODIFIEDURL == "" {
+// AnalyzeBodyChanges (Fase 2) compares probeABody against baselineBody, a relevantToken,
+// and their respective base URLs. It looks for new or modified HTML links/resources in probeABody
+// (compared to baselineBody) where the resolved URL contains the relevantToken in its hostname,
+// and this hostname differs from the original baseline host.
+func AnalyzeBodyChanges(probeABody []byte, baselineBody []byte, relevantToken string, probeAURLstring string, baselineOriginalURLstring string, logger Logger) (bool, string) {
+	if len(probeABody) == 0 || relevantToken == "" || probeAURLstring == "" || baselineOriginalURLstring == "" {
 		return false, ""
 	}
 
-	parsedBaselineURL, err := url.Parse(baselineMODIFIEDURL)
+	// It's possible baselineBody is nil if the baseline request failed but we still want to check probeA for absolute exploits.
+	// However, for a comparative analysis, baselineBody is essential.
+	// For now, this function assumes baselineBody is available for comparison.
+	// If baselineBody is empty, linksInBaseline will be empty, and any token-influenced link in probeA will be treated as "new".
+
+	parsedBaselineOriginalURL, err := url.Parse(baselineOriginalURLstring)
 	if err != nil {
-		logger.Warnf("AnalyzeBodyChanges: Failed to parse baselineMODIFIEDURL '%s': %v", baselineMODIFIEDURL, err)
+		logger.Warnf("AnalyzeBodyChanges: Failed to parse baselineOriginalURLstring '%s': %v", baselineOriginalURLstring, err)
 		return false, ""
 	}
-	originalHost := parsedBaselineURL.Hostname()
+	originalBaselineHost := parsedBaselineOriginalURL.Hostname()
 
-	doc, err := html.Parse(bytes.NewReader(probeABody))
+	linksInProbeA := ExtractHTMLLinksAndResources(probeABody, probeAURLstring, logger)
+	linksInBaseline := ExtractHTMLLinksAndResources(baselineBody, baselineOriginalURLstring, logger)
+
+	for attrValA, resolvedURLstringA := range linksInProbeA {
+		parsedURLA, err := url.Parse(resolvedURLstringA)
+		if err != nil {
+			// logger.Debugf("AnalyzeBodyChanges: Failed to parse resolved URL from Probe A '%s': %v", resolvedURLstringA, err)
+			continue
+		}
+		hostA := parsedURLA.Hostname()
+
+		if hostA != "" && strings.Contains(hostA, relevantToken) && hostA != originalBaselineHost {
+			resolvedURLstringBaseline, existsInBaseline := linksInBaseline[attrValA]
+
+			var description string
+			found := false
+
+			if !existsInBaseline {
+				description = fmt.Sprintf("New HTML resource attribute '%s' (resolves to '%s' with hostname '%s' containing token '%s') found in Probe A. Original baseline host: '%s'.",
+					attrValA, resolvedURLstringA, hostA, relevantToken, originalBaselineHost)
+				found = true
+			} else if resolvedURLstringA != resolvedURLstringBaseline {
+				description = fmt.Sprintf("HTML resource attribute '%s' changed from '%s' in baseline to '%s' (with hostname '%s' containing token '%s') in Probe A. Original baseline host: '%s'.",
+					attrValA, resolvedURLstringBaseline, resolvedURLstringA, hostA, relevantToken, originalBaselineHost)
+				found = true
+			}
+
+			if found {
+				logger.Infof("AnalyzeBodyChanges: %s", description)
+				return true, description
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// ExtractHTMLLinksAndResources parses an HTML body, extracts URLs from common attributes
+// (href, src, action, formaction), and resolves them against a given baseURLstring.
+// It returns a map where the key is the original attribute value and the value is the
+// resolved absolute URL string.
+func ExtractHTMLLinksAndResources(body []byte, baseURLstring string, logger Logger) map[string]string {
+	result := make(map[string]string)
+	if len(body) == 0 || baseURLstring == "" {
+		return result
+	}
+
+	parsedBaseURL, err := url.Parse(baseURLstring)
 	if err != nil {
-		logger.Warnf("AnalyzeBodyChanges: Failed to parse probeABody HTML for URL '%s': %v", baselineMODIFIEDURL, err)
-		return false, ""
+		logger.Warnf("ExtractHTMLLinksAndResources: Failed to parse baseURLstring '%s': %v", baseURLstring, err)
+		return result
 	}
 
-	var found bool
-	var description string
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		// Log this, as it might indicate non-HTML content or severely malformed HTML
+		logger.Debugf("ExtractHTMLLinksAndResources: Failed to parse HTML body for base URL '%s': %v", baseURLstring, err)
+		return result
+	}
 
 	var f func(*html.Node)
 	f = func(n *html.Node) {
-		if found { // Optimization: if already found, no need to keep traversing
-			return
-		}
-
 		if n.Type == html.ElementNode {
-			targetAttrs := []string{"href", "src", "action", "formaction"}
+			targetAttrs := []string{"href", "src", "action", "formaction"} // Consider adding more like "data", "poster", "cite", "longdesc" if relevant for poisoning vectors
 			for _, attrName := range targetAttrs {
 				for _, attr := range n.Attr {
 					if attr.Key == attrName {
-						attrValue := strings.TrimSpace(attr.Val)
-						if attrValue == "" {
+						attrValueOriginal := attr.Val // Keep original value for map key
+						attrValueTrimmed := strings.TrimSpace(attrValueOriginal)
+						if attrValueTrimmed == "" {
 							continue
 						}
 
 						// Try to parse the attribute value as a URL component
-						uRawAttr, err := url.Parse(attrValue)
+						uRawAttr, err := url.Parse(attrValueTrimmed)
 						if err != nil {
-							// logger.Debugf("AnalyzeBodyChanges: Failed to parse attribute value '%s' for URL '%s': %v", attrValue, baselineMODIFIEDURL, err)
+							// logger.Debugf("ExtractHTMLLinksAndResources: Attribute '%s' value '%s' is not a valid URL component for base '%s': %v", attrName, attrValueTrimmed, baseURLstring, err)
 							continue // Skip if attribute value itself is not a parseable URL structure
 						}
 
-						// Resolve it against the baselineMODIFIEDURL (which is probeA's URL)
-						resolvedAttrURL := parsedBaselineURL.ResolveReference(uRawAttr)
-						resolvedHost := resolvedAttrURL.Hostname()
-
-						if resolvedHost != "" && strings.Contains(resolvedHost, relevantToken) {
-							if resolvedHost != originalHost {
-								logger.Infof("AnalyzeBodyChanges: Token '%s' found in resolved hostname '%s' (from attribute %s.%s='%s') which is different from original host '%s' for baseline URL '%s'.",
-									relevantToken, resolvedHost, n.Data, attrName, attrValue, originalHost, baselineMODIFIEDURL)
-								found = true
-								description = fmt.Sprintf("Token '%s' found in attribute '%s' of tag '<%s>' resulting in a modified hostname '%s' (original host was '%s'). Attribute value: '%s'.",
-									relevantToken, attrName, n.Data, resolvedHost, originalHost, attrValue)
-								return // Found, stop this branch of recursion
-							}
-						}
-						break // Found the target attribute key, move to next attribute or node
+						resolvedAttrURL := parsedBaseURL.ResolveReference(uRawAttr)
+						result[attrValueOriginal] = resolvedAttrURL.String()
+						break // Found the target attribute key for this tag, move to next attribute or node
 					}
 				}
-				if found { return }
 			}
 		}
 
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
 			f(c)
-			if found { // Propagate found signal up
-				return
-			}
 		}
 	}
 
 	f(doc)
-
-	return found, description
+	return result
 }
 
-// TODO: Implement ExtractLinksAndResources for a more structured approach if needed later.
 // TODO: Implement more sophisticated DOM diffing or change analysis for Fase 2 of AnalyzeBodyChanges. 

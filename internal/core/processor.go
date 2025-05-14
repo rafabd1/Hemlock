@@ -139,25 +139,32 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 	
 	probeA_wasCacheable := utils.IsCacheable(probeA.Response)
 	if !probeA_wasCacheable {
-		p.logger.Debugf("HEURISTIC 2: Probe A for %s not cacheable, skipping indirect poisoning check.", targetURL)
+		p.logger.Debugf("HEURISTIC 2: Probe A for %s (header %s) not cacheable, skipping indirect poisoning check.", targetURL, headerName)
 		return nil, nil
 	}
 
-	// TODO H2.1: Extract domain/relevant part from injectedValue if it's a URL (e.g., for X-Forwarded-Host)
-	// relevantInjectedToken := utils.ExtractRelevantToken(injectedValue) 
+	// Extract a relevant token from the injected value (e.g., hostname if it's a URL)
+	relevantInjectedToken := utils.ExtractRelevantToken(injectedValue)
+	if relevantInjectedToken == "" && injectedValue != "" { // If extraction yields nothing but original was something, use original
+		relevantInjectedToken = injectedValue
+	} else if injectedValue == "" { // if original injected value was empty, token is empty, skip. 
+		p.logger.Debugf("HEURISTIC 2: Injected value and relevant token are empty for %s, skipping specific indirect checks.", targetURL)
+		// We might still want a generic diff later, but for token-based checks, this is a no-op.
+		// For now, we will return, but a more advanced diff that doesn't rely on a token could go here.
+		return nil, nil
+	}
 
-	// TODO H2.2: Implement utils.AnalyzeHeaderChanges(baselineHeaders, probeAHeaders, relevantInjectedToken) (bool, string:changeDescription)
-	// headerChanged, headerChangeDesc := utils.AnalyzeHeaderChanges(baseline.RespHeaders, probeA.RespHeaders, relevantInjectedToken)
+	p.logger.Debugf("HEURISTIC 2: Using relevant token '%s' (from injected value '%s') for indirect checks on %s.", relevantInjectedToken, injectedValue, targetURL)
+
+	// Analyze changes in headers between baseline and Probe A, potentially influenced by the token
+	headerChanged, headerChangeDesc := utils.AnalyzeHeaderChanges(baseline.RespHeaders, probeA.RespHeaders, relevantInjectedToken)
 	
-	// TODO H2.3: Implement utils.AnalyzeBodyChanges(baselineBody, probeABody, relevantInjectedToken, baseline.URL) (bool, string:changeDescription)
-	// bodyChanged, bodyChangeDesc := utils.AnalyzeBodyChanges(baseline.Body, probeA.Body, relevantInjectedToken, baseline.URL)
-
-	// For now, let's assume we have placeholder booleans. Replace with actual function calls later.
-	headerChanged, headerChangeDesc := false, ""
-	bodyChanged, bodyChangeDesc := false, ""
+	// Analyze changes in the body between baseline and Probe A, potentially influenced by the token
+	bodyChanged, bodyChangeDesc := utils.AnalyzeBodyChanges(probeA.Body, baseline.Body, relevantInjectedToken, probeA.URL, baseline.URL, p.logger)
 
 	if headerChanged || bodyChanged {
-		p.logger.Infof("HEURISTIC 2: Potential indirect influence by header '%s' on %s. Header changes: %t, Body changes: %t", headerName, targetURL, headerChanged, bodyChanged)
+		p.logger.Infof("HEURISTIC 2: Potential indirect influence by header '%s' on %s. Header changes: %t (%s), Body changes: %t (%s)", 
+			headerName, targetURL, headerChanged, headerChangeDesc, bodyChanged, bodyChangeDesc)
 
 		probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
 		bodiesSimilar_AB := utils.BodiesAreSimilar(probeA.Body, probeB.Body, 0.98) // High similarity for cache hit confirmation

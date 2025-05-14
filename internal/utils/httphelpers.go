@@ -330,31 +330,80 @@ func GenerateUniquePayload(baseString string) string {
 
 // AnalyzeHeaderChanges compares critical headers between a baseline and a probe response,
 // looking for changes influenced by a relevantToken (derived from an injected value).
-// Currently focuses on the 'Location' header.
 // Returns true and a description if a relevant change is found, otherwise false and an empty string.
 func AnalyzeHeaderChanges(baselineHeaders http.Header, probeAHeaders http.Header, relevantToken string) (bool, string) {
 	if probeAHeaders == nil || relevantToken == "" {
 		return false, ""
 	}
 
-	// Check Location header in Probe A
+	// --- 1. Check Location header ---
 	probeALocation := probeAHeaders.Get("Location")
-
 	if probeALocation != "" && strings.Contains(probeALocation, relevantToken) {
-		// Location header in Probe A contains the relevant token.
-		// Now compare with baseline.
 		baselineLocation := "" // Default if baseline has no Location header
 		if baselineHeaders != nil {
 			baselineLocation = baselineHeaders.Get("Location")
 		}
-
 		if probeALocation != baselineLocation {
 			description := fmt.Sprintf("Location header changed from '%s' to '%s', influenced by token '%s'.", baselineLocation, probeALocation, relevantToken)
 			return true, description
 		}
 	}
 
-	// TODO: Extend to check other critical headers like Link, Refresh, Content-Security-Policy, Set-Cookie (for path/domain attributes influenced by token)
+	// --- 2. Check Link header (Simplified check) ---
+	// This is a basic check. Robust parsing of Link headers is complex.
+	probeALinkHeaders := probeAHeaders["Link"] // Returns a slice of all Link header values
+	baselineLinkHeaders := []string{}
+	if baselineHeaders != nil {
+		baselineLinkHeaders = baselineHeaders["Link"]
+	}
+	
+	// Join all Link header values for simpler comparison and token search
+	probeALinkCombined := strings.Join(probeALinkHeaders, ", ") // Comma is a valid separator for Link header fields
+	baselineLinkCombined := strings.Join(baselineLinkHeaders, ", ")
+
+	if probeALinkCombined != "" && strings.Contains(probeALinkCombined, relevantToken) {
+		if probeALinkCombined != baselineLinkCombined {
+			description := fmt.Sprintf("Link header changed/appeared. Baseline: '%s', Probe A: '%s'. Change influenced by token '%s'.", baselineLinkCombined, probeALinkCombined, relevantToken)
+			return true, description
+		}
+	}
+
+	// --- 3. Check Refresh header ---
+	probeARefresh := probeAHeaders.Get("Refresh")
+	if probeARefresh != "" {
+		// Attempt to extract URL from Refresh header (e.g., "5; url=http://example.com")
+		refreshURLStr := ""
+		if parts := strings.SplitN(probeARefresh, "url=", 2); len(parts) == 2 {
+			refreshURLStr = strings.TrimSpace(parts[1])
+		}
+
+		if refreshURLStr != "" && strings.Contains(refreshURLStr, relevantToken) {
+			baselineRefresh := "" // Default if baseline has no Refresh header
+			if baselineHeaders != nil {
+				baselineRefresh = baselineHeaders.Get("Refresh")
+			}
+			if probeARefresh != baselineRefresh { // Compare the full Refresh header value for simplicity
+				description := fmt.Sprintf("Refresh header changed from '%s' to '%s', with URL part influenced by token '%s'.", baselineRefresh, probeARefresh, relevantToken)
+				return true, description
+			}
+		}
+	}
+
+	// --- 4. Check Content-Security-Policy header (Simplified check) ---
+	probeACSP := probeAHeaders.Get("Content-Security-Policy")
+	if probeACSP != "" && strings.Contains(probeACSP, relevantToken) {
+		baselineCSP := "" // Default if baseline has no CSP header
+		if baselineHeaders != nil {
+			baselineCSP = baselineHeaders.Get("Content-Security-Policy")
+		}
+		if probeACSP != baselineCSP {
+			description := fmt.Sprintf("Content-Security-Policy header changed from '%s' to '%s', influenced by token '%s'.", baselineCSP, probeACSP, relevantToken)
+			return true, description
+		}
+	}
+
+	// TODO: Extend to check other critical headers like Set-Cookie (for path/domain attributes influenced by token)
+	// TODO: Implement more robust parsing for Link and CSP headers.
 
 	return false, ""
 }
