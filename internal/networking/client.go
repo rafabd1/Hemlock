@@ -6,12 +6,15 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
 // Client represents an HTTP client for making requests.
 type Client struct {
 	httpClient *http.Client
 	userAgent  string
+	logger     utils.Logger
 }
 
 // ClientRequestData holds the necessary info to make a request.
@@ -31,8 +34,8 @@ type ClientResponseData struct {
 }
 
 // NewClient creates a new HTTP Client.
-// It takes timeout, userAgent, and proxyURL string as parameters.
-func NewClient(timeout time.Duration, userAgent string, proxyURL string) (*Client, error) {
+// It takes timeout, userAgent, proxyURL string, and a logger as parameters.
+func NewClient(timeout time.Duration, userAgent string, proxyURL string, logger utils.Logger) (*Client, error) {
 	transport := &http.Transport{}
 
 	if proxyURL != "" {
@@ -54,6 +57,7 @@ func NewClient(timeout time.Duration, userAgent string, proxyURL string) (*Clien
 			},
 		},
 		userAgent: userAgent,
+		logger:    logger,
 	}, nil
 }
 
@@ -66,9 +70,15 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		reqData.Method = http.MethodGet // Default to GET if not specified
 	}
 
+	c.logger.Debugf("[HTTP Client] Performing '%s' request to URL: %s", reqData.Method, reqData.URL)
+	if len(reqData.CustomHeaders) > 0 {
+		c.logger.Debugf("[HTTP Client] With custom headers: %v", reqData.CustomHeaders)
+	}
+
 	req, err := http.NewRequest(reqData.Method, reqData.URL, nil) 
 	if err != nil {
 		respData.Error = fmt.Errorf("failed to create request for %s: %w", reqData.URL, err)
+		c.logger.Errorf("[HTTP Client] Error creating request for %s: %v", reqData.URL, err)
 		return respData
 	}
 
@@ -92,6 +102,7 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 	httpResp, err := c.httpClient.Do(req)
 	if err != nil {
 		respData.Error = fmt.Errorf("failed to execute request to %s: %w", reqData.URL, err)
+		c.logger.Warnf("[HTTP Client] Failed to execute request to %s: %v", reqData.URL, err)
 		if httpResp != nil && httpResp.Body != nil {
 			httpResp.Body.Close()
 		}
@@ -111,8 +122,25 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		if respData.Error == nil {
 			respData.Error = fmt.Errorf("failed to read response body from %s: %w", reqData.URL, readErr)
 		} 
+		c.logger.Warnf("[HTTP Client] Failed to read response body from %s: %v", reqData.URL, readErr)
 	}
 	respData.Body = bodyBytes
 
+	c.logger.Debugf("[HTTP Client] Response from %s: Status: %s, Body Size: %d bytes", reqData.URL, httpResp.Status, len(respData.Body))
+	if c.loggerIsDebugEnabled() {
+		keyRespHeaders := make(http.Header)
+		if val := respData.RespHeaders.Get("Content-Type"); val != "" { keyRespHeaders.Set("Content-Type", val) }
+		if val := respData.RespHeaders.Get("Cache-Control"); val != "" { keyRespHeaders.Set("Cache-Control", val) }
+		if val := respData.RespHeaders.Get("X-Cache"); val != "" { keyRespHeaders.Set("X-Cache", val) }
+		if val := respData.RespHeaders.Get("Age"); val != "" { keyRespHeaders.Set("Age", val) }
+		c.logger.Debugf("[HTTP Client] Key response headers from %s: %v", reqData.URL, keyRespHeaders)
+	}
+
 	return respData
+}
+
+// loggerIsDebugEnabled is a helper to check if the logger is configured for debug output.
+// This is a simplistic check; a more robust Logger interface might have a IsLevelEnabled(level) method.
+func (c *Client) loggerIsDebugEnabled() bool {
+	return true
 } 

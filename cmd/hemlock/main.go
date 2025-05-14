@@ -22,6 +22,7 @@ var (
 	outputFormatCLI string
 	verbosityCLI   string
 	concurrencyCLI int
+	verboseFlag    bool // For -v
 )
 
 func init() {
@@ -31,8 +32,9 @@ func init() {
 	flag.StringVar(&targetsFileCLI, "tf", "", "Short for -targets-file.") // Alias
 	flag.StringVar(&outputFileCLI, "output-file", "", "Output file path (overrides config file). E.g., findings.json")
 	flag.StringVar(&outputFormatCLI, "output-format", "", "Output format: json or text (overrides config file). E.g., json")
-	flag.StringVar(&verbosityCLI, "verbosity", "", "Log level: debug, info, warn, error, fatal (overrides config file). E.g., debug")
+	flag.StringVar(&verbosityCLI, "verbosity", "", "Log level: debug, info, warn, error, fatal (overrides config file or -v). E.g., debug")
 	flag.IntVar(&concurrencyCLI, "concurrency", 0, "Number of concurrent workers (overrides config file). E.g., 20")
+	flag.BoolVar(&verboseFlag, "v", false, "Enable verbose (debug) logging. Equivalent to -verbosity debug.")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Hemlock Cache Scanner - Uncover Web Cache Poisoning Vulnerabilities\n\n")
@@ -42,7 +44,7 @@ func init() {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  %s -config hemlock_config.yaml\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -targets http://example.com,http://test.com -verbosity debug\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -tf /path/to/targets.txt -output-format text\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -tf /path/to/targets.txt -v -output-format text\n", os.Args[0])
 	}
 }
 
@@ -81,7 +83,10 @@ func main() {
 	if outputFormatCLI != "" {
 		cfg.OutputFormat = outputFormatCLI
 	}
-	if verbosityCLI != "" {
+	// Handle verbosity: -v sets to debug, -verbosity can override
+	if verboseFlag && verbosityCLI == "" { // If -v is set and -verbosity is not, set to debug
+		cfg.Verbosity = "debug"
+	} else if verbosityCLI != "" { // If -verbosity is set, it takes precedence
 		cfg.Verbosity = verbosityCLI
 	}
 	if concurrencyCLI > 0 {
@@ -119,7 +124,7 @@ func main() {
 	}
 
 	// 3. Initialize HTTP Client
-	httpClient, errClient := networking.NewClient(cfg.RequestTimeout, cfg.UserAgent, cfg.ProxyURL)
+	httpClient, errClient := networking.NewClient(cfg.RequestTimeout, cfg.UserAgent, cfg.ProxyURL, logger)
 	if errClient != nil {
 		logger.Fatalf("Failed to create HTTP client: %v", errClient)
 	}

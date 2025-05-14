@@ -156,70 +156,85 @@ func (s *Scheduler) StartScan() []*report.Finding {
 			semaphore <- struct{}{}         // Acquire a spot in the semaphore
 
 			go func(url, header string) {
-				defer s.wg.Done()               // Decrement counter when goroutine finishes
-				defer func() { <-semaphore }() // Release the spot in the semaphore
+				defer s.wg.Done()               
+				defer func() { <-semaphore }() 
 
-				s.logger.Debugf("Worker starting: URL=%s, Header=%s", url, header)
+				s.logger.Debugf("[Scheduler Worker] START: URL=%s, Header=%s", url, header)
 
 				// 1. Baseline Request
+				s.logger.Debugf("[Scheduler Worker] Performing Baseline Request for URL: %s", url)
 				baselineReqData := networking.ClientRequestData{URL: url, Method: "GET"}
 				baselineRespData := s.client.PerformRequest(baselineReqData)
 				baselineProbe := buildProbeData(url, baselineReqData, baselineRespData)
+				s.logger.Debugf("[Scheduler Worker] Baseline Probe for %s - Status: %s, Body Size: %d, Error: %v", url, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
 
 				if baselineProbe.Error != nil {
-					s.logger.Warnf("Baseline request failed for URL %s: %v. Skipping probes for this header.", url, baselineProbe.Error)
+					s.logger.Warnf("[Scheduler Worker] Baseline request failed for URL %s: %v. Skipping probes for this header.", url, baselineProbe.Error)
 					return
 				}
-				if baselineProbe.Response == nil { // Should not happen if error is nil, but good practice
-					s.logger.Warnf("Baseline response is nil for URL %s, though no error reported. Skipping probes for this header.", url)
+				if baselineProbe.Response == nil { 
+					s.logger.Warnf("[Scheduler Worker] Baseline response is nil for URL %s, though no error reported. Skipping probes for this header.", url)
 					return
 				}
 
 				injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-" + header)
+				s.logger.Debugf("[Scheduler Worker] Generated Injected Value for %s on %s: %s", header, url, injectedValue)
 
 				// 2. Probe A (with injected header)
+				s.logger.Debugf("[Scheduler Worker] Performing Probe A for URL: %s, Header: %s, Value: %s", url, header, injectedValue)
 				probeAReqHeaders := http.Header{header: []string{injectedValue}}
 				probeAReqData := networking.ClientRequestData{URL: url, Method: "GET", CustomHeaders: probeAReqHeaders}
 				probeARespData := s.client.PerformRequest(probeAReqData)
 				probeAProbe := buildProbeData(url, probeAReqData, probeARespData)
+				s.logger.Debugf("[Scheduler Worker] Probe A for %s (Header: %s) - Status: %s, Body Size: %d, Error: %v", url, header, getStatus(probeAProbe.Response), len(probeAProbe.Body), probeAProbe.Error)
 
 				if probeAProbe.Error != nil {
-					s.logger.Warnf("Probe A request failed for URL %s, Header %s: %v. Analysis may be incomplete.", url, header, probeAProbe.Error)
-					// We might still proceed to Probe B and analysis, as the processor handles probe errors.
+					s.logger.Warnf("[Scheduler Worker] Probe A request failed for URL %s, Header %s: %v. Analysis may be incomplete.", url, header, probeAProbe.Error)
 				}
 
 				// 3. Probe B (cache check - sent after Probe A)
-				// TODO: Consider a small delay here if cache propagation is a concern, though hard to generalize.
-				// time.Sleep(50 * time.Millisecond)
-				probeBReqData := networking.ClientRequestData{URL: url, Method: "GET"} // No special headers for this probe
+				s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for URL: %s (after Header: %s test)", url, header)
+				probeBReqData := networking.ClientRequestData{URL: url, Method: "GET"} 
 				probeBRespData := s.client.PerformRequest(probeBReqData)
 				probeBProbe := buildProbeData(url, probeBReqData, probeBRespData)
+				s.logger.Debugf("[Scheduler Worker] Probe B for %s (after Header: %s test) - Status: %s, Body Size: %d, Error: %v", url, header, getStatus(probeBProbe.Response), len(probeBProbe.Body), probeBProbe.Error)
 
 				if probeBProbe.Error != nil {
-					s.logger.Warnf("Probe B request failed for URL %s, Header %s (after Probe A): %v. Analysis may be incomplete.", url, header, probeBProbe.Error)
+					s.logger.Warnf("[Scheduler Worker] Probe B request failed for URL %s, Header %s (after Probe A): %v. Analysis may be incomplete.", url, header, probeBProbe.Error)
 				}
 
-				// Analyze with Processor
-				s.logger.Debugf("Analyzing probes for URL: %s, Header: %s, Value: %s", url, header, injectedValue)
+				s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, Header: %s, InjectedValue: %s", url, header, injectedValue)
 				finding, err := s.processor.AnalyzeProbes(url, header, injectedValue, baselineProbe, probeAProbe, probeBProbe)
 				if err != nil {
-					s.logger.Warnf("Processor error during analysis for URL %s, Header %s: %v", url, header, err)
+					s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Header %s: %v", url, header, err)
 				}
 
 				if finding != nil {
 					s.mu.Lock()
 					s.findings = append(s.findings, finding)
 					s.mu.Unlock()
-					s.logger.Infof("VULNERABILITY DETECTED: %s on %s with header %s (Payload: %s)", finding.Vulnerability, url, header, injectedValue)
+					s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s with header %s (Payload: %s)", finding.Vulnerability, url, header, injectedValue)
+					s.logger.Debugf("[Scheduler Worker] Finding Details: URL=%s, Vuln=%s, Desc=%s, Input=%s, Payload=%s, Evidence=%s", finding.URL, finding.Vulnerability, finding.Description, finding.UnkeyedInput, finding.Payload, finding.Evidence) // Log full finding on debug
+				} else {
+					s.logger.Debugf("[Scheduler Worker] No finding from processor for URL: %s, Header: %s, InjectedValue: %s", url, header, injectedValue)
 				}
+				s.logger.Debugf("[Scheduler Worker] END: URL=%s, Header=%s", url, header)
 
 			}(targetURL, headerName)
 		}
 	}
 
-	s.wg.Wait() // Wait for all goroutines to finish
+	s.wg.Wait() 
 	s.logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(s.findings))
 	return s.findings
+}
+
+// Helper function to safely get status from a potentially nil response
+func getStatus(resp *http.Response) string {
+	if resp == nil {
+		return "N/A (No Response)"
+	}
+	return resp.Status
 }
 
 // TODO: Implement StartScan() method that iterates targets and headers.
