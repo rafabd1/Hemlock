@@ -17,7 +17,8 @@ import (
 // Client manages HTTP requests, including retries, timeouts, custom headers, and proxy usage.
 // It will be based on the resilient client described in your architecture document.
 type Client struct {
-	httpClient      *http.Client
+	httpClient      *http.Client // This client will have a base transport, potentially without a proxy or with ProxyFromEnvironment
+	baseTransport   *http.Transport // Store the base transport for cloning
 	config          ClientConfig
 	domainManager   *DomainManager // Added DomainManager
 	logger          utils.Logger   // Added Logger
@@ -75,17 +76,18 @@ func NewClient(cfg ClientConfig, dm *DomainManager, logger utils.Logger) (*Clien
 		logger.Infof("Initialized with %d enabled proxies.", len(parsedProxyList))
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
-		Proxy: http.ProxyFromEnvironment, // Default behavior, will be overridden by getNextProxy logic if proxies are used
+	baseTransport := &http.Transport{
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+		Proxy:               http.ProxyFromEnvironment, // Default, can be overridden per request if needed by cloning transport
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
+		// Consider MaxIdleConnsPerHost, ResponseHeaderTimeout, ExpectContinueTimeout etc. for finer control
 	}
 
 	httpClient := &http.Client{
 		Timeout:   cfg.Timeout,
-		Transport: transport,
+		Transport: baseTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -93,6 +95,7 @@ func NewClient(cfg ClientConfig, dm *DomainManager, logger utils.Logger) (*Clien
 
 	return &Client{
 		httpClient:    httpClient,
+		baseTransport: baseTransport,
 		config:        cfg,
 		domainManager: dm,
 		logger:        logger,
@@ -101,7 +104,7 @@ func NewClient(cfg ClientConfig, dm *DomainManager, logger utils.Logger) (*Clien
 }
 
 // getNextProxy returns the next proxy from the list in a round-robin fashion.
-// Returns nil if no proxies are configured.
+// Returns nil if no proxies are configured or if all are disabled (though disabled ones are filtered at init).
 func (c *Client) getNextProxy() *url.URL {
 	if len(c.proxyList) == 0 {
 		return nil
@@ -143,25 +146,27 @@ func (c *Client) Get(targetUrlStr string, customHeaders map[string]string) (*htt
 			req.Header.Set(key, value)
 		}
 
-		// Dynamically set proxy for this request if proxies are configured
+		currentClient := c.httpClient // Use the base client by default
 		selectedProxy := c.getNextProxy()
+
 		if selectedProxy != nil {
-			if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
-				transport.Proxy = http.ProxyURL(selectedProxy)
-				c.logger.Debugf("Using proxy %s for URL %s", selectedProxy.String(), targetUrlStr)
-			} else {
-				c.logger.Warnf("Cannot set proxy, transport is not *http.Transport for URL %s", targetUrlStr)
+			c.logger.Debugf("Using proxy %s for URL %s", selectedProxy.String(), targetUrlStr)
+			// Clone the base transport and set the proxy for this specific request
+			proxyTransport := c.baseTransport.Clone()
+			proxyTransport.Proxy = http.ProxyURL(selectedProxy)
+			currentClient = &http.Client{
+				Transport:     proxyTransport,
+				Timeout:       c.config.Timeout, // Inherit timeout
+				CheckRedirect: c.httpClient.CheckRedirect, // Inherit redirect policy
 			}
 		} else {
-            // Ensure proxy is cleared if no proxy is selected for this attempt
-            if transport, ok := c.httpClient.Transport.(*http.Transport); ok {
-                transport.Proxy = nil
-            }
-        }
+			// Ensure the base client's transport is used (it might have ProxyFromEnvironment or nil)
+			// This is implicitly handled by currentClient = c.httpClient and baseTransport default
+		}
 
 		c.domainManager.RecordRequestSent(domain)
 		startTime := time.Now()
-		resp, err = c.httpClient.Do(req)
+		resp, err = currentClient.Do(req) // Use the potentially proxy-configured client
 		duration := time.Since(startTime)
 
 		if err != nil {
