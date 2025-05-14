@@ -13,7 +13,7 @@ import (
 type DomainManager struct {
 	mutex        sync.RWMutex
 	domainStatus map[string]*domainInfo
-	config       config.NetworkingConfig // Using the sub-config for relevant parameters
+	config       config.NetworkConfig // Explicitly using config.NetworkConfig
 	logger       utils.Logger
 	// TODO: Add fields for default MinRequestDelay, CooldownDuration, logger, etc.
 }
@@ -28,7 +28,7 @@ type domainInfo struct {
 const maxConsecutiveFailuresToBlock = 5 // Example: block after 5 consecutive failures
 
 // NewDomainManager creates a new DomainManager.
-func NewDomainManager(cfg config.NetworkingConfig, logger utils.Logger) *DomainManager {
+func NewDomainManager(cfg config.NetworkConfig, logger utils.Logger) *DomainManager { // Explicitly using config.NetworkConfig
 	return &DomainManager{
 		domainStatus: make(map[string]*domainInfo),
 		config:       cfg,

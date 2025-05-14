@@ -51,14 +51,14 @@ func NewScheduler(appCfg *config.Config, httpClient *networking.Client, domainMa
 
 	wp := utils.NewWorkerPool(ctx, appCfg.Workers.NumWorkers, appCfg.Workers.JobQueueSize)
 
-	headers, err := loadHeaders(appCfg.Headers.WordlistFile, logger)
+	headers, err := loadHeaders(appCfg.CachePoisoning.HeadersToTestFile, logger)
 	if err != nil {
 		cancel() // Cancel context if scheduler setup fails
 		wp.Shutdown() // Shutdown pool if setup fails
 		return nil, fmt.Errorf("failed to load headers wordlist: %w", err)
 	}
 	if len(headers) == 0 {
-		logger.Warnf("Headers wordlist at '%s' is empty or failed to load any headers.", appCfg.Headers.WordlistFile)
+		logger.Warnf("Headers wordlist at '%s' is empty or failed to load any headers.", appCfg.CachePoisoning.HeadersToTestFile)
 		// Continue without headers to test, or make it a fatal error based on policy
 	}
 
@@ -82,7 +82,7 @@ func NewScheduler(appCfg *config.Config, httpClient *networking.Client, domainMa
 // loadHeaders loads headers from the specified wordlist file.
 func loadHeaders(filePath string, logger utils.Logger) ([]string, error) {
 	if filePath == "" {
-		logger.Warnf("No header wordlist file specified in config.")
+		logger.Warnf("No header wordlist file specified in config (CachePoisoning.HeadersToTestFile).")
 		return []string{}, nil
 	}
 	file, err := os.Open(filePath)
@@ -204,12 +204,22 @@ func makeProbeData(url string, reqHeaders http.Header, resp *http.Response, body
 // Schedule starts the scanning process for the given URLs.
 // It returns a channel where ScanTaskResult can be received.
 func (s *Scheduler) Schedule(urls []string) <-chan ScanTaskResult {
-	s.logger.Infof("Scheduler starting with %d URLs and %d headers to test per URL.", len(urls), len(s.headersToTest))
+	s.logger.Infof("Scheduler starting with %d raw URLs and %d headers to test per URL.", len(urls), len(s.headersToTest))
 
-	balancedUrls := s.buildBalancedWorkQueue(urls)
-	if len(balancedUrls) == 0 {
-		s.logger.Warnf("No valid URLs to schedule after balancing.")
+	// Preprocess URLs: filter ignored extensions and deduplicate
+	processedUrls := utils.PreprocessURLs(urls, s.appConfig.Input.IgnoredExtensions, true, s.logger) // stripWWW = true, as normalizeURL handles it
+
+	if len(processedUrls) == 0 {
+		s.logger.Warnf("No valid URLs to schedule after preprocessing.")
 		s.closeResultsChan() // Close immediately if nothing to do
+		return s.resultsChan
+	}
+	s.logger.Infof("%d URLs remain after preprocessing.", len(processedUrls))
+
+	balancedUrls := s.buildBalancedWorkQueue(processedUrls)
+	if len(balancedUrls) == 0 {
+		s.logger.Warnf("No valid URLs to schedule after balancing (unexpected if preprocessing yielded URLs).")
+		s.closeResultsChan()
 		return s.resultsChan
 	}
 
@@ -303,7 +313,7 @@ func (s *Scheduler) Schedule(urls []string) <-chan ScanTaskResult {
 
 	go func() {
 		s.waitGroup.Wait()
-		s.logger.Infof("All %d URL scan tasks have been processed by workers.", len(balancedUrls))
+		s.logger.Infof("All %d URL scan tasks have been processed by workers.", len(balancedUrls)) // Log count of balanced (and thus processed) URLs
 		s.closeResultsChan()
 	}()
 

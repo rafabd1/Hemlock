@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rafabd1/Hemlock/internal/utils" // Assuming logger might be passed or used here
+	"github.com/rafabd1/Hemlock/internal/config" // For config.ProxyConfig
+	"github.com/rafabd1/Hemlock/internal/utils"  // Assuming logger might be passed or used here
 )
 
 // Client manages HTTP requests, including retries, timeouts, custom headers, and proxy usage.
@@ -30,38 +31,60 @@ type ClientConfig struct {
 	Timeout            time.Duration
 	MaxRetries         int
 	UserAgent          string
-	Proxies            []string // List of proxy URLs (e.g., "http://user:pass@host:port")
+	Proxies            []config.ProxyConfig // Changed to use ProxyConfig struct
 	InsecureSkipVerify bool    // To ignore SSL/TLS errors
 	// TODO: Add other relevant config fields like RetryDelay (min/max for backoff)
 }
 
 // NewClient creates a new HTTP Client.
-func NewClient(config ClientConfig, dm *DomainManager, logger utils.Logger) (*Client, error) {
-	var proxyList []*url.URL
-	for _, pStr := range config.Proxies {
-		proxyURL, err := url.Parse(pStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy URL %s: %w", pStr, err)
+func NewClient(cfg ClientConfig, dm *DomainManager, logger utils.Logger) (*Client, error) {
+	var parsedProxyList []*url.URL
+	for _, proxyCfg := range cfg.Proxies {
+		if !proxyCfg.Enabled {
+			logger.Debugf("Proxy %s is disabled, skipping.", proxyCfg.URL)
+			continue
 		}
-		proxyList = append(proxyList, proxyURL)
+
+		proxyStr := proxyCfg.URL
+		// If username and password are provided, prepend them to the URL string
+		// This assumes url.Parse can handle user:pass@host:port format for proxies.
+		if proxyCfg.Username != "" {
+			tempUrl, err := url.Parse(proxyStr)
+			if err != nil {
+				logger.Warnf("Failed to parse proxy URL %s before adding auth: %v. Skipping proxy.", proxyStr, err)
+				continue
+			}
+			if proxyCfg.Password != "" {
+				tempUrl.User = url.UserPassword(proxyCfg.Username, proxyCfg.Password)
+			} else {
+				tempUrl.User = url.User(proxyCfg.Username)
+			}
+			proxyStr = tempUrl.String()
+		}
+
+		proxyURL, err := url.Parse(proxyStr)
+		if err != nil {
+			logger.Warnf("Invalid proxy URL %s: %v. Skipping proxy.", proxyStr, err)
+			continue // Skip invalid proxy URLs
+		}
+		parsedProxyList = append(parsedProxyList, proxyURL)
+		logger.Debugf("Added enabled proxy: %s", proxyURL.Host) // Log host part for brevity
+	}
+
+	if len(parsedProxyList) > 0 {
+		logger.Infof("Initialized with %d enabled proxies.", len(parsedProxyList))
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: config.InsecureSkipVerify},
-		// Proxy will be set dynamically per request if proxies are enabled
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			// This part is tricky because getNextProxy is on Client, not directly accessible here.
-			// For now, we will set the proxy on the transport before each request if needed.
-			// A better approach might involve a custom RoundTripper that wraps the transport.
-			return nil, nil // Default to no proxy, will be overridden if needed
-		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
+		Proxy: http.ProxyFromEnvironment, // Default behavior, will be overridden by getNextProxy logic if proxies are used
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 
 	httpClient := &http.Client{
-		Timeout:   config.Timeout,
+		Timeout:   cfg.Timeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -70,10 +93,10 @@ func NewClient(config ClientConfig, dm *DomainManager, logger utils.Logger) (*Cl
 
 	return &Client{
 		httpClient:    httpClient,
-		config:        config,
+		config:        cfg,
 		domainManager: dm,
 		logger:        logger,
-		proxyList:     proxyList,
+		proxyList:     parsedProxyList, // Use the list of parsed and enabled proxies
 	}, nil
 }
 

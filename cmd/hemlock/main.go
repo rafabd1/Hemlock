@@ -32,12 +32,12 @@ func main() {
 	flag.Parse()
 
 	appConfig := loadConfig()
-	logger := utils.NewDefaultLogger(appConfig.Log.GetLogLevel())
+	logger := utils.NewDefaultLogger(appConfig.Logging.GetLogLevel())
 
 	logger.Infof("Hemlock Cache Poisoning Detection Tool Initializing...")
 	logger.Debugf("Using User-Agent: %s", appConfig.Network.UserAgent)
-	if len(appConfig.Proxies) > 0 {
-		logger.Infof("Using %d proxies.", len(appConfig.Proxies))
+	if len(appConfig.Network.Proxies) > 0 {
+		logger.Infof("Using %d proxies.", len(appConfig.Network.Proxies))
 	}
 
 	domainManager := networking.NewDomainManager(appConfig.Network, logger)
@@ -47,7 +47,7 @@ func main() {
 		Timeout:           time.Duration(appConfig.Network.TimeoutSeconds) * time.Second,
 		MaxRetries:        appConfig.Network.MaxRetries,
 		UserAgent:         appConfig.Network.UserAgent,
-		Proxies:           appConfig.Proxies,
+		Proxies:           appConfig.Network.Proxies,
 		InsecureSkipVerify: appConfig.Network.InsecureSkipVerify,
 	}
 	httpClient, err := networking.NewClient(clientConfig, domainManager, logger)
@@ -106,11 +106,11 @@ func main() {
 
 	logger.Infof("Scan finished. Found %d vulnerabilities. Encountered %d errors during scans.", len(findings), errorsEncountered)
 
-	if err := reporter.GenerateReport(findings, appConfig.Report.OutputFile, appConfig.Report.Format);
+	if err := reporter.GenerateReport(findings, appConfig.Output.File, appConfig.Output.Format);
 	err != nil {
 		logger.Fatalf("Error generating report: %v", err)
 	}
-	logger.Infof("Report generated to %s in %s format.", appConfig.Report.OutputFile, appConfig.Report.Format)
+	logger.Infof("Report generated to %s in %s format.", appConfig.Output.File, appConfig.Output.Format)
 
 	logger.Infof("Hemlock finished.")
 }
@@ -122,13 +122,13 @@ func loadConfig() *config.Config {
 
 	// Override defaults with command-line flags where provided
 	if *logLevel != "" {
-		cfg.Log.Level = *logLevel
+		cfg.Logging.Level = *logLevel
 	}
 	if *outputFile != "" {
-		cfg.Report.OutputFile = *outputFile
+		cfg.Output.File = *outputFile
 	}
 	if *outputFormat != "" {
-		cfg.Report.Format = *outputFormat
+		cfg.Output.Format = *outputFormat
 	}
 	if *numWorkers > 0 {
 		cfg.Workers.NumWorkers = *numWorkers
