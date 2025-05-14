@@ -17,9 +17,40 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
+# Go Module files
+go.sum
+go.mod # Typically committed, but can be ignored if everyone uses `go get`
+
+# IDE-specific files
+.idea/
+*.iml
+*.vscode/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build files
+/build/
+/dist/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*~
+
 # Go workspace file
 go.work
 go.work.sum
 
 # env file
 .env
+
+# dev
+dev/
+
+.cursor
+
+output.*
