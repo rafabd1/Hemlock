@@ -108,4 +108,20 @@ func PreprocessURLs(rawURLs []string, ignoredExtensions []string, stripWWW bool,
 
 	logger.Infof("Finished preprocessing. %d URLs remain after filtering and deduplication.", len(resultURLs))
 	return resultURLs
+}
+
+// ExtractRelevantToken attempts to extract a meaningful token from an injected value.
+// If the value parses as a URL with a hostname, the hostname is returned.
+// Otherwise, the original value is returned.
+func ExtractRelevantToken(injectedValue string) string {
+	if injectedValue == "" {
+		return ""
+	}
+	u, err := url.Parse(injectedValue)
+	if err == nil && u != nil && u.Hostname() != "" {
+		// It's a URL and has a hostname, return the hostname
+		return u.Hostname()
+	}
+	// Not a URL with a clear hostname, or parsing failed; return the original value
+	return injectedValue
 } 

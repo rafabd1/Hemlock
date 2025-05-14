@@ -328,4 +328,35 @@ func GenerateUniquePayload(baseString string) string {
 	return fmt.Sprintf("%s-%d-%x", baseString, atomic.LoadInt32(&payloadCounter), randomSuffix)
 }
 
+// AnalyzeHeaderChanges compares critical headers between a baseline and a probe response,
+// looking for changes influenced by a relevantToken (derived from an injected value).
+// Currently focuses on the 'Location' header.
+// Returns true and a description if a relevant change is found, otherwise false and an empty string.
+func AnalyzeHeaderChanges(baselineHeaders http.Header, probeAHeaders http.Header, relevantToken string) (bool, string) {
+	if probeAHeaders == nil || relevantToken == "" {
+		return false, ""
+	}
+
+	// Check Location header in Probe A
+	probeALocation := probeAHeaders.Get("Location")
+
+	if probeALocation != "" && strings.Contains(probeALocation, relevantToken) {
+		// Location header in Probe A contains the relevant token.
+		// Now compare with baseline.
+		baselineLocation := "" // Default if baseline has no Location header
+		if baselineHeaders != nil {
+			baselineLocation = baselineHeaders.Get("Location")
+		}
+
+		if probeALocation != baselineLocation {
+			description := fmt.Sprintf("Location header changed from '%s' to '%s', influenced by token '%s'.", baselineLocation, probeALocation, relevantToken)
+			return true, description
+		}
+	}
+
+	// TODO: Extend to check other critical headers like Link, Refresh, Content-Security-Policy, Set-Cookie (for path/domain attributes influenced by token)
+
+	return false, ""
+}
+
 // TODO: Add functions for parsing specific cache headers, generating unique payloads, etc. 
