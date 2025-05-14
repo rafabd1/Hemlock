@@ -2,47 +2,112 @@ package utils
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
+// Job represents a function to be executed by a worker.
+// It returns a generic interface{} result and an error.
+type Job func() (interface{}, error)
+
 // WorkerPool manages a pool of goroutines to perform tasks concurrently.
-// This will be based on the WorkerPool from your architecture document.
+// Based on ARCHITECTURE_NETWORKING_CONCURRENCY.md.
 type WorkerPool struct {
 	numWorkers int
-	jobQueue   chan func() // Using func() as a generic job type for now
+	jobQueue   chan Job
 	results    chan interface{}
 	errors     chan error
 	ctx        context.Context
-	cancel     context.CancelFunc
-	waitGroup  sync.WaitGroup
-	// TODO: Add other fields like activeJobs, mutexes as in your doc.
+	cancel     context.CancelFunc // To signal workers to stop
+	shutdownWg sync.WaitGroup   // To wait for all workers to finish during shutdown
+	activeJobs int32            // Atomic counter for active jobs (optional, for more detailed stats)
+	mu         sync.Mutex       // For protecting access to isClosed and jobQueue closing
+	isClosed   bool
 }
 
-// NewWorkerPool creates a new WorkerPool.
-func NewWorkerPool(ctx context.Context, numWorkers int, queueSize int) *WorkerPool {
-	parentCtx, cancel := context.WithCancel(ctx)
+// NewWorkerPool creates and starts a new WorkerPool.
+func NewWorkerPool(parentCtx context.Context, numWorkers int, queueSize int) *WorkerPool {
+	ctx, cancel := context.WithCancel(parentCtx)
 	wp := &WorkerPool{
 		numWorkers: numWorkers,
-		jobQueue:   make(chan func(), queueSize),
-		results:    make(chan interface{}), // Consider buffered channel or specific result struct
-		errors:     make(chan error),        // Consider buffered channel
-		ctx:        parentCtx,
+		jobQueue:   make(chan Job, queueSize),
+		results:    make(chan interface{}, queueSize), // Buffered to prevent blocking sender if receiver is slow
+		errors:     make(chan error, queueSize),     // Buffered for the same reason
+		ctx:        ctx,
 		cancel:     cancel,
 	}
-	// TODO: Start workers (wp.start())
+
+	wp.start()
 	return wp
 }
 
+// start initializes the workers.
+func (wp *WorkerPool) start() {
+	wp.shutdownWg.Add(wp.numWorkers)
+	for i := 0; i < wp.numWorkers; i++ {
+		go wp.worker(i)
+	}
+
+	// Goroutine to clean up channels once all workers are done with current jobs after ctx is cancelled
+	go func() {
+		wp.shutdownWg.Wait() // Wait for all workers to signal they've exited their loops
+		close(wp.results)    // Safe to close now
+		close(wp.errors)     // Safe to close now
+	}()
+}
+
+// worker is the internal function executed by each goroutine in the pool.
+func (wp *WorkerPool) worker(id int) {
+	defer wp.shutdownWg.Done()
+	// fmt.Printf("Worker %d starting\n", id) // For debugging
+	for {
+		select {
+		case job, ok := <-wp.jobQueue:
+			if !ok {
+				// fmt.Printf("Worker %d: jobQueue closed, exiting.\n", id) // For debugging
+				return // Job queue was closed, exit worker
+			}
+			// Execute the job
+			// fmt.Printf("Worker %d processing job\n", id) // For debugging
+			result, err := job()
+			if err != nil {
+				select {
+				case wp.errors <- err:
+				case <-wp.ctx.Done(): // If context is cancelled while trying to send error
+					// fmt.Printf("Worker %d: context cancelled while sending error. Error: %v\n", id, err) // For debugging
+					return
+				}
+			} else if result != nil { // Only send non-nil results
+				select {
+				case wp.results <- result:
+				case <-wp.ctx.Done(): // If context is cancelled while trying to send result
+					// fmt.Printf("Worker %d: context cancelled while sending result.\n", id) // For debugging
+					return
+				}
+			}
+		case <-wp.ctx.Done(): // Context was cancelled (e.g., by Shutdown)
+			// fmt.Printf("Worker %d: context cancelled, exiting.\n", id) // For debugging
+			return
+		}
+	}
+}
+
 // Submit adds a task to the job queue.
-func (wp *WorkerPool) Submit(task func()) error {
-	// TODO: Implement task submission with select to handle context cancellation or full queue.
-	// select {
-	// case wp.jobQueue <- task:
-	// 	 return nil
-	// case <-wp.ctx.Done():
-	// 	 return wp.ctx.Err()
-	// }
-	return nil
+// Returns an error if the context is cancelled or the pool is closed and cannot accept new jobs.
+func (wp *WorkerPool) Submit(job Job) error {
+	wp.mu.Lock()
+	if wp.isClosed {
+		wp.mu.Unlock()
+		return fmt.Errorf("worker pool is closed, cannot submit new jobs")
+	}
+	wp.mu.Unlock()
+
+	select {
+	case wp.jobQueue <- job:
+		return nil
+	case <-wp.ctx.Done():
+		return wp.ctx.Err() // Pool is shutting down or parent context cancelled
+	}
 }
 
 // Results returns a channel to read task results from.
@@ -56,20 +121,19 @@ func (wp *WorkerPool) Errors() <-chan error {
 }
 
 // Shutdown gracefully shuts down the worker pool.
+// It signals workers to stop, waits for them to finish current jobs, then closes job and result/error channels.
 func (wp *WorkerPool) Shutdown() {
-	// TODO: Implement graceful shutdown (cancel context, wait for workers).
-	wp.cancel()
-	wp.waitGroup.Wait()
-	close(wp.jobQueue)
-	close(wp.results)
-	close(wp.errors)
+	wp.mu.Lock()
+	if wp.isClosed {
+		wp.mu.Unlock()
+		return // Already shutdown
+	}
+	wp.isClosed = true
+	close(wp.jobQueue) // Signal no more jobs will be sent, workers will exit after processing remaining jobs
+	wp.mu.Unlock()
+
+	wp.cancel() // Signal workers to stop processing new items from queue if they haven't picked one up
+	// The goroutine started in `start()` will wait for `shutdownWg` and then close `results` and `errors` channels.
 }
 
-// worker is the internal function executed by each goroutine in the pool.
-func (wp *WorkerPool) worker(id int) {
-	defer wp.waitGroup.Done()
-	// TODO: Implement worker logic: listen to jobQueue and ctx.Done().
-	// Execute task and send result/error to respective channels.
-}
-
-// TODO: Consider adding SimpleWorkerPool, BoundedSemaphore, etc., as per your architecture document. 
+// TODO: Implement SimpleWorkerPool, BoundedSemaphore, etc., as per your architecture document if needed later. 

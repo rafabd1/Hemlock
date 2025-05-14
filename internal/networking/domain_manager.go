@@ -3,6 +3,9 @@ package networking
 import (
 	"sync"
 	"time"
+
+	"github.com/rafabd1/Hemlock/internal/config" // For DomainManagerConfig
+	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
 // DomainManager handles state and policies for specific domains (rate limiting, WAF detection, etc.).
@@ -10,41 +13,118 @@ import (
 type DomainManager struct {
 	mutex        sync.RWMutex
 	domainStatus map[string]*domainInfo
+	config       config.NetworkingConfig // Using the sub-config for relevant parameters
+	logger       utils.Logger
 	// TODO: Add fields for default MinRequestDelay, CooldownDuration, logger, etc.
 }
 
 type domainInfo struct {
-	lastRequestTime time.Time
-	blockedUntil    time.Time
-	// TODO: Add fields for consecutive failures, specific rate limits, etc.
+	lastRequestTime    time.Time
+	blockedUntil       time.Time
+	consecutiveFailures int
+	// TODO: Add more fine-grained stats if needed, e.g., total requests, success, specific error counts
 }
 
+const maxConsecutiveFailuresToBlock = 5 // Example: block after 5 consecutive failures
+
 // NewDomainManager creates a new DomainManager.
-func NewDomainManager(/* config */) *DomainManager {
-	// TODO: Initialize and return a new DomainManager
+func NewDomainManager(cfg config.NetworkingConfig, logger utils.Logger) *DomainManager {
 	return &DomainManager{
 		domainStatus: make(map[string]*domainInfo),
+		config:       cfg,
+		logger:       logger,
 	}
+}
+
+// getOrCreateDomainInfo retrieves or creates a domainInfo struct for a domain.
+// This must be called with the dm.mutex already locked.
+func (dm *DomainManager) getOrCreateDomainInfo(domain string) *domainInfo {
+	di, exists := dm.domainStatus[domain]
+	if !exists {
+		di = &domainInfo{}
+		dm.domainStatus[domain] = di
+	}
+	return di
 }
 
 // CanRequest checks if a request can be made to a domain based on its current state.
 func (dm *DomainManager) CanRequest(domain string) bool {
-	// TODO: Implement logic to check for blocks and rate limits.
-	// dm.mutex.RLock()
-	// defer dm.mutex.RUnlock()
+	dm.mutex.RLock()
+	defer dm.mutex.RUnlock()
+
+	di, exists := dm.domainStatus[domain]
+	if !exists {
+		return true // No info yet, can request
+	}
+
+	if !di.blockedUntil.IsZero() && time.Now().Before(di.blockedUntil) {
+		dm.logger.Debugf("Domain %s is blocked until %v", domain, di.blockedUntil)
+		return false // Domain is currently blocked
+	}
+
+	minDelay := time.Duration(dm.config.MinRequestDelayMs) * time.Millisecond
+	if !di.lastRequestTime.IsZero() && time.Since(di.lastRequestTime) < minDelay {
+		dm.logger.Debugf("Rate limiting domain %s, last request was at %v, need to wait %v", domain, di.lastRequestTime, minDelay)
+		return false // Rate limiting
+	}
+
 	return true
 }
 
 // RecordRequestSent updates the last request time for a domain.
 func (dm *DomainManager) RecordRequestSent(domain string) {
-	// TODO: Implement logic to update domain status after a request is sent.
-	// dm.mutex.Lock()
-	// defer dm.mutex.Unlock()
+	dm.mutex.Lock()
+	defer dm.mutex.Unlock()
+
+	di := dm.getOrCreateDomainInfo(domain)
+	di.lastRequestTime = time.Now()
 }
 
 // RecordRequestResult updates the domain status based on the outcome of a request.
-func (dm *DomainManager) RecordRequestResult(domain string, success bool, statusCode int, isWAFBlock bool, isRateLimit bool) {
-	// TODO: Implement logic to update domain status (e.g., block domain, update failure counts).
-	// dm.mutex.Lock()
-	// defer dm.mutex.Unlock()
-} 
+func (dm *DomainManager) RecordRequestResult(domain string, success bool, statusCode int, isWAFBlock bool, isRateLimitError bool) {
+	dm.mutex.Lock()
+	defer dm.mutex.Unlock()
+
+	di := dm.getOrCreateDomainInfo(domain)
+
+	if success {
+		di.consecutiveFailures = 0
+		// If a successful request happens, and the domain was blocked, unblock it.
+		// This handles cases where a block might have been too aggressive or temporary conditions cleared.
+		if !di.blockedUntil.IsZero() {
+			dm.logger.Infof("Domain %s was blocked, but a successful request occurred. Unblocking.", domain)
+			di.blockedUntil = time.Time{} // Clear block
+		}
+		return
+	}
+
+	// Handle failure
+	di.consecutiveFailures++
+	dm.logger.Debugf("Failure recorded for domain %s. Consecutive failures: %d. Status: %d, WAF: %t, RateLimit: %t",
+		domain, di.consecutiveFailures, statusCode, isWAFBlock, isRateLimitError)
+
+	cooldownDuration := time.Duration(dm.config.DomainCooldownMs) * time.Millisecond
+
+	if isWAFBlock {
+		dm.logger.Warnf("WAF detected for domain %s. Blocking for %v.", domain, cooldownDuration)
+		di.blockedUntil = time.Now().Add(cooldownDuration)
+		di.consecutiveFailures = 0 // Reset after explicit block
+		return
+	}
+
+	if isRateLimitError { // e.g. HTTP 429
+		dm.logger.Warnf("Rate limit error (e.g. HTTP 429) from domain %s. Blocking for %v.", domain, cooldownDuration)
+		di.blockedUntil = time.Now().Add(cooldownDuration)
+		di.consecutiveFailures = 0 // Reset after explicit block
+		return
+	}
+
+	if di.consecutiveFailures >= maxConsecutiveFailuresToBlock {
+		dm.logger.Warnf("Domain %s reached %d consecutive failures. Blocking for %v.", domain, di.consecutiveFailures, cooldownDuration)
+		di.blockedUntil = time.Now().Add(cooldownDuration)
+		di.consecutiveFailures = 0 // Reset counter after blocking
+	}
+}
+
+// GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.
+// func (dm *DomainManager) GetDomainStatus(domain string) (domainInfo, bool) { ... } 
