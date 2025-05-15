@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rafabd1/Hemlock/internal/config"
 	"github.com/rafabd1/Hemlock/internal/networking"
@@ -27,23 +28,25 @@ type ScanTaskResult struct {
 // It manages target URLs, headers to test, concurrency, and coordinates
 // the HTTP client and processor to find vulnerabilities.
 type Scheduler struct {
-	config    *config.Config
-	client    *networking.Client
-	processor *Processor // Uses Processor from internal/core/processor.go
-	logger    utils.Logger
-	findings  []*report.Finding
-	wg        sync.WaitGroup
-	mu        sync.Mutex // For thread-safe access to findings slice
+	config        *config.Config
+	client        *networking.Client
+	processor     *Processor
+	domainManager *networking.DomainManager
+	logger        utils.Logger
+	findings      []*report.Finding
+	wg            sync.WaitGroup
+	mu            sync.Mutex // For thread-safe access to findings slice
 }
 
 // NewScheduler creates a new Scheduler instance.
-func NewScheduler(cfg *config.Config, client *networking.Client, processor *Processor, logger utils.Logger) *Scheduler {
+func NewScheduler(cfg *config.Config, client *networking.Client, processor *Processor, dm *networking.DomainManager, logger utils.Logger) *Scheduler {
 	return &Scheduler{
-		config:    cfg,
-		client:    client,
-		processor: processor,
-		logger:    logger,
-		findings:  make([]*report.Finding, 0),
+		config:        cfg,
+		client:        client,
+		processor:     processor,
+		domainManager: dm,
+		logger:        logger,
+		findings:      make([]*report.Finding, 0),
 		// wg and mu are initialized to their zero values, which is appropriate.
 	}
 }
@@ -129,6 +132,30 @@ func buildProbeData(url string, reqData networking.ClientRequestData, respData n
 	}
 }
 
+// performRequestWithDomainManagement é um helper para encapsular a lógica de DomainManager.
+func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData networking.ClientRequestData) networking.ClientResponseData {
+	canProceed, waitTime := s.domainManager.CanRequest(domain)
+	for !canProceed {
+		s.logger.Debugf("[Scheduler DM] Domínio '%s' requer espera de %s. Pausando goroutine.", domain, waitTime)
+		time.Sleep(waitTime)
+		canProceed, waitTime = s.domainManager.CanRequest(domain)
+	}
+
+	// Pode prosseguir
+	s.logger.Debugf("[Scheduler DM] Procedendo com a requisição para o domínio '%s' (URL: %s)", domain, reqData.URL)
+	respData := s.client.PerformRequest(reqData)
+	s.domainManager.RecordRequestSent(domain) // Registra que a requisição foi feita
+
+	// Analisa o resultado para possível bloqueio de domínio
+	var statusCode int
+	if respData.Response != nil {
+		statusCode = respData.Response.StatusCode
+	}
+	s.domainManager.RecordRequestResult(domain, statusCode, respData.Error)
+
+	return respData
+}
+
 // StartScan begins the scanning process based on the scheduler's configuration.
 func (s *Scheduler) StartScan() []*report.Finding {
 	s.logger.Infof("Preprocessing URLs...")
@@ -153,6 +180,13 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	semaphore := make(chan struct{}, concurrencyLimit)
 
 	for _, baseURL := range uniqueBaseURLs {
+		parsedBaseURL, errURLParse := url.Parse(baseURL)
+		if errURLParse != nil {
+			s.logger.Warnf("Falha ao parsear baseURL '%s': %v. Pulando este base URL.", baseURL, errURLParse)
+			continue
+		}
+		baseDomain := parsedBaseURL.Hostname()
+
 		paramSets := groupedBaseURLsAndParams[baseURL]
 		if len(paramSets) == 0 { // Should technically not happen if PreprocessAndGroupURLs adds an empty map for parameter-less URLs
 			paramSets = []map[string]string{{}} // Ensure at least one iteration for parameter-less base URLs
@@ -167,9 +201,10 @@ func (s *Scheduler) StartScan() []*report.Finding {
 			}
 
 			// Perform baseline request for this specific URL + param combination
-			s.logger.Debugf("[Scheduler] Performing Baseline Request for URL: %s", targetURLWithOriginalParams)
+			s.logger.Debugf("[Scheduler] Performing Baseline Request for URL: %s (Domain: %s)", targetURLWithOriginalParams, baseDomain)
 			baselineReqData := networking.ClientRequestData{URL: targetURLWithOriginalParams, Method: "GET"}
-			baselineRespData := s.client.PerformRequest(baselineReqData)
+			// Usa o helper com gerenciamento de domínio
+			baselineRespData := s.performRequestWithDomainManagement(baseDomain, baselineReqData)
 			baselineProbe := buildProbeData(targetURLWithOriginalParams, baselineReqData, baselineRespData)
 			s.logger.Debugf("[Scheduler] Baseline Probe for %s - Status: %s, Body Size: %d, Error: %v", targetURLWithOriginalParams, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
 
@@ -184,14 +219,14 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 			// Test Headers
 			if len(s.config.HeadersToTest) > 0 {
-				s.logger.Debugf("[Scheduler] Starting header tests for %s", targetURLWithOriginalParams)
+				s.logger.Debugf("[Scheduler] Starting header tests for %s (Domain: %s)", targetURLWithOriginalParams, baseDomain)
 				for _, headerName := range s.config.HeadersToTest {
 					s.wg.Add(1)
 					semaphore <- struct{}{}
-					go func(urlToTest, currentHeaderName string, baseProbe ProbeData) {
+					go func(urlToTest, currentHeaderName, domain string, baseProbe ProbeData) {
 						defer s.wg.Done()
 						defer func() { <-semaphore }()
-						s.logger.Debugf("[Scheduler Worker] START HEADER TEST: URL=%s, Header=%s", urlToTest, currentHeaderName)
+						s.logger.Debugf("[Scheduler Worker] START HEADER TEST: URL=%s, Header=%s, Domain=%s", urlToTest, currentHeaderName, domain)
 
 						injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + currentHeaderName)
 						s.logger.Debugf("[Scheduler Worker] Generated Injected Value for %s on %s: %s", currentHeaderName, urlToTest, injectedValue)
@@ -200,7 +235,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 						s.logger.Debugf("[Scheduler Worker] Performing Probe A for URL: %s, Header: %s, Value: %s", urlToTest, currentHeaderName, injectedValue)
 						probeAReqHeaders := http.Header{currentHeaderName: []string{injectedValue}}
 						probeAReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET", CustomHeaders: probeAReqHeaders}
-						probeARespData := s.client.PerformRequest(probeAReqData)
+						probeARespData := s.performRequestWithDomainManagement(domain, probeAReqData)
 						probeAProbe := buildProbeData(urlToTest, probeAReqData, probeARespData)
 						s.logger.Debugf("[Scheduler Worker] Probe A for %s (Header: %s) - Status: %s, Body Size: %d, Error: %v", urlToTest, currentHeaderName, getStatus(probeAProbe.Response), len(probeAProbe.Body), probeAProbe.Error)
 						if probeAProbe.Error != nil {
@@ -210,7 +245,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 						// Probe B (cache check - sent after Probe A)
 						s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for URL: %s (after Header: %s test)", urlToTest, currentHeaderName)
 						probeBReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET"}
-						probeBRespData := s.client.PerformRequest(probeBReqData)
+						probeBRespData := s.performRequestWithDomainManagement(domain, probeBReqData)
 						probeBProbe := buildProbeData(urlToTest, probeBReqData, probeBRespData)
 						s.logger.Debugf("[Scheduler Worker] Probe B for %s (after Header: %s test) - Status: %s, Body Size: %d, Error: %v", urlToTest, currentHeaderName, getStatus(probeBProbe.Response), len(probeBProbe.Body), probeBProbe.Error)
 						if probeBProbe.Error != nil {
@@ -230,7 +265,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 							s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s via HEADER %s (Payload: %s)", finding.Vulnerability, urlToTest, currentHeaderName, injectedValue)
 						}
 						s.logger.Debugf("[Scheduler Worker] END HEADER TEST: URL=%s, Header=%s", urlToTest, currentHeaderName)
-					}(targetURLWithOriginalParams, headerName, baselineProbe)
+					}(targetURLWithOriginalParams, headerName, baseDomain, baselineProbe)
 				}
 			}
 
@@ -249,10 +284,10 @@ func (s *Scheduler) StartScan() []*report.Finding {
 					for _, paramPayload := range payloadsToTest {
 						s.wg.Add(1)
 						semaphore <- struct{}{}
-						go func(urlToTestWithOriginalParams, currentParamName, currentOriginalParamValue, currentParamPayload string, baseProbe ProbeData) {
+						go func(urlToTestWithOriginalParams, currentParamName, currentOriginalParamValue, currentParamPayload, domain string, baseProbe ProbeData) {
 							defer s.wg.Done()
 							defer func() { <-semaphore }()
-							s.logger.Debugf("[Scheduler Worker] START PARAM TEST: URL=%s, Param=%s, Payload=%s", urlToTestWithOriginalParams, currentParamName, currentParamPayload)
+							s.logger.Debugf("[Scheduler Worker] START PARAM TEST: URL=%s, Param=%s, Payload=%s, Domain=%s", urlToTestWithOriginalParams, currentParamName, currentParamPayload, domain)
 
 							// Probe A (with injected parameter value)
 							probeAURLForParamTest, err := modifyURLQueryParam(urlToTestWithOriginalParams, currentParamName, currentParamPayload)
@@ -262,7 +297,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 							}
 							s.logger.Debugf("[Scheduler Worker] Performing Probe A for Param Test. URL: %s", probeAURLForParamTest)
 							probeAParamReqData := networking.ClientRequestData{URL: probeAURLForParamTest, Method: "GET"}
-							probeAParamRespData := s.client.PerformRequest(probeAParamReqData)
+							probeAParamRespData := s.performRequestWithDomainManagement(domain, probeAParamReqData)
 							probeAParamProbe := buildProbeData(probeAURLForParamTest, probeAParamReqData, probeAParamRespData)
 							s.logger.Debugf("[Scheduler Worker] Probe A for Param Test %s (Param: %s) - Status: %s, Body Size: %d, Error: %v", urlToTestWithOriginalParams, currentParamName, getStatus(probeAParamProbe.Response), len(probeAParamProbe.Body), probeAParamProbe.Error)
 							if probeAParamProbe.Error != nil {
@@ -272,7 +307,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 							// Probe B (cache check - original URL with original params)
 							s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for Param Test. URL: %s (after Param: %s test)", urlToTestWithOriginalParams, currentParamName)
 							probeBParamReqData := networking.ClientRequestData{URL: urlToTestWithOriginalParams, Method: "GET"}
-							probeBParamRespData := s.client.PerformRequest(probeBParamReqData)
+							probeBParamRespData := s.performRequestWithDomainManagement(domain, probeBParamReqData)
 							probeBParamProbe := buildProbeData(urlToTestWithOriginalParams, probeBParamReqData, probeBParamRespData)
 							s.logger.Debugf("[Scheduler Worker] Probe B for Param Test %s (after Param: %s test) - Status: %s, Body Size: %d, Error: %v", urlToTestWithOriginalParams, currentParamName, getStatus(probeBParamProbe.Response), len(probeBParamProbe.Body), probeBParamProbe.Error)
 							if probeBParamProbe.Error != nil {
@@ -292,7 +327,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 								s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s via PARAMETER %s (Payload: %s)", finding.Vulnerability, urlToTestWithOriginalParams, currentParamName, currentParamPayload)
 							}
 							s.logger.Debugf("[Scheduler Worker] END PARAM TEST: URL=%s, Param=%s", urlToTestWithOriginalParams, currentParamName)
-						}(targetURLWithOriginalParams, paramName, originalParamValue, paramPayload, baselineProbe)
+						}(targetURLWithOriginalParams, paramName, originalParamValue, paramPayload, baseDomain, baselineProbe)
 					}
 				}
 			}
