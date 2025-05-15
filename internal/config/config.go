@@ -30,6 +30,10 @@ type Config struct {
 	TargetsFile          string // Path to a file containing target URLs
 	MinRequestDelayMs    int
 	DomainCooldownMs     int
+	MaxRetries           int    // Número máximo de retentativas por requisição
+	RetryDelayBaseMs     int    // Delay base para backoff exponencial em ms
+	RetryDelayMaxMs      int    // Delay máximo para backoff em ms
+	MaxConsecutiveFailuresToBlock int    // Novo: Número de falhas de rede consecutivas para bloquear um domínio
 	// Novas flags/opções podem ser adicionadas aqui e gerenciadas pelo Viper
 	NoColor bool // Para desabilitar output colorido
 	Silent  bool // Para suprimir logs não críticos
@@ -82,6 +86,10 @@ func GetDefaultConfig() *Config {
 		TargetsFile:          "",
 		MinRequestDelayMs:    500,
 		DomainCooldownMs:     300000,
+		MaxRetries:           3,    // Default de 3 retentativas
+		RetryDelayBaseMs:     200,  // Default de 200ms para delay base
+		RetryDelayMaxMs:      5000, // Default de 5000ms (5s) para delay máximo
+		MaxConsecutiveFailuresToBlock: 3,    // Default para 3 falhas consecutivas
 		NoColor:              false,
 		Silent:               false,
 	}
@@ -172,11 +180,26 @@ func (c *Config) Validate() error {
 	if len(c.HeadersToTest) == 0 {
 		return fmt.Errorf("headersToTest cannot be empty")
 	}
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("maxRetries cannot be negative")
+	}
+	if c.RetryDelayBaseMs < 0 {
+		return fmt.Errorf("retryDelayBaseMs cannot be negative")
+	}
+	if c.RetryDelayMaxMs < 0 {
+		return fmt.Errorf("retryDelayMaxMs cannot be negative")
+	}
+	if c.RetryDelayBaseMs > c.RetryDelayMaxMs && c.RetryDelayMaxMs > 0 { // Only if MaxMs is not unlimited (0)
+		return fmt.Errorf("retryDelayBaseMs (%d) cannot be greater than retryDelayMaxMs (%d)", c.RetryDelayBaseMs, c.RetryDelayMaxMs)
+	}
+	if c.MaxConsecutiveFailuresToBlock < 0 { // 0 pode significar desabilitado, mas não negativo
+		return fmt.Errorf("maxConsecutiveFailuresToBlock cannot be negative")
+	}
 	return nil
 }
 
 // String (método de Config) permanece útil para debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity)
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, RetryDelayBaseMs: %d, RetryDelayMaxMs: %d, MaxConsecutiveFailuresToBlock: %d",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.RetryDelayBaseMs, c.RetryDelayMaxMs, c.MaxConsecutiveFailuresToBlock)
 } 

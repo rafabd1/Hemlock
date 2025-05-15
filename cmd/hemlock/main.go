@@ -80,6 +80,10 @@ Usa técnicas de probing para verificar se payloads injetados são refletidos e 
 		cfg.TargetsFile = vp.GetString("targets-file")
 		cfg.MinRequestDelayMs = vp.GetInt("min-delay")
 		cfg.DomainCooldownMs = vp.GetInt("cooldown")
+		cfg.MaxRetries = vp.GetInt("max-retries")
+		cfg.RetryDelayBaseMs = vp.GetInt("retry-delay-base")
+		cfg.RetryDelayMaxMs = vp.GetInt("retry-delay-max")
+		cfg.MaxConsecutiveFailuresToBlock = vp.GetInt("max-consecutive-failures")
 		cfg.NoColor = vp.GetBool("no-color")
 		cfg.Silent = vp.GetBool("silent")
 
@@ -168,6 +172,10 @@ Usa técnicas de probing para verificar se payloads injetados são refletidos e 
 		logger.Infof("Hemlock Cache Scanner iniciando...")
 		logger.Debugf("Configuração Efetiva: %s", cfg.String())
 
+		if err := cfg.Validate(); err != nil {
+			logger.Fatalf("Configuração inválida: %v", err)
+		}
+
 		if len(cfg.Targets) == 0 {
 			logger.Fatalf("Nenhum alvo especificado. Use --targets ou --targets-file.")
 		}
@@ -175,14 +183,7 @@ Usa técnicas de probing para verificar se payloads injetados são refletidos e 
 			logger.Fatalf("Nenhum header para testar foi carregado. Verifique --headers-file ou o arquivo padrão.")
 		}
 
-		var firstProxyURL string
-		if len(cfg.ParsedProxies) > 0 {
-			proxyEntry := cfg.ParsedProxies[0]
-			firstProxyURL = proxyEntry.String()
-			logger.Debugf("Usando primeiro proxy parseado para cliente HTTP: %s", firstProxyURL)
-		}
-
-		httpClient, errClient := networking.NewClient(cfg.RequestTimeout, cfg.UserAgent, firstProxyURL, logger)
+		httpClient, errClient := networking.NewClient(&cfg, logger)
 		if errClient != nil {
 			logger.Fatalf("Falha ao criar cliente HTTP: %v", errClient)
 		}
@@ -225,62 +226,40 @@ Usa técnicas de probing para verificar se payloads injetados são refletidos e 
 func init() {
 	// Configuração do Viper para defaults
 	defaults := config.GetDefaultConfig()
-	vp := viper.New() // Usar uma instância local para definir defaults, não a global do Viper
-
-	vp.SetDefault("payload-prefix", defaults.DefaultPayloadPrefix)
-	vp.SetDefault("concurrency", defaults.Concurrency)
-	vp.SetDefault("timeout", defaults.RequestTimeout) // Viper lida com time.Duration
-	vp.SetDefault("output-format", defaults.OutputFormat)
-	vp.SetDefault("verbosity", defaults.Verbosity)
-	vp.SetDefault("user-agent", defaults.UserAgent)
-	vp.SetDefault("min-delay", defaults.MinRequestDelayMs)
-	vp.SetDefault("cooldown", defaults.DomainCooldownMs)
-	vp.SetDefault("no-color", defaults.NoColor)
-	vp.SetDefault("silent", defaults.Silent)
-	// Para campos que não têm um "zero value" útil (como strings vazias para paths):
-	vp.SetDefault("output-file", defaults.OutputFile)     // Default é ""
-	vp.SetDefault("proxy", defaults.ProxyInput)             // Default é ""
-	vp.SetDefault("headers-file", defaults.HeadersFile)   // Default é ""
-	vp.SetDefault("targets-file", defaults.TargetsFile)   // Default é ""
-	// Viper.SetDefault para slices como "targets" e "payloads" pode ser um pouco tricky se eles podem vir de múltiplas fontes.
-	// Geralmente, para flags que podem ser repetidas ou são CSV, Cobra as parseia em slices diretamente.
-	// Viper as lerá como tal se vinculadas. Definir default como slice vazio é seguro.
-	vp.SetDefault("targets", []string{})
-	vp.SetDefault("payloads", []string{})
+	// Viper agora é inicializado e usado localmente em PersistentPreRunE para popular cfg
+	// e aqui para definir os defaults para as flags do Cobra.
 
 	// Flags Persistentes (disponíveis para o comando raiz e qualquer subcomando)
-	rootCmd.PersistentFlags().StringSliceP("targets", "t", vp.GetStringSlice("targets"), "Lista de URLs alvo separadas por vírgula (ex: http://host1,http://host2)")
-	rootCmd.PersistentFlags().StringP("targets-file", "f", vp.GetString("targets-file"), "Caminho para um arquivo contendo URLs alvo (uma por linha)")
-	// Alias -tf para targets-file, Cobra não suporta alias nativo para flags, então definimos duas flags que fazem a mesma coisa e a lógica em PreRun lida com isso.
-	// Ou podemos apenas documentar -f como short.
+	rootCmd.PersistentFlags().StringSliceP("targets", "t", defaults.Targets, "Lista de URLs alvo separadas por vírgula (ex: http://host1,http://host2)")
+	rootCmd.PersistentFlags().StringP("targets-file", "f", defaults.TargetsFile, "Caminho para um arquivo contendo URLs alvo (uma por linha)")
 
-	rootCmd.PersistentFlags().String("headers-file", vp.GetString("headers-file"), "Caminho para o arquivo de headers a testar (default: wordlists/headers.txt em locais padrão)")
-	rootCmd.PersistentFlags().StringSlice("payloads", vp.GetStringSlice("payloads"), "Lista de payloads base para usar (separados por vírgula)")
-	rootCmd.PersistentFlags().String("payload-prefix", vp.GetString("payload-prefix"), "Prefixo para payloads gerados automaticamente se a lista de payloads base estiver vazia")
+	rootCmd.PersistentFlags().String("headers-file", defaults.HeadersFile, "Caminho para o arquivo de headers a testar (default: wordlists/headers.txt em locais padrão)")
+	rootCmd.PersistentFlags().StringSlice("payloads", defaults.BasePayloads, "Lista de payloads base para usar (separados por vírgula)")
+	rootCmd.PersistentFlags().String("payload-prefix", defaults.DefaultPayloadPrefix, "Prefixo para payloads gerados automaticamente se a lista de payloads base estiver vazia")
 
-	rootCmd.PersistentFlags().StringP("output-file", "o", vp.GetString("output-file"), "Caminho do arquivo para salvar os resultados (default: stdout)")
-	rootCmd.PersistentFlags().String("output-format", vp.GetString("output-format"), "Formato da saída: json ou text")
+	rootCmd.PersistentFlags().StringP("output-file", "o", defaults.OutputFile, "Caminho do arquivo para salvar os resultados (default: stdout)")
+	rootCmd.PersistentFlags().String("output-format", defaults.OutputFormat, "Formato da saída: json ou text")
 
-	rootCmd.PersistentFlags().StringP("verbosity", "V", vp.GetString("verbosity"), "Nível de log: debug, info, warn, error, fatal")
-	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Atalho para --verbosity debug") // Flag booleana separada para -v
+	rootCmd.PersistentFlags().StringP("verbosity", "V", defaults.Verbosity, "Nível de log: debug, info, warn, error, fatal")
+	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Atalho para --verbosity debug")
 
-	rootCmd.PersistentFlags().IntP("concurrency", "c", vp.GetInt("concurrency"), "Número de workers concorrentes")
-	rootCmd.PersistentFlags().DurationP("timeout", "T", vp.GetDuration("timeout"), "Timeout para requisições HTTP (ex: 10s, 1m)")
-	rootCmd.PersistentFlags().String("user-agent", vp.GetString("user-agent"), "User-Agent customizado para as requisições")
-	rootCmd.PersistentFlags().String("proxy", vp.GetString("proxy"), "Proxy para usar (URL, lista CSV ou path de arquivo)")
+	rootCmd.PersistentFlags().IntP("concurrency", "c", defaults.Concurrency, "Número de workers concorrentes")
+	rootCmd.PersistentFlags().DurationP("timeout", "T", defaults.RequestTimeout, "Timeout para requisições HTTP (ex: 10s, 1m)")
+	rootCmd.PersistentFlags().String("user-agent", defaults.UserAgent, "User-Agent customizado para as requisições")
+	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy para usar (URL, lista CSV ou path de arquivo)")
 
-	rootCmd.PersistentFlags().Int("min-delay", vp.GetInt("min-delay"), "Atraso mínimo em ms entre requisições para o mesmo domínio")
-	rootCmd.PersistentFlags().Int("cooldown", vp.GetInt("cooldown"), "Período de cooldown em ms para um domínio após ser bloqueado")
+	rootCmd.PersistentFlags().Int("min-delay", defaults.MinRequestDelayMs, "Atraso mínimo em ms entre requisições para o mesmo domínio")
+	rootCmd.PersistentFlags().Int("cooldown", defaults.DomainCooldownMs, "Período de cooldown em ms para um domínio após ser bloqueado")
 
-	rootCmd.PersistentFlags().Bool("no-color", vp.GetBool("no-color"), "Desabilitar cores na saída de texto")
-	rootCmd.PersistentFlags().Bool("silent", vp.GetBool("silent"), "Suprimir todos os logs exceto resultados finais (achados)")
+	// Novas flags para retentativas
+	rootCmd.PersistentFlags().Int("max-retries", defaults.MaxRetries, "Número máximo de retentativas por requisição")
+	rootCmd.PersistentFlags().Int("retry-delay-base", defaults.RetryDelayBaseMs, "Delay base em ms para backoff exponencial entre retentativas")
+	rootCmd.PersistentFlags().Int("retry-delay-max", defaults.RetryDelayMaxMs, "Delay máximo em ms para backoff entre retentativas")
+	rootCmd.PersistentFlags().Int("max-consecutive-failures", defaults.MaxConsecutiveFailuresToBlock, "Número de falhas de rede consecutivas para bloquear um domínio (0 para desabilitar por este método)")
 
-	// Vincular as flags definidas acima ao Viper (para que Viper possa ler os valores das flags)
-	// Isso é feito no PersistentPreRunE para garantir que a instância correta do viper (vp local ao comando) seja usada.
-	// No entanto, a documentação do Viper sugere fazer isso no init() se possível.
-	// A questão é que as flags são definidas em rootCmd.PersistentFlags(), e precisamos dessa referência.
-	// A abordagem de BindPFlags no PreRun é mais segura para garantir que estamos vinculando ao conjunto correto de flags.
-	// Ou, alternativamente, podemos passar vp do init para PreRun, mas isso é mais complicado.
+	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Desabilitar cores na saída de texto")
+	rootCmd.PersistentFlags().Bool("silent", defaults.Silent, "Suprimir todos os logs exceto resultados finais (achados)")
+
 }
 
 func main() {
