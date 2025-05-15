@@ -62,7 +62,7 @@ func getDefaultConfig() *Config {
 		OutputFile:           "hemlock_findings.json",
 		OutputFormat:         "json",
 		Verbosity:            "info",
-		UserAgent:            "Hemlock Cache Scanner/0.1",
+		UserAgent:            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		ProxyURL:             "",
 		HeadersFile:          "", // This will be used to ADD to the default/fallback list if specified in YAML
 		TargetsFile:          "",
@@ -205,9 +205,6 @@ func (c *Config) Validate() error {
 	}
 	if c.UserAgent == "" {
 		return fmt.Errorf("userAgent cannot be empty")
-	}
-	if c.ProxyURL == "" {
-		return fmt.Errorf("proxyUrl cannot be empty")
 	}
 	if len(c.Targets) == 0 {
 		return fmt.Errorf("targets cannot be empty")

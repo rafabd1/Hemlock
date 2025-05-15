@@ -124,4 +124,108 @@ func ExtractRelevantToken(injectedValue string) string {
 	}
 	// Not a URL with a clear hostname, or parsing failed; return the original value
 	return injectedValue
-} 
+}
+
+// PreprocessAndGroupURLs normalizes URLs, extracts base URLs, and groups their query parameters.
+// It returns a map of base URLs to a list of their original query parameter sets,
+// and a sorted list of unique base URLs for deterministic processing.
+func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[string]string, []string) {
+	groupedParams := make(map[string][]map[string]string)
+	baseURLExistence := make(map[string]struct{})
+	var uniqueBaseURLs []string
+
+	if logger == nil {
+		// Provide a no-op logger if nil is passed to prevent panics
+		logger = &NoOpLogger{}
+	}
+
+	for _, rawURL := range rawURLs {
+		normalizedFullURL, err := normalizeURL(rawURL, logger) // Normalizes scheme, host, sorts params etc.
+		if err != nil {
+			logger.Warnf("Skipping URL due to normalization error: %s, error: %v", rawURL, err)
+			continue
+		}
+
+		u, err := url.Parse(normalizedFullURL) // Parse the already normalized URL
+		if err != nil {
+			logger.Warnf("Skipping URL due to parse error after normalization: %s, error: %v", normalizedFullURL, err)
+			continue
+		}
+
+		// Construct base URL (scheme + host + path)
+		baseURL := &url.URL{
+			Scheme: u.Scheme,
+			Host:   u.Host,
+			Path:   u.Path,
+		}
+		baseString := baseURL.String()
+
+		// Collect original parameters from the *rawURL* before full normalization altered them for deduplication
+		// We use u.Query() from the *normalizedFullURL* as normalizeURL already sorted them, which is fine for grouping.
+		// The key is that parameters for the *same base URL* are grouped.
+		queryParamsMap := make(map[string]string)
+		originalURLParsed, parseErr := url.Parse(rawURL) // Parse original to get its specific query params
+		if parseErr == nil {
+			for k, v := range originalURLParsed.Query() {
+				if len(v) > 0 {
+					queryParamsMap[k] = v[0] // Take the first value if multiple are present for simplicity
+					// For more complex scenarios, might need to decide how to handle multiple values for a single param name.
+				}
+			}
+		}
+
+		if _, exists := baseURLExistence[baseString]; !exists {
+			baseURLExistence[baseString] = struct{}{}
+			uniqueBaseURLs = append(uniqueBaseURLs, baseString)
+		}
+
+		// Add the parameter set to the list for this base URL
+		// We add even if queryParamsMap is empty, to signify the base URL itself was an input
+		groupedParams[baseString] = append(groupedParams[baseString], queryParamsMap)
+	}
+
+	// Sort uniqueBaseURLs for deterministic processing order
+	sort.Strings(uniqueBaseURLs)
+
+	// Deduplicate parameter sets for each base URL (optional, but good for reducing redundant tests if inputs had exact same query strings for same base)
+	for base, paramSets := range groupedParams {
+		dedupedSets := []map[string]string{}
+		seenSets := make(map[string]struct{})
+		for _, pSet := range paramSets {
+			// Create a canonical representation of the param set for deduplication
+			var paramKeys []string
+			for k := range pSet {
+				paramKeys = append(paramKeys, k)
+			}
+			sort.Strings(paramKeys)
+			var canonicalParts []string
+			for _, k := range paramKeys {
+				canonicalParts = append(canonicalParts, k+"="+pSet[k])
+			}
+			canonicalString := strings.Join(canonicalParts, "&")
+
+			if _, seen := seenSets[canonicalString]; !seen {
+				seenSets[canonicalString] = struct{}{}
+				dedupedSets = append(dedupedSets, pSet)
+			}
+		}
+		groupedParams[base] = dedupedSets
+	}
+
+	logger.Infof("Preprocessed URLs. Found %d unique base URLs.", len(uniqueBaseURLs))
+	for _, base := range uniqueBaseURLs {
+		logger.Debugf("Base URL: %s, has %d unique parameter sets.", base, len(groupedParams[base]))
+	}
+
+	return groupedParams, uniqueBaseURLs
+}
+
+// NoOpLogger is a logger that does nothing, useful for utility functions
+// where a logger might not always be provided.
+type NoOpLogger struct{}
+
+func (l *NoOpLogger) Debugf(format string, args ...interface{}) {}
+func (l *NoOpLogger) Infof(format string, args ...interface{})  {}
+func (l *NoOpLogger) Warnf(format string, args ...interface{})  {}
+func (l *NoOpLogger) Errorf(format string, args ...interface{}) {}
+func (l *NoOpLogger) Fatalf(format string, args ...interface{}) {} 

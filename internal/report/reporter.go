@@ -12,7 +12,8 @@ type Finding struct {
 	URL             string `json:"url"`
 	Vulnerability   string `json:"vulnerability_type"` // e.g., "Unkeyed Header Input", "Reflected Payload in Cache"
 	Description     string `json:"description"`
-	UnkeyedInput    string `json:"unkeyed_input,omitempty"` // e.g., "X-Forwarded-Host"
+	InputType       string `json:"inputType,omitempty"`     // "header" or "parameter"
+	InputName       string `json:"inputName,omitempty"`       // e.g., "X-Forwarded-Host" or "param_name"
 	Payload         string `json:"payload,omitempty"`
 	Evidence        string `json:"evidence,omitempty"`       // Could be a snippet of the response or specific headers
 	// TODO: Add more fields as needed, e.g., Severity, Request/Response diffs
@@ -58,8 +59,8 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 			if err != nil { return err }
 			_, err = fmt.Fprintf(outputWriter, "  Description:     %s\n", finding.Description)
 			if err != nil { return err }
-			if finding.UnkeyedInput != "" {
-				_, err = fmt.Fprintf(outputWriter, "  Unkeyed Input:   %s\n", finding.UnkeyedInput)
+			if finding.InputType != "" && finding.InputName != "" {
+				_, err = fmt.Fprintf(outputWriter, "  Input:           %s (%s)\n", finding.InputName, finding.InputType)
 				if err != nil { return err }
 			}
 			if finding.Payload != "" {
@@ -96,7 +97,7 @@ func NewReporter(/* config */) *Reporter {
 // AddFinding records a new finding.
 func (r *Reporter) AddFinding(finding Finding) {
 	// TODO: Store finding (e.g., in a slice)
-	fmt.Printf("[VULN] URL: %s, Type: %s, Input: %s, Payload: %s\n", finding.URL, finding.Vulnerability, finding.UnkeyedInput, finding.Payload)
+	fmt.Printf("[VULN] URL: %s, Type: %s, Input: %s, Payload: %s\n", finding.URL, finding.Vulnerability, finding.InputName, finding.Payload)
 }
 
 // GenerateReport outputs all recorded findings in the configured format.
@@ -122,7 +123,7 @@ func (r *Reporter) GenerateReport(findings []Finding, outputPath string, format 
 	// Default to simple text format
 	for _, finding := range findings {
 		_, err := fmt.Fprintf(outputWriter, "URL: %s\nType: %s\nDescription: %s\nInput: %s\nPayload: %s\nEvidence: %s\n---\n",
-			finding.URL, finding.Vulnerability, finding.Description, finding.UnkeyedInput, finding.Payload, finding.Evidence)
+			finding.URL, finding.Vulnerability, finding.Description, finding.InputName, finding.Payload, finding.Evidence)
 		if err != nil {
 			return err
 		}

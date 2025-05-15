@@ -43,8 +43,8 @@ func NewProcessor(cfg *config.Config, logger utils.Logger) *Processor {
 // It takes data from a baseline request, a probe with a modified header (Probe A),
 // and a subsequent cache check request (Probe B).
 // It returns a Finding if a potential cache poisoning vulnerability is detected.
-func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedValue string, baseline ProbeData, probeA ProbeData, probeB ProbeData) (*report.Finding, error) {
-	p.logger.Debugf("Processor analyzing probes for URL: %s, Header: %s, Value: %s", targetURL, headerName, injectedValue)
+func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName string, injectedValue string, baseline ProbeData, probeA ProbeData, probeB ProbeData) (*report.Finding, error) {
+	p.logger.Debugf("Processor analyzing probes for URL: %s, InputType: %s, InputName: %s, Value: %s", targetURL, inputType, inputName, injectedValue)
 
 	// --- Basic Sanity Checks & Error Handling ---
 	if baseline.Error != nil {
@@ -54,12 +54,12 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 		// Depending on strategy, we might return early or try to proceed with caution.
 	}
 	if probeA.Error != nil {
-		p.logger.Warnf("Probe A (header %s:%s) for %s had an error: %v.", headerName, injectedValue, targetURL, probeA.Error)
+		p.logger.Warnf("Probe A (input %s:%s, type: %s) for %s had an error: %v.", inputName, injectedValue, inputType, targetURL, probeA.Error)
 		// If Probe A fails, we can't know if the header had an effect.
 		return nil, fmt.Errorf("probe A failed: %w", probeA.Error)
 	}
 	if probeB.Error != nil {
-		p.logger.Warnf("Probe B (cache check for %s after header %s:%s) had an error: %v.", targetURL, headerName, injectedValue, probeB.Error)
+		p.logger.Warnf("Probe B (cache check for %s after input %s:%s, type: %s) had an error: %v.", targetURL, inputName, injectedValue, inputType, probeB.Error)
 		// If Probe B fails, we can't confirm caching behavior.
 		return nil, fmt.Errorf("probe B failed: %w", probeB.Error)
 	}
@@ -82,7 +82,7 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 		reflectedInB_Headers := utils.HeadersContain(probeB.RespHeaders, injectedValue)
 
 		if reflectedInB_Body || reflectedInB_Headers {
-			p.logger.Infof("HEURISTIC 1: Injected value '%s' from Probe A (header %s) found in Probe B (cache check) for %s.", injectedValue, headerName, targetURL)
+			p.logger.Infof("HEURISTIC 1: Injected value '%s' from Probe A (input %s:%s, type: %s) found in Probe B (cache check) for %s.", injectedValue, inputName, inputType, targetURL)
 
 			probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
 			probeA_wasCacheable := utils.IsCacheable(probeA.Response)
@@ -99,38 +99,40 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 				reflectionLocationB += "headers"
 			}
 			
-			description := fmt.Sprintf("Header '%s' with value '%s' was reflected in Probe A's %s. A subsequent request (Probe B) also contained this value in its %s.", 
-				headerName, injectedValue, reflectionLocationA, reflectionLocationB)
+			description := fmt.Sprintf("Input '%s' (type: %s) with value '%s' was reflected in Probe A's %s. A subsequent request (Probe B) also contained this value in its %s.", 
+				inputName, inputType, injectedValue, reflectionLocationA, reflectionLocationB)
 
 			evidence := fmt.Sprintf("Probe A cacheable: %t. Probe B cache HIT indicated: %t.", probeA_wasCacheable, probeB_isCacheHit)
 
 			if probeB_isCacheHit || (probeA_wasCacheable && utils.BodiesAreSimilar(probeA.Body, probeB.Body, 0.95)) {
 				return &report.Finding{
 					URL:           targetURL,
-					Vulnerability: "Web Cache Poisoning via Unkeyed Header (Direct Reflection)",
+					Vulnerability: fmt.Sprintf("Web Cache Poisoning via Unkeyed %s (Direct Reflection)", inputType),
 					Description:   description + " The cache appears to have served the poisoned content.",
-					UnkeyedInput:  headerName,
+					InputType:     inputType,
+					InputName:     inputName,
 					Payload:       injectedValue,
 					Evidence:      evidence,
 				}, nil
 			} else {
 				return &report.Finding{
 					URL:           targetURL,
-					Vulnerability: "Potential Web Cache Deception (Direct Reflection, Unconfirmed Cache Hit)",
+					Vulnerability: fmt.Sprintf("Potential Web Cache Deception via Unkeyed %s (Direct Reflection, Unconfirmed Cache Hit)", inputType),
 					Description:   description + " The cache HIT status for Probe B was not definitively confirmed, but reflection occurred.",
-					UnkeyedInput:  headerName,
+					InputType:     inputType,
+					InputName:     inputName,
 					Payload:       injectedValue,
 					Evidence:      evidence,
 				}, nil
 			}
 		} // End if reflectedInB_Body || reflectedInB_Headers
 	} else { // Not reflected in Probe A body or headers
-		p.logger.Debugf("Injected value '%s' for header '%s' not directly reflected in Probe A's response for %s. Proceeding to Heuristic 2.", injectedValue, headerName, targetURL)
+		p.logger.Debugf("Injected value '%s' for input '%s' (type %s) not directly reflected in Probe A's response for %s. Proceeding to Heuristic 2.", injectedValue, inputName, inputType, targetURL)
 		// No direct reflection, so Heuristic 1 does not apply. We continue to Heuristic 2.
 	}
 
 	// --- Heuristic 2: Unkeyed Header Influences Other Cacheable Content (e.g., X-Forwarded-Host changing links) ---
-	p.logger.Debugf("HEURISTIC 2: Checking for indirect poisoning for %s with header %s...", targetURL, headerName)
+	p.logger.Debugf("HEURISTIC 2: Checking for indirect poisoning for %s with input %s (type %s)...", targetURL, inputName, inputType)
 
 	if baseline.Error != nil {
 		p.logger.Warnf("HEURISTIC 2: Skipping for %s due to baseline probe error: %v", targetURL, baseline.Error)
@@ -139,7 +141,7 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 	
 	probeA_wasCacheable := utils.IsCacheable(probeA.Response)
 	if !probeA_wasCacheable {
-		p.logger.Debugf("HEURISTIC 2: Probe A for %s (header %s) not cacheable, skipping indirect poisoning check.", targetURL, headerName)
+		p.logger.Debugf("HEURISTIC 2: Probe A for %s (input %s, type %s) not cacheable, skipping indirect poisoning check.", targetURL, inputName, inputType)
 		return nil, nil
 	}
 
@@ -163,14 +165,14 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 	bodyChanged, bodyChangeDesc := utils.AnalyzeBodyChanges(probeA.Body, baseline.Body, relevantInjectedToken, probeA.URL, baseline.URL, p.logger)
 
 	if headerChanged || bodyChanged {
-		p.logger.Infof("HEURISTIC 2: Potential indirect influence by header '%s' on %s. Header changes: %t (%s), Body changes: %t (%s)", 
-			headerName, targetURL, headerChanged, headerChangeDesc, bodyChanged, bodyChangeDesc)
+		p.logger.Infof("HEURISTIC 2: Potential indirect influence by input '%s' (type %s) on %s. Header changes: %t (%s), Body changes: %t (%s)", 
+			inputName, inputType, targetURL, headerChanged, headerChangeDesc, bodyChanged, bodyChangeDesc)
 
 		probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
 		bodiesSimilar_AB := utils.BodiesAreSimilar(probeA.Body, probeB.Body, 0.98) // High similarity for cache hit confirmation
 
 		if probeB_isCacheHit || bodiesSimilar_AB { // If Probe A was cacheable (checked above) and B is a hit or similar
-			description := fmt.Sprintf("Header '%s' with value '%s' appears to have indirectly influenced the response content of Probe A.", headerName, injectedValue)
+			description := fmt.Sprintf("Input '%s' (type %s) with value '%s' appears to have indirectly influenced the response content of Probe A.", inputName, inputType, injectedValue)
 			if headerChanged {
 				description += fmt.Sprintf(" Header change detected: %s.", headerChangeDesc)
 			}
@@ -183,9 +185,10 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 
 			return &report.Finding{
 				URL:           targetURL,
-				Vulnerability: "Web Cache Poisoning via Unkeyed Header (Indirect Influence)",
+				Vulnerability: fmt.Sprintf("Web Cache Poisoning via Unkeyed %s (Indirect Influence)", inputType),
 				Description:   description,
-				UnkeyedInput:  headerName,
+				InputType:     inputType,
+				InputName:     inputName,
 				Payload:       injectedValue,
 				Evidence:      evidence,
 			}, nil
@@ -194,7 +197,7 @@ func (p *Processor) AnalyzeProbes(targetURL string, headerName string, injectedV
 		}
 	}
 
-	p.logger.Debugf("No definitive cache poisoning vector found for %s with header %s by current heuristics.", targetURL, headerName)
+	p.logger.Debugf("No definitive cache poisoning vector found for %s with input %s (type %s) by current heuristics.", targetURL, inputName, inputType)
 	return nil, nil // No finding based on current simple heuristics
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -130,16 +131,17 @@ func buildProbeData(url string, reqData networking.ClientRequestData, respData n
 
 // StartScan begins the scanning process based on the scheduler's configuration.
 func (s *Scheduler) StartScan() []*report.Finding {
-	s.logger.Infof("Starting scan with %d targets and %d headers to test.", len(s.config.Targets), len(s.config.HeadersToTest))
-	s.logger.Debugf("Concurrency level set to: %d", s.config.Concurrency)
-	s.logger.Debugf("Request timeout set to: %s", s.config.RequestTimeout.String())
+	s.logger.Infof("Preprocessing URLs...")
+	groupedBaseURLsAndParams, uniqueBaseURLs := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
-	if len(s.config.Targets) == 0 {
-		s.logger.Warnf("No targets configured. Aborting scan.")
+	if len(uniqueBaseURLs) == 0 {
+		s.logger.Warnf("No processable targets found after preprocessing. Aborting scan.")
 		return s.findings
 	}
-	if len(s.config.HeadersToTest) == 0 {
-		s.logger.Warnf("No headers to test configured. Aborting scan.")
+	s.logger.Infof("Starting scan for %d unique base URLs.", len(uniqueBaseURLs))
+
+	if len(s.config.HeadersToTest) == 0 && len(s.config.BasePayloads) == 0 && s.config.DefaultPayloadPrefix == "" {
+		s.logger.Warnf("No headers to test and no base payloads/prefix configured. Aborting scan as no tests can be performed.")
 		return s.findings
 	}
 
@@ -150,81 +152,154 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	}
 	semaphore := make(chan struct{}, concurrencyLimit)
 
-	for _, targetURL := range s.config.Targets {
-		for _, headerName := range s.config.HeadersToTest {
-			s.wg.Add(1)                   // Increment WaitGroup counter
-			semaphore <- struct{}{}         // Acquire a spot in the semaphore
+	for _, baseURL := range uniqueBaseURLs {
+		paramSets := groupedBaseURLsAndParams[baseURL]
+		if len(paramSets) == 0 { // Should technically not happen if PreprocessAndGroupURLs adds an empty map for parameter-less URLs
+			paramSets = []map[string]string{{}} // Ensure at least one iteration for parameter-less base URLs
+		}
 
-			go func(url, header string) {
-				defer s.wg.Done()               
-				defer func() { <-semaphore }() 
+		for _, currentParamSet := range paramSets {
+			// Construct the target URL with its original parameters for this specific test iteration
+			targetURLWithOriginalParams, err := constructURLWithParams(baseURL, currentParamSet)
+			if err != nil {
+				s.logger.Warnf("Failed to construct URL from base '%s' and params %v: %v. Skipping this param set.", baseURL, currentParamSet, err)
+				continue
+			}
 
-				s.logger.Debugf("[Scheduler Worker] START: URL=%s, Header=%s", url, header)
+			// Perform baseline request for this specific URL + param combination
+			s.logger.Debugf("[Scheduler] Performing Baseline Request for URL: %s", targetURLWithOriginalParams)
+			baselineReqData := networking.ClientRequestData{URL: targetURLWithOriginalParams, Method: "GET"}
+			baselineRespData := s.client.PerformRequest(baselineReqData)
+			baselineProbe := buildProbeData(targetURLWithOriginalParams, baselineReqData, baselineRespData)
+			s.logger.Debugf("[Scheduler] Baseline Probe for %s - Status: %s, Body Size: %d, Error: %v", targetURLWithOriginalParams, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
 
-				// 1. Baseline Request
-				s.logger.Debugf("[Scheduler Worker] Performing Baseline Request for URL: %s", url)
-				baselineReqData := networking.ClientRequestData{URL: url, Method: "GET"}
-				baselineRespData := s.client.PerformRequest(baselineReqData)
-				baselineProbe := buildProbeData(url, baselineReqData, baselineRespData)
-				s.logger.Debugf("[Scheduler Worker] Baseline Probe for %s - Status: %s, Body Size: %d, Error: %v", url, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
+			if baselineProbe.Error != nil {
+				s.logger.Warnf("[Scheduler] Baseline request failed for URL %s: %v. Skipping probes for this target.", targetURLWithOriginalParams, baselineProbe.Error)
+				continue // Skip to next paramSet or baseURL
+			}
+			if baselineProbe.Response == nil {
+				s.logger.Warnf("[Scheduler] Baseline response is nil for URL %s, though no error reported. Skipping probes for this target.", targetURLWithOriginalParams)
+				continue // Skip to next paramSet or baseURL
+			}
 
-				if baselineProbe.Error != nil {
-					s.logger.Warnf("[Scheduler Worker] Baseline request failed for URL %s: %v. Skipping probes for this header.", url, baselineProbe.Error)
-					return
+			// Test Headers
+			if len(s.config.HeadersToTest) > 0 {
+				s.logger.Debugf("[Scheduler] Starting header tests for %s", targetURLWithOriginalParams)
+				for _, headerName := range s.config.HeadersToTest {
+					s.wg.Add(1)
+					semaphore <- struct{}{}
+					go func(urlToTest, currentHeaderName string, baseProbe ProbeData) {
+						defer s.wg.Done()
+						defer func() { <-semaphore }()
+						s.logger.Debugf("[Scheduler Worker] START HEADER TEST: URL=%s, Header=%s", urlToTest, currentHeaderName)
+
+						injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + currentHeaderName)
+						s.logger.Debugf("[Scheduler Worker] Generated Injected Value for %s on %s: %s", currentHeaderName, urlToTest, injectedValue)
+
+						// Probe A (with injected header)
+						s.logger.Debugf("[Scheduler Worker] Performing Probe A for URL: %s, Header: %s, Value: %s", urlToTest, currentHeaderName, injectedValue)
+						probeAReqHeaders := http.Header{currentHeaderName: []string{injectedValue}}
+						probeAReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET", CustomHeaders: probeAReqHeaders}
+						probeARespData := s.client.PerformRequest(probeAReqData)
+						probeAProbe := buildProbeData(urlToTest, probeAReqData, probeARespData)
+						s.logger.Debugf("[Scheduler Worker] Probe A for %s (Header: %s) - Status: %s, Body Size: %d, Error: %v", urlToTest, currentHeaderName, getStatus(probeAProbe.Response), len(probeAProbe.Body), probeAProbe.Error)
+						if probeAProbe.Error != nil {
+							s.logger.Warnf("[Scheduler Worker] Probe A request failed for URL %s, Header %s: %v. Analysis may be incomplete.", urlToTest, currentHeaderName, probeAProbe.Error)
+						}
+
+						// Probe B (cache check - sent after Probe A)
+						s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for URL: %s (after Header: %s test)", urlToTest, currentHeaderName)
+						probeBReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET"}
+						probeBRespData := s.client.PerformRequest(probeBReqData)
+						probeBProbe := buildProbeData(urlToTest, probeBReqData, probeBRespData)
+						s.logger.Debugf("[Scheduler Worker] Probe B for %s (after Header: %s test) - Status: %s, Body Size: %d, Error: %v", urlToTest, currentHeaderName, getStatus(probeBProbe.Response), len(probeBProbe.Body), probeBProbe.Error)
+						if probeBProbe.Error != nil {
+							s.logger.Warnf("[Scheduler Worker] Probe B request failed for URL %s, Header %s: %v. Analysis may be incomplete.", urlToTest, currentHeaderName, probeBProbe.Error)
+						}
+
+						s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, InputType: Header, InputName: %s, InjectedValue: %s", urlToTest, currentHeaderName, injectedValue)
+						// TODO: Modify AnalyzeProbes signature to accept inputType and inputName
+						finding, err := s.processor.AnalyzeProbes(urlToTest, "header", currentHeaderName, injectedValue, baseProbe, probeAProbe, probeBProbe)
+						if err != nil {
+							s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Header %s: %v", urlToTest, currentHeaderName, err)
+						}
+						if finding != nil {
+							s.mu.Lock()
+							s.findings = append(s.findings, finding)
+							s.mu.Unlock()
+							s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s via HEADER %s (Payload: %s)", finding.Vulnerability, urlToTest, currentHeaderName, injectedValue)
+						}
+						s.logger.Debugf("[Scheduler Worker] END HEADER TEST: URL=%s, Header=%s", urlToTest, currentHeaderName)
+					}(targetURLWithOriginalParams, headerName, baselineProbe)
 				}
-				if baselineProbe.Response == nil { 
-					s.logger.Warnf("[Scheduler Worker] Baseline response is nil for URL %s, though no error reported. Skipping probes for this header.", url)
-					return
+			}
+
+			// Test URL Parameters
+			// Use s.config.BasePayloads or generate from s.config.DefaultPayloadPrefix
+			payloadsToTest := s.config.BasePayloads
+			if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" {
+				// If BasePayloads is empty but prefix is set, generate a few sample payloads for params
+				// This is a placeholder; a more robust approach for param-specific payloads might be needed.
+				payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval1"))
+				// payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval2"))
+			}
+
+			if len(payloadsToTest) > 0 {
+				for paramName, originalParamValue := range currentParamSet {
+					for _, paramPayload := range payloadsToTest {
+						s.wg.Add(1)
+						semaphore <- struct{}{}
+						go func(urlToTestWithOriginalParams, currentParamName, currentOriginalParamValue, currentParamPayload string, baseProbe ProbeData) {
+							defer s.wg.Done()
+							defer func() { <-semaphore }()
+							s.logger.Debugf("[Scheduler Worker] START PARAM TEST: URL=%s, Param=%s, Payload=%s", urlToTestWithOriginalParams, currentParamName, currentParamPayload)
+
+							// Probe A (with injected parameter value)
+							probeAURLForParamTest, err := modifyURLQueryParam(urlToTestWithOriginalParams, currentParamName, currentParamPayload)
+							if err != nil {
+								s.logger.Warnf("[Scheduler Worker] Failed to build Probe A URL for param test on %s (param %s): %v", urlToTestWithOriginalParams, currentParamName, err)
+								return
+							}
+							s.logger.Debugf("[Scheduler Worker] Performing Probe A for Param Test. URL: %s", probeAURLForParamTest)
+							probeAParamReqData := networking.ClientRequestData{URL: probeAURLForParamTest, Method: "GET"}
+							probeAParamRespData := s.client.PerformRequest(probeAParamReqData)
+							probeAParamProbe := buildProbeData(probeAURLForParamTest, probeAParamReqData, probeAParamRespData)
+							s.logger.Debugf("[Scheduler Worker] Probe A for Param Test %s (Param: %s) - Status: %s, Body Size: %d, Error: %v", urlToTestWithOriginalParams, currentParamName, getStatus(probeAParamProbe.Response), len(probeAParamProbe.Body), probeAParamProbe.Error)
+							if probeAParamProbe.Error != nil {
+								s.logger.Warnf("[Scheduler Worker] Probe A (param test) request failed for URL %s, Param %s: %v. Analysis may be incomplete.", urlToTestWithOriginalParams, currentParamName, probeAParamProbe.Error)
+							}
+
+							// Probe B (cache check - original URL with original params)
+							s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for Param Test. URL: %s (after Param: %s test)", urlToTestWithOriginalParams, currentParamName)
+							probeBParamReqData := networking.ClientRequestData{URL: urlToTestWithOriginalParams, Method: "GET"}
+							probeBParamRespData := s.client.PerformRequest(probeBParamReqData)
+							probeBParamProbe := buildProbeData(urlToTestWithOriginalParams, probeBParamReqData, probeBParamRespData)
+							s.logger.Debugf("[Scheduler Worker] Probe B for Param Test %s (after Param: %s test) - Status: %s, Body Size: %d, Error: %v", urlToTestWithOriginalParams, currentParamName, getStatus(probeBParamProbe.Response), len(probeBParamProbe.Body), probeBParamProbe.Error)
+							if probeBParamProbe.Error != nil {
+								s.logger.Warnf("[Scheduler Worker] Probe B (param test) request failed for URL %s, Param %s: %v. Analysis may be incomplete.", urlToTestWithOriginalParams, currentParamName, probeBParamProbe.Error)
+							}
+
+							s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, InputType: Parameter, InputName: %s, InjectedValue: %s", urlToTestWithOriginalParams, currentParamName, currentParamPayload)
+							// TODO: Modify AnalyzeProbes signature
+							finding, err := s.processor.AnalyzeProbes(urlToTestWithOriginalParams, "parameter", currentParamName, currentParamPayload, baseProbe, probeAParamProbe, probeBParamProbe)
+							if err != nil {
+								s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Param %s: %v", urlToTestWithOriginalParams, currentParamName, err)
+							}
+							if finding != nil {
+								s.mu.Lock()
+								s.findings = append(s.findings, finding)
+								s.mu.Unlock()
+								s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s via PARAMETER %s (Payload: %s)", finding.Vulnerability, urlToTestWithOriginalParams, currentParamName, currentParamPayload)
+							}
+							s.logger.Debugf("[Scheduler Worker] END PARAM TEST: URL=%s, Param=%s", urlToTestWithOriginalParams, currentParamName)
+						}(targetURLWithOriginalParams, paramName, originalParamValue, paramPayload, baselineProbe)
+					}
 				}
-
-				injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-" + header)
-				s.logger.Debugf("[Scheduler Worker] Generated Injected Value for %s on %s: %s", header, url, injectedValue)
-
-				// 2. Probe A (with injected header)
-				s.logger.Debugf("[Scheduler Worker] Performing Probe A for URL: %s, Header: %s, Value: %s", url, header, injectedValue)
-				probeAReqHeaders := http.Header{header: []string{injectedValue}}
-				probeAReqData := networking.ClientRequestData{URL: url, Method: "GET", CustomHeaders: probeAReqHeaders}
-				probeARespData := s.client.PerformRequest(probeAReqData)
-				probeAProbe := buildProbeData(url, probeAReqData, probeARespData)
-				s.logger.Debugf("[Scheduler Worker] Probe A for %s (Header: %s) - Status: %s, Body Size: %d, Error: %v", url, header, getStatus(probeAProbe.Response), len(probeAProbe.Body), probeAProbe.Error)
-
-				if probeAProbe.Error != nil {
-					s.logger.Warnf("[Scheduler Worker] Probe A request failed for URL %s, Header %s: %v. Analysis may be incomplete.", url, header, probeAProbe.Error)
-				}
-
-				// 3. Probe B (cache check - sent after Probe A)
-				s.logger.Debugf("[Scheduler Worker] Performing Probe B (cache check) for URL: %s (after Header: %s test)", url, header)
-				probeBReqData := networking.ClientRequestData{URL: url, Method: "GET"} 
-				probeBRespData := s.client.PerformRequest(probeBReqData)
-				probeBProbe := buildProbeData(url, probeBReqData, probeBRespData)
-				s.logger.Debugf("[Scheduler Worker] Probe B for %s (after Header: %s test) - Status: %s, Body Size: %d, Error: %v", url, header, getStatus(probeBProbe.Response), len(probeBProbe.Body), probeBProbe.Error)
-
-				if probeBProbe.Error != nil {
-					s.logger.Warnf("[Scheduler Worker] Probe B request failed for URL %s, Header %s (after Probe A): %v. Analysis may be incomplete.", url, header, probeBProbe.Error)
-				}
-
-				s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, Header: %s, InjectedValue: %s", url, header, injectedValue)
-				finding, err := s.processor.AnalyzeProbes(url, header, injectedValue, baselineProbe, probeAProbe, probeBProbe)
-				if err != nil {
-					s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Header %s: %v", url, header, err)
-				}
-
-				if finding != nil {
-					s.mu.Lock()
-					s.findings = append(s.findings, finding)
-					s.mu.Unlock()
-					s.logger.Infof("[Scheduler Worker] VULNERABILITY DETECTED: %s on %s with header %s (Payload: %s)", finding.Vulnerability, url, header, injectedValue)
-					s.logger.Debugf("[Scheduler Worker] Finding Details: URL=%s, Vuln=%s, Desc=%s, Input=%s, Payload=%s, Evidence=%s", finding.URL, finding.Vulnerability, finding.Description, finding.UnkeyedInput, finding.Payload, finding.Evidence) // Log full finding on debug
-				} else {
-					s.logger.Debugf("[Scheduler Worker] No finding from processor for URL: %s, Header: %s, InjectedValue: %s", url, header, injectedValue)
-				}
-				s.logger.Debugf("[Scheduler Worker] END: URL=%s, Header=%s", url, header)
-
-			}(targetURL, headerName)
+			}
 		}
 	}
 
-	s.wg.Wait() 
+	s.wg.Wait()
 	s.logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(s.findings))
 	return s.findings
 }
@@ -235,6 +310,35 @@ func getStatus(resp *http.Response) string {
 		return "N/A (No Response)"
 	}
 	return resp.Status
+}
+
+// Helper function to construct a URL string from a base URL and a map of query parameters.
+func constructURLWithParams(baseURL string, params map[string]string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse base URL '%s': %w", baseURL, err)
+	}
+	if len(params) == 0 {
+		return u.String(), nil
+	}
+	q := u.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// Helper function to modify a single query parameter in a URL string.
+func modifyURLQueryParam(originalURL string, paramNameToModify string, newParamValue string) (string, error) {
+	u, err := url.Parse(originalURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse original URL '%s': %w", originalURL, err)
+	}
+	q := u.Query()
+	q.Set(paramNameToModify, newParamValue) // Set the new value for the specified parameter
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // TODO: Implement StartScan() method that iterates targets and headers.
