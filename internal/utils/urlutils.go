@@ -142,7 +142,50 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 		logger = &NoOpLogger{}
 	}
 
+	// Define a default list of extensions to ignore for cache poisoning tests
+	// TODO: This list could be made configurable in the future
+	defaultIgnoredExtensions := []string{
+		".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", // Common web assets
+		".map",                         // Source maps
+		".xml", ".json", ".txt",       // Common data files (unless specifically targeted)
+		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", // Documents
+		".zip", ".tar", ".gz", ".rar", // Archives
+		".mp4", ".avi", ".mov", ".webm", // Video
+		".mp3", ".wav", ".ogg", // Audio
+		".ico",                                                        // Favicons
+		".d.ts", ".ts", ".tsx", ".jsx", // TypeScript/JavaScript specific build/type files
+		".vue", ".svelte", // Framework specific files
+		// Consider adding more based on typical non-HTML, non-dynamic content
+	}
+	lowerIgnoredExtensions := make([]string, len(defaultIgnoredExtensions))
+	for i, ext := range defaultIgnoredExtensions {
+		lowerIgnoredExtensions[i] = strings.ToLower(ext)
+	}
+
 	for _, rawURL := range rawURLs {
+		// Attempt to parse the raw URL early to check its extension first
+		parsedForExtCheck, errExtCheck := url.Parse(rawURL)
+		if errExtCheck != nil {
+			logger.Warnf("Skipping URL due to initial parse error (for extension check): %s, error: %v", rawURL, errExtCheck)
+			continue
+		}
+
+		// Filter by extension
+		currentExtension := strings.ToLower(path.Ext(parsedForExtCheck.Path))
+		if currentExtension != "" { // Only check if there is an extension
+			isIgnored := false
+			for _, ignoredExt := range lowerIgnoredExtensions {
+				if currentExtension == ignoredExt {
+					isIgnored = true
+					break
+				}
+			}
+			if isIgnored {
+				logger.Debugf("Filtering out URL %s due to ignored extension: %s", rawURL, currentExtension)
+				continue
+			}
+		}
+
 		normalizedFullURL, err := normalizeURL(rawURL, logger) // Normalizes scheme, host, sorts params etc.
 		if err != nil {
 			logger.Warnf("Skipping URL due to normalization error: %s, error: %v", rawURL, err)
@@ -164,11 +207,11 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 		baseString := baseURL.String()
 
 		queryParamsMap := make(map[string]string)
-		originalURLParsed, parseErr := url.Parse(rawURL) 
+		originalURLParsed, parseErr := url.Parse(rawURL)
 		if parseErr == nil {
 			for k, v := range originalURLParsed.Query() {
 				if len(v) > 0 {
-					queryParamsMap[k] = v[0] 
+					queryParamsMap[k] = v[0]
 				}
 			}
 		}
@@ -216,7 +259,7 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 	}
 	groupedParams = tempGroupedParams // Update with deduped sets
 
-	logger.Infof("Preprocessed URLs. Found %d unique base URLs.", len(uniqueBaseURLs))
+	logger.Infof("Preprocessed URLs. Found %d unique base URLs after filtering.", len(uniqueBaseURLs)) // Updated log
 	logger.Debugf("Total query parameters found across all unique sets: %d", totalQueryParametersFound)
 	logger.Debugf("Number of base URLs with parameters: %d", baseURLsWithParamsCount)
 
