@@ -44,24 +44,30 @@ func NewProcessor(cfg *config.Config, logger utils.Logger) *Processor {
 // and a subsequent cache check request (Probe B).
 // It returns a Finding if a potential cache poisoning vulnerability is detected.
 func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName string, injectedValue string, baseline ProbeData, probeA ProbeData, probeB ProbeData) (*report.Finding, error) {
-	p.logger.Debugf("Processor analyzing probes for URL: %s, InputType: %s, InputName: %s, Value: %s", targetURL, inputType, inputName, injectedValue)
+	if p.config.VerbosityLevel >= 2 { // -vv
+		p.logger.Debugf("[Processor] Analyzing probes for URL: %s, InputType: %s, InputName: %s, Value: %s", targetURL, inputType, inputName, injectedValue)
+	}
 
 	// --- Basic Sanity Checks & Error Handling ---
 	if baseline.Error != nil {
 		// If baseline itself failed significantly, it's hard to compare.
-		// The scheduler might have already logged this, but processor can also note it.
-		p.logger.Warnf("Baseline probe for %s had an error: %v. Analysis might be unreliable.", targetURL, baseline.Error)
+		// This is an execution error that impacts analysis.
+		p.logger.Warnf("[Processor] Baseline probe for %s had an error: %v. Analysis might be unreliable.", targetURL, baseline.Error)
 		// Depending on strategy, we might return early or try to proceed with caution.
 	}
 	if probeA.Error != nil {
-		p.logger.Warnf("Probe A (input %s:%s, type: %s) for %s had an error: %v.", inputName, injectedValue, inputType, targetURL, probeA.Error)
+		if p.config.VerbosityLevel >= 1 { // -v
+			p.logger.Warnf("[Processor] Probe A (input %s:%s, type: %s) for %s had an error: %v.", inputName, injectedValue, inputType, targetURL, probeA.Error)
+		}
 		// If Probe A fails, we can't know if the header had an effect.
-		return nil, fmt.Errorf("probe A failed: %w", probeA.Error)
+		return nil, fmt.Errorf("probe A failed: %w", probeA.Error) // Error returned to scheduler
 	}
 	if probeB.Error != nil {
-		p.logger.Warnf("Probe B (cache check for %s after input %s:%s, type: %s) had an error: %v.", targetURL, inputName, injectedValue, inputType, probeB.Error)
+		if p.config.VerbosityLevel >= 1 { // -v
+			p.logger.Warnf("[Processor] Probe B (cache check for %s after input %s:%s, type: %s) had an error: %v.", targetURL, inputName, injectedValue, inputType, probeB.Error)
+		}
 		// If Probe B fails, we can't confirm caching behavior.
-		return nil, fmt.Errorf("probe B failed: %w", probeB.Error)
+		return nil, fmt.Errorf("probe B failed: %w", probeB.Error) // Error returned to scheduler
 	}
 
 	// --- Heuristic 1: Unkeyed Header Input Leads to Content Reflection in Cache (Classic Poisoning) ---
@@ -75,14 +81,18 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 
 	// Heuristic 1: Direct reflection of injectedValue
 	if reflectedInA_Body || reflectedInA_Headers {
-		p.logger.Debugf("Injected value '%s' REFLECTED in Probe A for %s (Body: %t, Headers: %t).", injectedValue, targetURL, reflectedInA_Body, reflectedInA_Headers)
+		if p.config.VerbosityLevel >= 2 { // -vv
+			p.logger.Debugf("[Processor] Injected value '%s' REFLECTED in Probe A for %s (Body: %t, Headers: %t).", injectedValue, targetURL, reflectedInA_Body, reflectedInA_Headers)
+		}
 
 		// Now check Probe B (cache check)
 		reflectedInB_Body := utils.BodyContains(probeB.Body, []byte(injectedValue))
 		reflectedInB_Headers := utils.HeadersContain(probeB.RespHeaders, injectedValue)
 
 		if reflectedInB_Body || reflectedInB_Headers {
-			p.logger.Infof("HEURISTIC 1: Injected value '%s' from Probe A (input %s:%s, type: %s) found in Probe B (cache check) for %s.", injectedValue, inputName, inputType, targetURL)
+			if p.config.VerbosityLevel >= 1 { // -v
+				p.logger.Infof("[Processor] HEURISTIC 1: Injected value '%s' from Probe A (input %s:%s, type: %s) found in Probe B (cache check) for %s.", injectedValue, inputName, inputType, targetURL)
+			}
 
 			probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
 			probeA_wasCacheable := utils.IsCacheable(probeA.Response)
@@ -127,21 +137,28 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 			}
 		} // End if reflectedInB_Body || reflectedInB_Headers
 	} else { // Not reflected in Probe A body or headers
-		p.logger.Debugf("Injected value '%s' for input '%s' (type %s) not directly reflected in Probe A's response for %s. Proceeding to Heuristic 2.", injectedValue, inputName, inputType, targetURL)
+		if p.config.VerbosityLevel >= 2 { // -vv
+			p.logger.Debugf("[Processor] Injected value '%s' for input '%s' (type %s) not directly reflected in Probe A's response for %s. Proceeding to Heuristic 2.", injectedValue, inputName, inputType, targetURL)
+		}
 		// No direct reflection, so Heuristic 1 does not apply. We continue to Heuristic 2.
 	}
 
 	// --- Heuristic 2: Unkeyed Header Influences Other Cacheable Content (e.g., X-Forwarded-Host changing links) ---
-	p.logger.Debugf("HEURISTIC 2: Checking for indirect poisoning for %s with input %s (type %s)...", targetURL, inputName, inputType)
+	if p.config.VerbosityLevel >= 2 { // -vv
+		p.logger.Debugf("[Processor] HEURISTIC 2: Checking for indirect poisoning for %s with input %s (type %s)...", targetURL, inputName, inputType)
+	}
 
 	if baseline.Error != nil {
-		p.logger.Warnf("HEURISTIC 2: Skipping for %s due to baseline probe error: %v", targetURL, baseline.Error)
+		// Already logged with Warnf above if baseline.Error is not nil.
+		// p.logger.Warnf("[Processor] HEURISTIC 2: Skipping for %s due to baseline probe error: %v", targetURL, baseline.Error)
 		return nil, nil
 	}
 	
 	probeA_wasCacheable := utils.IsCacheable(probeA.Response)
 	if !probeA_wasCacheable {
-		p.logger.Debugf("HEURISTIC 2: Probe A for %s (input %s, type %s) not cacheable, skipping indirect poisoning check.", targetURL, inputName, inputType)
+		if p.config.VerbosityLevel >= 2 { // -vv
+			p.logger.Debugf("[Processor] HEURISTIC 2: Probe A for %s (input %s, type %s) not cacheable, skipping indirect poisoning check.", targetURL, inputName, inputType)
+		}
 		return nil, nil
 	}
 
@@ -150,13 +167,17 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 	if relevantInjectedToken == "" && injectedValue != "" { // If extraction yields nothing but original was something, use original
 		relevantInjectedToken = injectedValue
 	} else if injectedValue == "" { // if original injected value was empty, token is empty, skip. 
-		p.logger.Debugf("HEURISTIC 2: Injected value and relevant token are empty for %s, skipping specific indirect checks.", targetURL)
+		if p.config.VerbosityLevel >= 2 { // -vv
+			p.logger.Debugf("[Processor] HEURISTIC 2: Injected value and relevant token are empty for %s, skipping specific indirect checks.", targetURL)
+		}
 		// We might still want a generic diff later, but for token-based checks, this is a no-op.
 		// For now, we will return, but a more advanced diff that doesn't rely on a token could go here.
 		return nil, nil
 	}
 
-	p.logger.Debugf("HEURISTIC 2: Using relevant token '%s' (from injected value '%s') for indirect checks on %s.", relevantInjectedToken, injectedValue, targetURL)
+	if p.config.VerbosityLevel >= 2 { // -vv
+		p.logger.Debugf("[Processor] HEURISTIC 2: Using relevant token '%s' (from injected value '%s') for indirect checks on %s.", relevantInjectedToken, injectedValue, targetURL)
+	}
 
 	// Analyze changes in headers between baseline and Probe A, potentially influenced by the token
 	headerChanged, headerChangeDesc := utils.AnalyzeHeaderChanges(baseline.RespHeaders, probeA.RespHeaders, relevantInjectedToken)
@@ -165,8 +186,10 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 	bodyChanged, bodyChangeDesc := utils.AnalyzeBodyChanges(probeA.Body, baseline.Body, relevantInjectedToken, probeA.URL, baseline.URL, p.logger)
 
 	if headerChanged || bodyChanged {
-		p.logger.Infof("HEURISTIC 2: Potential indirect influence by input '%s' (type %s) on %s. Header changes: %t (%s), Body changes: %t (%s)", 
-			inputName, inputType, targetURL, headerChanged, headerChangeDesc, bodyChanged, bodyChangeDesc)
+		if p.config.VerbosityLevel >= 1 { // -v
+			p.logger.Infof("[Processor] HEURISTIC 2: Potential indirect influence by input '%s' (type %s) on %s. Header changes: %t (%s), Body changes: %t (%s)", 
+				inputName, inputType, targetURL, headerChanged, headerChangeDesc, bodyChanged, bodyChangeDesc)
+		}
 
 		probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
 		bodiesSimilar_AB := utils.BodiesAreSimilar(probeA.Body, probeB.Body, 0.98) // High similarity for cache hit confirmation
@@ -193,11 +216,15 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 				Evidence:      evidence,
 			}, nil
 		} else {
-			p.logger.Debugf("HEURISTIC 2: Indirect influence detected in Probe A for %s, but Probe B (cache check) did not confirm cache hit of influenced content.", targetURL)
+			if p.config.VerbosityLevel >= 2 { // -vv
+				p.logger.Debugf("[Processor] HEURISTIC 2: Indirect influence detected in Probe A for %s, but Probe B (cache check) did not confirm cache hit of influenced content.", targetURL)
+			}
 		}
 	}
 
-	p.logger.Debugf("No definitive cache poisoning vector found for %s with input %s (type %s) by current heuristics.", targetURL, inputName, inputType)
+	if p.config.VerbosityLevel >= 2 { // -vv
+		p.logger.Debugf("[Processor] No definitive cache poisoning vector found for %s with input %s (type %s) by current heuristics.", targetURL, inputName, inputType)
+	}
 	return nil, nil // No finding based on current simple heuristics
 }
 

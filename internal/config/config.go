@@ -22,7 +22,8 @@ type Config struct {
 	RequestTimeout       time.Duration
 	OutputFile           string
 	OutputFormat         string
-	Verbosity            string
+	Verbosity            string // String representation from CLI/Viper (e.g., "debug", "info")
+	VerbosityLevel       int    // Integer representation (0: normal, 1: -v, 2: -vv)
 	ProxyInput           string // Raw input for proxies (URL, list, or file path)
 	ParsedProxies        []ProxyEntry
 	HeadersFile          string // Path to a file containing additional headers to test
@@ -82,7 +83,8 @@ func GetDefaultConfig() *Config {
 		RequestTimeout:       10 * time.Second,
 		OutputFile:           "",       // No output file by default
 		OutputFormat:         "json",   // Default to JSON
-		Verbosity:            "info",   // Default verbosity
+		Verbosity:            "info",   // Default string verbosity
+		VerbosityLevel:       0,        // Default int verbosity (0 = normal/info)
 		UserAgent:            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		ProxyInput:           "",
 		ParsedProxies:        []ProxyEntry{},
@@ -223,6 +225,6 @@ func (c *Config) Validate() error {
 
 // String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, DelayMs: %d, CustomHeaders (count): %d, InitialRPS: %.2f, MaxRPS: %.2f",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.DelayMs, len(c.CustomHeaders), c.InitialTargetRPS, c.MaxTargetRPS)
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s (Level: %d), MaxRetries: %d, DelayMs: %d, CustomHeaders (count): %d, InitialRPS: %.2f, MaxRPS: %.2f",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.VerbosityLevel, c.MaxRetries, c.DelayMs, len(c.CustomHeaders), c.InitialTargetRPS, c.MaxTargetRPS)
 } 

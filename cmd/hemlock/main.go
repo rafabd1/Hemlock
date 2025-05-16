@@ -74,7 +74,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.RequestTimeout = vp.GetDuration("timeout")
 		cfg.OutputFile = vp.GetString("output-file")
 		cfg.OutputFormat = vp.GetString("output-format")
-		cfg.Verbosity = vp.GetString("verbosity")
+		// cfg.Verbosity will be set below based on -v, -vv flags
 		cfg.ProxyInput = vp.GetString("proxy")
 		cfg.HeadersFile = vp.GetString("headers-file")
 		cfg.TargetsFile = vp.GetString("targets-file")
@@ -97,12 +97,37 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			cfg.UserAgent = defaultCfg.UserAgent
 		}
 
-		// Special logic for -v (verbose) that affects verbosity
-		if verbose, _ := cmd.Flags().GetBool("verbose"); verbose {
-			cfg.Verbosity = "debug"
+		// Handle verbosity flags to set both Verbosity (string) and VerbosityLevel (int)
+		verboseFlag, _ := cmd.Flags().GetBool("verbose")
+		veryVerboseFlag, _ := cmd.Flags().GetBool("very-verbose")
+
+		if veryVerboseFlag {
+			cfg.VerbosityLevel = 2
+			cfg.Verbosity = "debug" // -vv implies debug log level for the logger
+		} else if verboseFlag {
+			cfg.VerbosityLevel = 1
+			cfg.Verbosity = "debug" // -v also implies debug for now, filtering is done by VerbosityLevel in code
+		} else {
+			// Use verbosity string from flag if set, otherwise default
+			cfg.Verbosity = vp.GetString("verbosity") // Default is "info"
+			switch strings.ToLower(cfg.Verbosity) {
+			case "debug":
+				cfg.VerbosityLevel = 2 // if --verbosity=debug is set, treat as -vv
+			case "info":
+				cfg.VerbosityLevel = 0
+			case "warn":
+				cfg.VerbosityLevel = 0 // Warns will show with Info level logger
+			case "error":
+				cfg.VerbosityLevel = 0 // Errors will show with Info level logger
+			default:
+				cfg.VerbosityLevel = 0
+				cfg.Verbosity = "info" // Fallback to info
+			}
 		}
 
 		// Initialize Logger (after verbosity, noColor and silent are set)
+		// The logger itself is configured with the string log level (e.g., "debug", "info")
+		// The cfg.VerbosityLevel (int) is used within the application logic for conditional logging.
 		logLevel := utils.StringToLogLevel(cfg.Verbosity)
 		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent)
 		
@@ -111,7 +136,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			fileTargets, err := config.LoadLinesFromFile(cfg.TargetsFile)
 		if err != nil {
 				return fmt.Errorf("error reading targets from file '%s': %w", cfg.TargetsFile, err)
-			}
+		}
 			cfg.Targets = fileTargets
 		} else if len(cfg.Targets) > 0 { 
 		    if len(cfg.Targets) == 1 && strings.Contains(cfg.Targets[0], ",") {
@@ -146,7 +171,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			}
 		} 
 
-		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
+		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile) // Pass verbosity to loadHeaders if its logs need to be conditional
 		if err != nil {
 			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
 		}
@@ -279,39 +304,39 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 
 		// Initialize services
 		httpClient, errClient := networking.NewClient(&cfg, logger)
-		if errClient != nil {
-			logger.Fatalf("Failed to create HTTP client: %v", errClient)
-		}
+	if errClient != nil {
+		logger.Fatalf("Failed to create HTTP client: %v", errClient)
+	}
 		logger.Debugf("HTTP client initialized.")
 
 		processor := core.NewProcessor(&cfg, logger)
-		logger.Debugf("Processor initialized.")
+	logger.Debugf("Processor initialized.")
 
 		domainManager := networking.NewDomainManager(&cfg, logger)
 		logger.Debugf("DomainManager initialized.")
 
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
-		logger.Debugf("Scheduler initialized.")
+	logger.Debugf("Scheduler initialized.")
 
 		// Correção: StartScan agora retorna apenas findings
-		findings := scheduler.StartScan()
+	findings := scheduler.StartScan() 
 
 		logger.Infof("Scan completed. Generating report for %d finding(s)...", len(findings))
-		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
-		if errReport != nil {
-			logger.Errorf("Failed to generate report: %v", errReport)
-			if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
-				logger.Warnf("Attempting to print report to stdout as fallback...")
-				fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
-				if fbErr != nil {
-					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
-				}
+	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+	if errReport != nil {
+		logger.Errorf("Failed to generate report: %v", errReport)
+		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+			logger.Warnf("Attempting to print report to stdout as fallback...")
+			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+			if fbErr != nil {
+				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
 			}
-		} else {
-			logger.Infof("Report generated successfully.")
 		}
+	} else {
+		logger.Infof("Report generated successfully.")
+	}
 
-		logger.Infof("Hemlock Cache Scanner finished.")
+	logger.Infof("Hemlock Cache Scanner finished.")
 		return nil
 	},
 }

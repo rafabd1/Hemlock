@@ -66,8 +66,10 @@ func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
 			CurrentStandbyDuration: dm.config.InitialStandbyDuration, // Use config value
 		}
 		dm.domainStatus[domain] = ds
-		dm.logger.Debugf("[DomainManager] Initialized state for domain '%s' with TargetRPS: %.2f, InitialStandby: %s", 
-			domain, ds.TargetRPS, ds.CurrentStandbyDuration)
+		if dm.config.VerbosityLevel >= 2 { // -vv
+			dm.logger.Debugf("[DomainManager] Initialized state for domain '%s' with TargetRPS: %.2f, InitialStandby: %s", 
+				domain, ds.TargetRPS, ds.CurrentStandbyDuration)
+		}
 	}
 	return ds
 }
@@ -83,8 +85,12 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	// 1. Check if domain is in forced standby
 	if ds.StandbyUntil.After(now) {
 		waitTime := ds.StandbyUntil.Sub(now)
-		dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' in STANDBY. Now: %s, StandbyUntil: %s. Wait: %s", 
-			domain, now.Format(time.RFC3339), ds.StandbyUntil.Format(time.RFC3339), waitTime)
+		if dm.config.VerbosityLevel >= 2 { // -vv
+			dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' in STANDBY. Now: %s, StandbyUntil: %s. Will wait: %s", 
+				domain, now.Format(time.RFC3339), ds.StandbyUntil.Format(time.RFC3339), waitTime)
+		} else if dm.config.VerbosityLevel >= 1 { // -v
+			dm.logger.Infof("[DomainManager] Domain '%s' in STANDBY. Waiting for %s.", domain, waitTime)
+		}
 		return false, waitTime
 	}
 
@@ -96,7 +102,8 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 		} else {
 			effectiveRPS = 0.1 // A very small default if MinTargetRPS is not set or zero
 		}
-		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' has invalid TargetRPS (%.2f). Using effective RPS: %.2f.", domain, ds.TargetRPS, effectiveRPS)
+		// This is a state correction, should be visible in normal mode.
+		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' has invalid TargetRPS (%.2f). Corrected to effective RPS: %.2f.", domain, ds.TargetRPS, effectiveRPS)
 		ds.TargetRPS = effectiveRPS // Correct the state
 	}
 	
@@ -105,14 +112,20 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 		timeSinceLastRequest := now.Sub(ds.lastRequestTime)
 		if timeSinceLastRequest < requiredDelay {
 			waitTime := requiredDelay - timeSinceLastRequest
-			dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' TargetRPS (%.2f req/s => %.3fs delay) NOT met. LastReq: %s (%.3fs ago). Wait: %s", 
-				domain, ds.TargetRPS, requiredDelay.Seconds(), ds.lastRequestTime.Format(time.RFC3339), timeSinceLastRequest.Seconds(), waitTime)
+			if dm.config.VerbosityLevel >= 2 { // -vv
+				dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' TargetRPS (%.2f req/s => %.3fs delay) NOT met. LastReq: %s (%.3fs ago). Will wait: %s", 
+					domain, ds.TargetRPS, requiredDelay.Seconds(), ds.lastRequestTime.Format(time.RFC3339), timeSinceLastRequest.Seconds(), waitTime)
+			} else if dm.config.VerbosityLevel >= 1 { // -v
+				dm.logger.Infof("[DomainManager] Domain '%s' TargetRPS limit (%.2f req/s) not met. Waiting for %s.", domain, ds.TargetRPS, waitTime)
+			}
 			return false, waitTime
 		}
 	}
 
-	dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. TargetRPS: %.2f. LastReq: %s. Now: %s", 
-		domain, ds.TargetRPS, ds.lastRequestTime.Format(time.RFC3339), now.Format(time.RFC3339))
+	if dm.config.VerbosityLevel >= 2 { // -vv
+		dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. TargetRPS: %.2f. LastReq: %s. Now: %s", 
+			domain, ds.TargetRPS, ds.lastRequestTime.Format(time.RFC3339), now.Format(time.RFC3339))
+	}
 	return true, 0
 }
 
@@ -122,7 +135,9 @@ func (dm *DomainManager) RecordRequestSent(domain string) {
 	defer dm.mu.Unlock()
 	ds := dm.getOrCreateDomainState(domain)
 	ds.lastRequestTime = time.Now()
-	dm.logger.Debugf("[DomainManager] RecordRequestSent: Domain '%s' lastRequestTime updated to %s", domain, ds.lastRequestTime.Format(time.RFC3339))
+	if dm.config.VerbosityLevel >= 2 { // -vv
+		dm.logger.Debugf("[DomainManager] RecordRequestSent: Domain '%s' lastRequestTime updated to %s", domain, ds.lastRequestTime.Format(time.RFC3339))
+	}
 }
 
 // RecordRequestResult analyzes the result of a request.
@@ -143,15 +158,19 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		}
 		ds.TargetRPS = newRPS
 
-		dm.logger.Warnf("[DomainManager] RecordRequestResult: Domain '%s' (Status 429). Applying standby for %s. StandbyUntil: %s. TargetRPS reduced to %.2f.", 
-			domain, appliedStandbyDuration, ds.StandbyUntil.Format(time.RFC3339), ds.TargetRPS)
+		if dm.config.VerbosityLevel >= 1 { // -v
+			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Applying standby for %s. StandbyUntil: %s. TargetRPS reduced to %.2f.", 
+				domain, appliedStandbyDuration, ds.StandbyUntil.Format(time.RFC3339), ds.TargetRPS)
+		}
 		
 		// Increase standby duration for next time, up to MaxStandbyDuration from config
 		ds.CurrentStandbyDuration += dm.config.StandbyDurationIncrement
 		if ds.CurrentStandbyDuration > dm.config.MaxStandbyDuration {
 			ds.CurrentStandbyDuration = dm.config.MaxStandbyDuration
 		}
-		dm.logger.Infof("[DomainManager] RecordRequestResult: Domain '%s' next standby duration increased to %s.", domain, ds.CurrentStandbyDuration)
+		if dm.config.VerbosityLevel >= 1 { // -v
+			dm.logger.Infof("[DomainManager] Domain '%s' next standby duration increased to %s.", domain, ds.CurrentStandbyDuration)
+		}
 
 		ds.consecutiveFailures = 0 
 		return 
@@ -159,14 +178,20 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 
 	if err != nil {
 		ds.consecutiveFailures++
-		dm.logger.Debugf("[DomainManager] RecordRequestResult: Error for domain '%s': %v. Consecutive failures: %d.", domain, err, ds.consecutiveFailures)
+		if dm.config.VerbosityLevel >= 2 { // -vv
+			dm.logger.Debugf("[DomainManager] RecordRequestResult: Error for domain '%s': %v. Consecutive failures: %d.", domain, err, ds.consecutiveFailures)
+		} else if dm.config.VerbosityLevel >= 1 { // -v
+			dm.logger.Warnf("[DomainManager] Request error for domain '%s': %v.", domain, err)
+		}
 		// TODO: Future: If consecutiveFailures reach a threshold, moderately decrease TargetRPS (dynamic rate limiting)
 	} else {
 		// Successful request (non-429 and no network error)
 		ds.consecutiveFailures = 0
 		// TODO: Future: If requests are consistently successful, gradually increase TargetRPS up to MaxTargetRPS from config
 		// For now, just log success, RPS increase will be a future enhancement.
-		dm.logger.Debugf("[DomainManager] RecordRequestResult: Successful request (status: %d, no error) for domain '%s'. Consecutive failures reset.", statusCode, domain)
+		if dm.config.VerbosityLevel >= 2 { // -vv
+			dm.logger.Debugf("[DomainManager] RecordRequestResult: Successful request (status: %d, no error) for domain '%s'. Consecutive failures reset.", statusCode, domain)
+		}
 	}
 }
 
@@ -181,10 +206,14 @@ func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 	ds := dm.getOrCreateDomainState(domain) // Ensure state exists if called externally
 	
 	if ds.StandbyUntil.IsZero() || time.Now().After(ds.StandbyUntil) {
-		dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' is NOT in standby.", domain)
+		if dm.config.VerbosityLevel >= 2 { // -vv
+			dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' is NOT in standby.", domain)
+		}
 		return false, time.Time{}
 	}
-	dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, ds.StandbyUntil.Format(time.RFC3339))
+	if dm.config.VerbosityLevel >= 2 { // -vv
+		dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, ds.StandbyUntil.Format(time.RFC3339))
+	}
 	return true, ds.StandbyUntil
 }
 

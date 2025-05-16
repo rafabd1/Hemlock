@@ -90,14 +90,19 @@ func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
 			proxyStr := proxyEntry.String()
 			proxyURL, err := url.Parse(proxyStr)
 			if err != nil {
+				// This is a configuration error, should be visible in normal mode.
 				clientInstance.logger.Warnf("Falha ao parsear URL do proxy rotacionado ('%s'): %v. Tentando sem proxy para esta requisição.", proxyStr, err)
 				return nil, nil // Não usar proxy se o parse falhar
 			}
-			clientInstance.logger.Debugf("Usando proxy rotacionado para requisição a %s: %s", req.URL.Host, proxyURL.String())
+			if clientInstance.cfg.VerbosityLevel >= 2 { // -vv
+				clientInstance.logger.Debugf("Usando proxy rotacionado para requisição a %s: %s", req.URL.Host, proxyURL.String())
+			}
 			return proxyURL, nil
 		}
 	} else {
-		logger.Debugf("Nenhum proxy configurado para o cliente HTTP.")
+		if cfg.VerbosityLevel >= 2 { // -vv
+			logger.Debugf("Nenhum proxy configurado para o cliente HTTP.")
+		}
 	}
 
 	httpClient := &http.Client{
@@ -107,7 +112,9 @@ func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
 			if len(via) >= 10 {
 				return http.ErrUseLastResponse
 			}
-			logger.Debugf("Redirect detectado de %s para %s", via[len(via)-1].URL, req.URL)
+			if cfg.VerbosityLevel >= 2 { // -vv
+				logger.Debugf("Redirect detectado de %s para %s", via[len(via)-1].URL, req.URL)
+			}
 			return nil
 		},
 	}
@@ -138,13 +145,19 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 				delay = 0
 			}
 
-			c.logger.Debugf("[Client] Attempt %d/%d failed for %s. Error: %v. Waiting %s before trying again.", attempt, c.cfg.MaxRetries, reqData.URL, finalRespData.Error, delay)
+			if c.cfg.VerbosityLevel >= 2 { // -vv
+				c.logger.Debugf("[Client] Attempt %d/%d failed for %s. Error: %v. Waiting %s before trying again.", attempt, c.cfg.MaxRetries, reqData.URL, finalRespData.Error, delay)
+			} else if c.cfg.VerbosityLevel >= 1 { // -v
+				c.logger.Warnf("[Client] Request for %s failed (attempt %d/%d, error: %v). Retrying after delay.", reqData.URL, attempt, c.cfg.MaxRetries, finalRespData.Error)
+			}
 			time.Sleep(delay)
 		}
 
 		req, err := http.NewRequest(reqData.Method, reqData.URL, nil) // TODO: Support request body (reqData.Body)
 		if err != nil {
 			finalRespData.Error = fmt.Errorf("failed to create request for %s: %w", reqData.URL, err)
+			// This is an internal error, should be logged in normal mode if it's the final error.
+			// No direct log here, let the loop decide based on MaxRetries.
 			continue // Try next retry if there's an error creating the request
 		}
 
@@ -160,6 +173,7 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 				req.Header.Set(headerName, headerValue)
 				// If the header is User-Agent, it will override the default one
 			} else {
+				// Configuration warning, should be visible in normal mode.
 				c.logger.Warnf("[Client] Invalid custom header format (expected 'Name: Value'): %s", headerLine)
 			}
 		}
@@ -171,22 +185,26 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 			}
 		}
 
-		c.logger.Debugf("[Client Attempt: %d] Sending %s to %s with headers: %v", attempt+1, reqData.Method, reqData.URL, req.Header)
+		if c.cfg.VerbosityLevel >= 2 { // -vv
+			c.logger.Debugf("[Client Attempt: %d] Sending %s to %s with headers: %v", attempt+1, reqData.Method, reqData.URL, req.Header)
+		}
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d): %w", reqData.URL, attempt+1, err)
 			// Check if the error is transient to decide whether to continue
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				c.logger.Warnf("[Client] Timeout on request to %s (attempt %d).", reqData.URL, attempt+1)
-				// Timeouts are good candidates for retries
+				if c.cfg.VerbosityLevel >= 1 { // -v
+					c.logger.Warnf("[Client] Timeout on request to %s (attempt %d).", reqData.URL, attempt+1)
+				}
 			} else {
-				// For other non-timeout network errors, we can decide to stop or continue
-				// If it's a definite error (e.g., host not found), retrying won't help.
-				// For now, we'll retry for most httpClient.Do() errors
+				// Other network errors, log if verbose and it's not the last attempt (which gets logged by the final Errorf)
+				if c.cfg.VerbosityLevel >= 1 && attempt < c.cfg.MaxRetries {
+					c.logger.Warnf("[Client] Network error for %s (attempt %d): %v", reqData.URL, attempt+1, err)
+				}
 			}
 			// If it's the last attempt, the error will be the finalRespData.Error
 			if attempt == c.cfg.MaxRetries {
-				return finalRespData
+				break // Break to log the final error outside the loop
 			}
 			continue // Next attempt
 		}
@@ -198,15 +216,20 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 			finalRespData.Error = fmt.Errorf("failed to read response body from %s (attempt %d): %w", reqData.URL, attempt+1, readErr)
 			// Even if reading the body fails, the status code might be useful.
 			// For consistency, we'll treat this as a failed attempt and possibly retry.
+			if c.cfg.VerbosityLevel >= 1 && attempt < c.cfg.MaxRetries { // -v
+				c.logger.Warnf("[Client] Failed to read response body from %s (attempt %d): %v", reqData.URL, attempt+1, readErr)
+			}
 			if attempt == c.cfg.MaxRetries {
 				finalRespData.Response = resp // Still store the response if possible
 				finalRespData.RespHeaders = resp.Header
-				return finalRespData
+				break // Break to log the final error outside the loop
 			}
 			continue // Next attempt
 		}
 
-		c.logger.Debugf("[Client] Response received from %s (attempt %d): Status %s, Body Size: %d", reqData.URL, attempt+1, resp.Status, len(body))
+		if c.cfg.VerbosityLevel >= 2 { // -vv
+			c.logger.Debugf("[Client] Response received from %s (attempt %d): Status %s, Body Size: %d", reqData.URL, attempt+1, resp.Status, len(body))
+		}
 
 		// Check if HTTP status code should trigger a retry (e.g., 5xx)
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
@@ -214,8 +237,11 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 			finalRespData.Response = resp
 			finalRespData.Body = body
 			finalRespData.RespHeaders = resp.Header
+			if c.cfg.VerbosityLevel >= 1 { // -v
+				c.logger.Warnf("[Client] Server error %s for %s (attempt %d). Retrying if possible.", resp.Status, reqData.URL, attempt+1)
+			}
 			if attempt == c.cfg.MaxRetries {
-				return finalRespData
+				break // Break to log the final error outside the loop
 			}
 			continue // Next attempt
 		}
@@ -228,7 +254,8 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		return finalRespData      // Success, return immediately
 	}
 
-	// If all attempts fail (MaxRetries reached)
+	// If all attempts fail (MaxRetries reached and loop finished or broke to here)
+	// This error is an execution error as the client could not get a valid response after all retries.
 	c.logger.Errorf("[Client] All %d attempts failed for %s. Last error: %v", c.cfg.MaxRetries+1, reqData.URL, finalRespData.Error)
 	return finalRespData
 }
@@ -240,8 +267,4 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 // - Return a list of strings, each string being the content of a JS file.
 // - This method should also use the retry logic.
 
-// loggerIsDebugEnabled is a helper to check if the logger is configured for debug output.
-// This is a simplistic check; a more robust Logger interface might have a IsLevelEnabled(level) method.
-func (c *Client) loggerIsDebugEnabled() bool {
-	return true
-} 
+// Removed loggerIsDebugEnabled as it's better to use c.cfg.VerbosityLevel directly. 
