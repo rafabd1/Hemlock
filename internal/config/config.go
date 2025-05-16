@@ -23,19 +23,15 @@ type Config struct {
 	OutputFile           string
 	OutputFormat         string
 	Verbosity            string
-	UserAgent            string
 	ProxyInput           string // Raw input for proxies (URL, list, or file path)
 	ParsedProxies        []ProxyEntry
 	HeadersFile          string // Path to a file containing additional headers to test
 	TargetsFile          string // Path to a file containing target URLs
-	MinRequestDelayMs    int
-	DomainCooldownMs     int
+	DelayMs              int    // Renamed from MinRequestDelayMs
 	MaxRetries           int    // Maximum number of retries per request
-	RetryDelayBaseMs     int    // Base delay for exponential backoff in ms
-	RetryDelayMaxMs      int    // Maximum delay for backoff in ms
 	MaxConsecutiveFailuresToBlock int    // Number of consecutive network failures to block a domain
 	CustomHeaders        []string // Custom HTTP headers to add to every request (format: "Name: Value")
-	// New flags/options can be added here and managed by Viper
+	UserAgent            string   // User-Agent still needed for default if no -H "User-Agent: ..." is provided
 	NoColor bool // To disable colored output
 	Silent  bool // To suppress non-critical logs
 }
@@ -85,11 +81,8 @@ func GetDefaultConfig() *Config {
 		ParsedProxies:        []ProxyEntry{},
 		HeadersFile:          "", // Will be set by flag or default in main.go
 		TargetsFile:          "",
-		MinRequestDelayMs:    500,
-		DomainCooldownMs:     60000, // Changed from 300000ms (5 min) to 60000ms (1 min)
+		DelayMs:              500,    // Renamed from MinRequestDelayMs
 		MaxRetries:           3,    // Default of 3 retries
-		RetryDelayBaseMs:     200,  // Default of 200ms for base delay
-		RetryDelayMaxMs:      5000, // Default of 5000ms (5s) for max delay
 		MaxConsecutiveFailuresToBlock: 3,    // Default to 3 consecutive failures
 		CustomHeaders:        []string{},
 		NoColor:              false,
@@ -173,7 +166,7 @@ func (c *Config) Validate() error {
 	if c.Verbosity == "" {
 		return fmt.Errorf("verbosity cannot be empty")
 	}
-	if c.UserAgent == "" {
+	if c.UserAgent == "" { // Still validate UserAgent as it's a field, though mainly set by default
 		return fmt.Errorf("userAgent cannot be empty")
 	}
 	if len(c.Targets) == 0 {
@@ -185,14 +178,8 @@ func (c *Config) Validate() error {
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("maxRetries cannot be negative")
 	}
-	if c.RetryDelayBaseMs < 0 {
-		return fmt.Errorf("retryDelayBaseMs cannot be negative")
-	}
-	if c.RetryDelayMaxMs < 0 {
-		return fmt.Errorf("retryDelayMaxMs cannot be negative")
-	}
-	if c.RetryDelayBaseMs > c.RetryDelayMaxMs && c.RetryDelayMaxMs > 0 { // Only if MaxMs is not unlimited (0)
-		return fmt.Errorf("retryDelayBaseMs (%d) cannot be greater than retryDelayMaxMs (%d)", c.RetryDelayBaseMs, c.RetryDelayMaxMs)
+	if c.DelayMs < 0 { // Renamed from MinRequestDelayMs
+		return fmt.Errorf("delayMs cannot be negative")
 	}
 	if c.MaxConsecutiveFailuresToBlock < 0 { // 0 can mean disabled, but not negative
 		return fmt.Errorf("maxConsecutiveFailuresToBlock cannot be negative")
@@ -202,6 +189,6 @@ func (c *Config) Validate() error {
 
 // String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, RetryDelayBaseMs: %d, RetryDelayMaxMs: %d, MaxConsecutiveFailuresToBlock: %d, CustomHeaders (count): %d",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.RetryDelayBaseMs, c.RetryDelayMaxMs, c.MaxConsecutiveFailuresToBlock, len(c.CustomHeaders))
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, DelayMs: %d, MaxConsecutiveFailuresToBlock: %d, CustomHeaders (count): %d",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.DelayMs, c.MaxConsecutiveFailuresToBlock, len(c.CustomHeaders))
 } 

@@ -75,14 +75,12 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.OutputFile = vp.GetString("output-file")
 		cfg.OutputFormat = vp.GetString("output-format")
 		cfg.Verbosity = vp.GetString("verbosity")
+		cfg.UserAgent = vp.GetString("user-agent")
 		cfg.ProxyInput = vp.GetString("proxy")
 		cfg.HeadersFile = vp.GetString("headers-file")
 		cfg.TargetsFile = vp.GetString("targets-file")
-		cfg.MinRequestDelayMs = vp.GetInt("min-delay")
-		cfg.DomainCooldownMs = vp.GetInt("cooldown")
+		cfg.DelayMs = vp.GetInt("delay")
 		cfg.MaxRetries = vp.GetInt("max-retries")
-		cfg.RetryDelayBaseMs = vp.GetInt("retry-delay-base")
-		cfg.RetryDelayMaxMs = vp.GetInt("retry-delay-max")
 		cfg.MaxConsecutiveFailuresToBlock = vp.GetInt("max-consecutive-failures")
 		cfg.NoColor = vp.GetBool("no-color")
 		cfg.Silent = vp.GetBool("silent")
@@ -244,17 +242,14 @@ func init() {
 
 	rootCmd.PersistentFlags().IntP("concurrency", "c", defaults.Concurrency, "Number of concurrent workers")
 	rootCmd.PersistentFlags().DurationP("timeout", "T", defaults.RequestTimeout, "HTTP request timeout (e.g., 10s, 1m)")
-	// Remove --user-agent flag and add --header flag
+	rootCmd.PersistentFlags().String("user-agent", defaults.UserAgent, "Set the User-Agent string for requests (overridden by -H \"User-Agent: ...\")")
 	rootCmd.PersistentFlags().StringSliceP("header", "H", defaults.CustomHeaders, "Custom HTTP header to add to requests (can be specified multiple times, format: \"Name: Value\")")
 	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy to use (URL, CSV list, or file path)")
 
-	rootCmd.PersistentFlags().Int("min-delay", defaults.MinRequestDelayMs, "Minimum delay in ms between requests to the same domain")
-	rootCmd.PersistentFlags().Int("cooldown", defaults.DomainCooldownMs, "Cooldown period in ms for a domain after being blocked")
+	rootCmd.PersistentFlags().Int("delay", defaults.DelayMs, "Delay in ms between requests to the same domain")
 
 	// Retry flags
 	rootCmd.PersistentFlags().IntP("max-retries", "r", defaults.MaxRetries, "Maximum number of retries per request")
-	rootCmd.PersistentFlags().Int("retry-delay-base", defaults.RetryDelayBaseMs, "Base delay in ms for exponential backoff between retries")
-	rootCmd.PersistentFlags().Int("retry-delay-max", defaults.RetryDelayMaxMs, "Maximum delay in ms for backoff between retries")
 	rootCmd.PersistentFlags().Int("max-consecutive-failures", defaults.MaxConsecutiveFailuresToBlock, "Number of consecutive network failures to block a domain (0 to disable this method)")
 
 	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Disable colors in text output")

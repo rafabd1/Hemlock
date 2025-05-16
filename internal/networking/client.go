@@ -16,6 +16,13 @@ import (
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
+const (
+	// DefaultRetryDelayBaseMs is the base delay for exponential backoff.
+	DefaultRetryDelayBaseMs = 200 // formerly from config.RetryDelayBaseMs
+	// DefaultRetryDelayMaxMs is the maximum delay for exponential backoff.
+	DefaultRetryDelayMaxMs = 5000 // formerly from config.RetryDelayMaxMs
+)
+
 // Client manages HTTP requests and client-specific configurations.
 // It's a wrapper around http.Client to include custom logic for Hemlock.
 type Client struct {
@@ -116,8 +123,8 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
 		if attempt > 0 {
-			baseDelay := time.Duration(c.cfg.RetryDelayBaseMs) * time.Millisecond
-			maxDelay := time.Duration(c.cfg.RetryDelayMaxMs) * time.Millisecond
+			baseDelay := time.Duration(DefaultRetryDelayBaseMs) * time.Millisecond
+			maxDelay := time.Duration(DefaultRetryDelayMaxMs) * time.Millisecond
 
 			delay := baseDelay * time.Duration(1<<(attempt-1)) // Exponential: 2^(attempt-1)
 			// Add jitter: +/- 20% of calculated delay
