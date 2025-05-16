@@ -137,7 +137,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				}
 			}
 			if foundPath == "" {
-				return fmt.Errorf("default headers file ('%s') not found in standard locations and --headers-file not specified. This file is essential.", defaultHeadersFilename)
+				return fmt.Errorf("default headers file ('%s') not found in standard locations and --headers-file not specified. This file is essential", defaultHeadersFilename)
 			}
 		} // else cfg.HeadersFile was provided by the flag
 
@@ -147,7 +147,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
 		}
 		if len(loadedHeaders) == 0 {
-			return fmt.Errorf("headers file '%s' is empty.", cfg.HeadersFile)
+			return fmt.Errorf("headers file '%s' is empty", cfg.HeadersFile)
 		}
 		cfg.HeadersToTest = loadedHeaders
 
@@ -166,19 +166,69 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		logger.Infof("Hemlock Cache Scanner starting...")
-		logger.Debugf("Effective Configuration: %s", cfg.String())
+		// Display Banner (only if not in silent mode and verbosity is info or higher)
+		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo {
+			banner := `
+   _    _                _            _    
+  | |  | |              | |          | |   
+  | |__| | ___ _ __ ___ | | ___   ___| | __
+  |  __  |/ _ \ '_ ` + "`" + ` _ \| |/ _ \ / __| |/ /
+  | |  | |  __/ | | | | | | (_) | (__|   < 
+  |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
+`
+			version := "v0.1.0" // Placeholder version, update as needed
+			author := "github.com/rafabd1"    // Placeholder author, update as needed
+			fmt.Printf("%s\n", banner)
+			fmt.Printf("\t\t\t\tVersion: %s by %s\n\n", version, author)
+		}
+		
+		logger.Infof("Hemlock Cache Scanner initializing...") // Changed from "starting..."
 
 		if err := cfg.Validate(); err != nil {
 			logger.Fatalf("Invalid configuration: %v", err)
 		}
 
 	    if len(cfg.Targets) == 0 {
-			logger.Fatalf("No targets specified. Use --targets or --targets-file.")
+			logger.Fatalf("No targets specified. Use --targets or --targets-file")
 		}
 		if len(cfg.HeadersToTest) == 0 {
-			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file.")
+			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file")
 	    }
+
+		// Enhanced Initial Statistics Log
+		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo {
+			fmt.Println("------------------------------------------------------------")
+			fmt.Println(" Scan Configuration Summary")
+			fmt.Println("------------------------------------------------------------")
+			fmt.Printf(" Initial Targets Provided: %d\n", len(cfg.Targets)) 
+			// A contagem de domínios únicos será exibida após o pré-processamento do scheduler
+			fmt.Printf(" Headers to Test: %d loaded from '%s'\n", len(cfg.HeadersToTest), cfg.HeadersFile)
+			// TODO: Add payload count if/when parameters are implemented
+			fmt.Printf(" Concurrency: %d workers\n", cfg.Concurrency)
+			fmt.Printf(" Request Timeout: %s\n", cfg.RequestTimeout.String())
+			fmt.Printf(" Default User-Agent: %s\n", cfg.UserAgent) // Display default UA
+			if len(cfg.CustomHeaders) > 0 {
+				fmt.Printf(" Custom Global Headers: %d\n", len(cfg.CustomHeaders))
+				for _, h := range cfg.CustomHeaders {
+					fmt.Printf("   - %s\n", h)
+				}
+			}
+			if len(cfg.ParsedProxies) > 0 {
+				fmt.Printf(" Proxies: %d configured\n", len(cfg.ParsedProxies))
+			} else {
+				fmt.Println(" Proxies: None configured")
+			}
+			fmt.Printf(" Max Retries per Request: %d\n", cfg.MaxRetries)
+			fmt.Printf(" Delay Between Requests (same domain): %dms\n", cfg.DelayMs)
+			fmt.Printf(" Max Consecutive Failures to Block Domain: %d\n", cfg.MaxConsecutiveFailuresToBlock)
+			if cfg.OutputFile != "" {
+				fmt.Printf(" Output File: %s (Format: %s)\n", cfg.OutputFile, cfg.OutputFormat)
+			} else {
+				fmt.Printf(" Output: stdout (Format: %s)\n", cfg.OutputFormat)
+			}
+			fmt.Printf(" Log Level: %s\n", cfg.Verbosity)
+			fmt.Println("------------------------------------------------------------")
+		}
 
 		httpClient, errClient := networking.NewClient(&cfg, logger)
 	    if errClient != nil {
@@ -197,10 +247,23 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
 		logger.Debugf("Scheduler initialized.")
 
-		logger.Infof("Starting scan for %d target(s)...", len(cfg.Targets))
-	    findings := scheduler.StartScan() 
+		var previouslyDisplayedDomainCount int = 0 // Variável para exemplo, será removida na simplificação abaixo.
 
-		logger.Infof("Scan completed. Generating report for %d findings...", len(findings))
+		// logger.Infof("Starting scan for %d target(s)...", len(cfg.Targets)) // Log movido para dentro do Scheduler
+	    findings, uniqueDomainCount := scheduler.StartScan()
+
+		// Exibir contagem de domínios únicos se ainda não foi exibido ou se o log do scheduler for DEBUG
+		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) == utils.LevelDebug {
+			logger.Infof("Total unique base URLs (domains) processed: %d", uniqueDomainCount)
+		} else if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo && previouslyDisplayedDomainCount == 0 {
+            // Se o log do scheduler já mostrou no nível INFO, não repetir aqui, 
+            // mas se o log do scheduler for mais alto (WARN, ERROR), podemos mostrar aqui.
+            // O scheduler agora loga "Preprocessing complete. %d unique base URLs (domains) will be scanned."
+            // então não precisamos repetir essa informação específica aqui se o log for INFO.
+            // No entanto, a variável uniqueDomainCount é útil para o resumo final.
+        }
+
+		logger.Infof("Scan completed. Generating report for %d finding(s)...", len(findings))
 	    errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
 	    if errReport != nil {
 			logger.Errorf("Failed to generate report: %v", errReport)

@@ -2,7 +2,7 @@ package utils
 
 import (
 	"fmt"
-	"io"          // Adicionado para io.Writer
+	"io" // Adicionado para io.Writer
 	"io/ioutil"
 	"log"
 	"os"
@@ -35,11 +35,11 @@ type defaultLogger struct {
 type LogLevel int
 
 const (
-	LevelDebug LogLevel = iota
-	LevelInfo
-	LevelWarn
-	LevelError
-	LevelFatal
+	LevelDebug LogLevel = iota // Exported: utils.LevelDebug
+	LevelInfo                  // Exported: utils.LevelInfo
+	LevelWarn                  // Exported: utils.LevelWarn
+	LevelError                 // Exported: utils.LevelError
+	LevelFatal                 // Exported: utils.LevelFatal
 )
 
 // ANSI color codes
