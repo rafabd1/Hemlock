@@ -12,7 +12,7 @@ import (
 
 // Config holds all the configuration for the Hemlock scanner.
 // Fields will be populated by Viper from flags and defaults.
-// YAML tags são removidas pois não haverá mais loading direto de YAML para esta struct aqui.
+// YAML tags are removed as there will be no direct YAML loading to this struct here.
 type Config struct {
 	Targets              []string
 	HeadersToTest        []string
@@ -30,13 +30,14 @@ type Config struct {
 	TargetsFile          string // Path to a file containing target URLs
 	MinRequestDelayMs    int
 	DomainCooldownMs     int
-	MaxRetries           int    // Número máximo de retentativas por requisição
-	RetryDelayBaseMs     int    // Delay base para backoff exponencial em ms
-	RetryDelayMaxMs      int    // Delay máximo para backoff em ms
-	MaxConsecutiveFailuresToBlock int    // Novo: Número de falhas de rede consecutivas para bloquear um domínio
-	// Novas flags/opções podem ser adicionadas aqui e gerenciadas pelo Viper
-	NoColor bool // Para desabilitar output colorido
-	Silent  bool // Para suprimir logs não críticos
+	MaxRetries           int    // Maximum number of retries per request
+	RetryDelayBaseMs     int    // Base delay for exponential backoff in ms
+	RetryDelayMaxMs      int    // Maximum delay for backoff in ms
+	MaxConsecutiveFailuresToBlock int    // Number of consecutive network failures to block a domain
+	CustomHeaders        []string // Custom HTTP headers to add to every request (format: "Name: Value")
+	// New flags/options can be added here and managed by Viper
+	NoColor bool // To disable colored output
+	Silent  bool // To suppress non-critical logs
 }
 
 // ProxyEntry holds the parsed components of a proxy string.
@@ -67,52 +68,53 @@ func (pe *ProxyEntry) String() string {
 }
 
 // GetDefaultConfig returns a Config struct populated with default values.
-// Viper em main.go definirá estes defaults e os sobrescreverá com flags.
+// Viper in main.go will set these defaults and override them with flags.
 func GetDefaultConfig() *Config {
 	return &Config{
 		Targets:              []string{},
-		HeadersToTest:        []string{}, // Será preenchido em main.go após carregar headersFile
+		HeadersToTest:        []string{}, // Will be filled in main.go after loading headersFile
 		BasePayloads:         []string{},
 		DefaultPayloadPrefix: "hemlock",
 		Concurrency:          10,
 		RequestTimeout:       10 * time.Second,
-		OutputFile:           "",       // Sem output file por padrão
-		OutputFormat:         "json",   // Default para JSON
+		OutputFile:           "",       // No output file by default
+		OutputFormat:         "json",   // Default to JSON
 		Verbosity:            "info",   // Default verbosity
 		UserAgent:            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 		ProxyInput:           "",
 		ParsedProxies:        []ProxyEntry{},
-		HeadersFile:          "", // Será definido por flag ou default em main.go
+		HeadersFile:          "", // Will be set by flag or default in main.go
 		TargetsFile:          "",
 		MinRequestDelayMs:    500,
-		DomainCooldownMs:     300000,
-		MaxRetries:           3,    // Default de 3 retentativas
-		RetryDelayBaseMs:     200,  // Default de 200ms para delay base
-		RetryDelayMaxMs:      5000, // Default de 5000ms (5s) para delay máximo
-		MaxConsecutiveFailuresToBlock: 3,    // Default para 3 falhas consecutivas
+		DomainCooldownMs:     60000, // Changed from 300000ms (5 min) to 60000ms (1 min)
+		MaxRetries:           3,    // Default of 3 retries
+		RetryDelayBaseMs:     200,  // Default of 200ms for base delay
+		RetryDelayMaxMs:      5000, // Default of 5000ms (5s) for max delay
+		MaxConsecutiveFailuresToBlock: 3,    // Default to 3 consecutive failures
+		CustomHeaders:        []string{},
 		NoColor:              false,
 		Silent:               false,
 	}
 }
 
-// LoadConfig é agora um stub. A configuração será carregada e gerenciada
-// primariamente por Viper e Cobra em cmd/hemlock/main.go.
-// Esta função pode ser usada para inicializar com defaults se necessário antes do Viper,
-// ou totalmente removida se o Viper cuidar de todos os defaults.
-// Por ora, ela apenas retorna os defaults codificados.
-func LoadConfig(userConfigFilePath string /* parâmetro não mais usado */) (*Config, error) {
+// LoadConfig is now a stub. Configuration will be loaded and managed
+// primarily by Viper and Cobra in cmd/hemlock/main.go.
+// This function can be used to initialize with defaults if needed before Viper,
+// or removed entirely if Viper handles all defaults.
+// For now, it just returns the hardcoded defaults.
+func LoadConfig(userConfigFilePath string /* parameter no longer used */) (*Config, error) {
 	if userConfigFilePath != "" {
-		// Logica de carregar YAML de usuário foi removida.
-		// Poderia logar um aviso que a flag de config file não é mais suportada se ela for usada.
+		// Logic to load user YAML has been removed.
+		// Could log a warning that config file flag is no longer supported if it's used.
 		log.Printf("WARN: Configuration via YAML file ('%s') is deprecated and no longer supported. Please use CLI flags.", userConfigFilePath)
 	}
-	// A lógica de carregar hemlock_default_config.yaml também foi removida.
-	// A lógica de carregar HeadersToTest daqui também foi removida - será feita em main.go.
+	// Logic to load hemlock_default_config.yaml has been removed.
+	// Logic to load HeadersToTest from here has been removed - will be done in main.go.
 	cfg := GetDefaultConfig()
 	return cfg, nil
 }
 
-// LoadLinesFromFile continua útil para carregar targets/headers de arquivos especificados por flags.
+// LoadLinesFromFile is still useful for loading targets/headers from files specified by flags.
 func LoadLinesFromFile(filePath string) ([]string, error) {
 	content, err := ioutil.ReadFile(filePath)
 	if err != nil {
@@ -122,14 +124,14 @@ func LoadLinesFromFile(filePath string) ([]string, error) {
 	var result []string
 	for _, line := range lines {
 		trimmedLine := strings.TrimSpace(line)
-		if trimmedLine != "" && !strings.HasPrefix(trimmedLine, "#") { // Ignora comentários e linhas vazias
+		if trimmedLine != "" && !strings.HasPrefix(trimmedLine, "#") { // Ignore comments and empty lines
 			result = append(result, trimmedLine)
 		}
 	}
 	return result, nil
 }
 
-// deduplicateStringSlice continua útil.
+// deduplicateStringSlice is still useful.
 func deduplicateStringSlice(s []string) []string {
 	seen := make(map[string]struct{})
 	result := []string{}
@@ -154,7 +156,7 @@ func GetUserHomeDir() (string, error) {
 }
 */
 
-// Validate continua útil para validar a struct Config após ser populada pelo Viper.
+// Validate is still useful for validating the Config struct after being populated by Viper.
 func (c *Config) Validate() error {
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("requestTimeout must be positive")
@@ -192,14 +194,14 @@ func (c *Config) Validate() error {
 	if c.RetryDelayBaseMs > c.RetryDelayMaxMs && c.RetryDelayMaxMs > 0 { // Only if MaxMs is not unlimited (0)
 		return fmt.Errorf("retryDelayBaseMs (%d) cannot be greater than retryDelayMaxMs (%d)", c.RetryDelayBaseMs, c.RetryDelayMaxMs)
 	}
-	if c.MaxConsecutiveFailuresToBlock < 0 { // 0 pode significar desabilitado, mas não negativo
+	if c.MaxConsecutiveFailuresToBlock < 0 { // 0 can mean disabled, but not negative
 		return fmt.Errorf("maxConsecutiveFailuresToBlock cannot be negative")
 	}
 	return nil
 }
 
-// String (método de Config) permanece útil para debugging.
+// String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, RetryDelayBaseMs: %d, RetryDelayMaxMs: %d, MaxConsecutiveFailuresToBlock: %d",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.RetryDelayBaseMs, c.RetryDelayMaxMs, c.MaxConsecutiveFailuresToBlock)
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, RetryDelayBaseMs: %d, RetryDelayMaxMs: %d, MaxConsecutiveFailuresToBlock: %d, CustomHeaders (count): %d",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.RetryDelayBaseMs, c.RetryDelayMaxMs, c.MaxConsecutiveFailuresToBlock, len(c.CustomHeaders))
 } 

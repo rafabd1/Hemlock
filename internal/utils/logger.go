@@ -142,7 +142,7 @@ func (l *defaultLogger) Errorf(format string, v ...interface{}) {
 
 func (l *defaultLogger) Fatalf(format string, v ...interface{}) {
 	// Fatalf sempre loga, independente de silent, se o nível de log permitir (que sempre será, por ser fatal)
-	if l.logLevel <= LevelFatal { 
+	if l.logLevel <= LevelFatal {
 		l.fatalLogger.Fatalf(format, v...)
 	}
 	// Fallback se por algum motivo o nível de log for maior que fatal (não deveria acontecer)

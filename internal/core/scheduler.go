@@ -51,12 +51,6 @@ func NewScheduler(cfg *config.Config, client *networking.Client, processor *Proc
 	}
 }
 
-// TODO: Implement StartScan() method that iterates targets and headers.
-// TODO: Implement worker goroutine logic for performing probes (baseline, A, B) using the client.
-// TODO: Implement conversion from networking.ClientResponseData to core.ProbeData.
-// TODO: Implement logic to call processor.AnalyzeProbes and collect findings.
-// TODO: Implement concurrency management using cfg.Concurrency and the WaitGroup.
-
 // loadHeaders loads headers from the specified wordlist file.
 func loadHeaders(filePath string, logger utils.Logger) ([]string, error) {
 	if filePath == "" {
@@ -84,41 +78,6 @@ func loadHeaders(filePath string, logger utils.Logger) ([]string, error) {
 	return headers, nil
 }
 
-// collectWorkerPoolOutputs listens to the worker pool's results and errors channels
-// and forwards them or handles them appropriately.
-// For now, it just logs errors from the worker pool itself (e.g., if a job func panics - though our jobs return errors).
-func (s *Scheduler) collectWorkerPoolOutputs() {
-	// Implementation needed
-}
-
-// buildBalancedWorkQueue prepares a list of URLs for processing, attempting to balance load across domains.
-func (s *Scheduler) buildBalancedWorkQueue(urls []string) []string {
-	// Implementation needed
-	return nil
-}
-
-// Helper to create ProbeData from httpClient response
-func makeProbeData(url string, reqHeaders http.Header, resp *http.Response, body []byte, err error) ProbeData {
-	// Implementation needed
-	return ProbeData{}
-}
-
-// Schedule starts the scanning process for the given URLs.
-// It returns a channel where ScanTaskResult can be received.
-func (s *Scheduler) Schedule(urls []string) <-chan ScanTaskResult {
-	// Implementation needed
-	return nil
-}
-
-func (s *Scheduler) closeResultsChan() {
-	// Implementation needed
-}
-
-// Shutdown gracefully stops the scheduler and its worker pool.
-func (s *Scheduler) Shutdown() {
-	// Implementation needed
-}
-
 // buildProbeData converts networking.ClientResponseData to core.ProbeData.
 func buildProbeData(url string, reqData networking.ClientRequestData, respData networking.ClientResponseData) ProbeData {
 	// Note: core.ProbeData is defined in processor.go
@@ -132,21 +91,21 @@ func buildProbeData(url string, reqData networking.ClientRequestData, respData n
 	}
 }
 
-// performRequestWithDomainManagement é um helper para encapsular a lógica de DomainManager.
+// performRequestWithDomainManagement is a helper to encapsulate DomainManager logic.
 func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData networking.ClientRequestData) networking.ClientResponseData {
 	canProceed, waitTime := s.domainManager.CanRequest(domain)
 	for !canProceed {
-		s.logger.Debugf("[Scheduler DM] Domínio '%s' requer espera de %s. Pausando goroutine.", domain, waitTime)
+		s.logger.Debugf("[Scheduler DM] Domain '%s' requires waiting %s. Pausing goroutine.", domain, waitTime)
 		time.Sleep(waitTime)
 		canProceed, waitTime = s.domainManager.CanRequest(domain)
 	}
 
-	// Pode prosseguir
-	s.logger.Debugf("[Scheduler DM] Procedendo com a requisição para o domínio '%s' (URL: %s)", domain, reqData.URL)
+	// Can proceed
+	s.logger.Debugf("[Scheduler DM] Proceeding with request to domain '%s' (URL: %s)", domain, reqData.URL)
 	respData := s.client.PerformRequest(reqData)
-	s.domainManager.RecordRequestSent(domain) // Registra que a requisição foi feita
+	s.domainManager.RecordRequestSent(domain) // Record that the request was made
 
-	// Analisa o resultado para possível bloqueio de domínio
+	// Analyze result for possible domain blocking
 	var statusCode int
 	if respData.Response != nil {
 		statusCode = respData.Response.StatusCode
@@ -182,7 +141,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	for _, baseURL := range uniqueBaseURLs {
 		parsedBaseURL, errURLParse := url.Parse(baseURL)
 		if errURLParse != nil {
-			s.logger.Warnf("Falha ao parsear baseURL '%s': %v. Pulando este base URL.", baseURL, errURLParse)
+			s.logger.Warnf("Failed to parse baseURL '%s': %v. Skipping this base URL.", baseURL, errURLParse)
 			continue
 		}
 		baseDomain := parsedBaseURL.Hostname()
@@ -203,7 +162,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 			// Perform baseline request for this specific URL + param combination
 			s.logger.Debugf("[Scheduler] Performing Baseline Request for URL: %s (Domain: %s)", targetURLWithOriginalParams, baseDomain)
 			baselineReqData := networking.ClientRequestData{URL: targetURLWithOriginalParams, Method: "GET"}
-			// Usa o helper com gerenciamento de domínio
+			// Use the helper with domain management
 			baselineRespData := s.performRequestWithDomainManagement(baseDomain, baselineReqData)
 			baselineProbe := buildProbeData(targetURLWithOriginalParams, baselineReqData, baselineRespData)
 			s.logger.Debugf("[Scheduler] Baseline Probe for %s - Status: %s, Body Size: %d, Error: %v", targetURLWithOriginalParams, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
@@ -253,7 +212,6 @@ func (s *Scheduler) StartScan() []*report.Finding {
 						}
 
 						s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, InputType: Header, InputName: %s, InjectedValue: %s", urlToTest, currentHeaderName, injectedValue)
-						// TODO: Modify AnalyzeProbes signature to accept inputType and inputName
 						finding, err := s.processor.AnalyzeProbes(urlToTest, "header", currentHeaderName, injectedValue, baseProbe, probeAProbe, probeBProbe)
 						if err != nil {
 							s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Header %s: %v", urlToTest, currentHeaderName, err)
@@ -315,7 +273,6 @@ func (s *Scheduler) StartScan() []*report.Finding {
 							}
 
 							s.logger.Debugf("[Scheduler Worker] Analyzing probes for URL: %s, InputType: Parameter, InputName: %s, InjectedValue: %s", urlToTestWithOriginalParams, currentParamName, currentParamPayload)
-							// TODO: Modify AnalyzeProbes signature
 							finding, err := s.processor.AnalyzeProbes(urlToTestWithOriginalParams, "parameter", currentParamName, currentParamPayload, baseProbe, probeAParamProbe, probeBParamProbe)
 							if err != nil {
 								s.logger.Warnf("[Scheduler Worker] Processor error for URL %s, Param %s: %v", urlToTestWithOriginalParams, currentParamName, err)
@@ -375,9 +332,3 @@ func modifyURLQueryParam(originalURL string, paramNameToModify string, newParamV
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }
-
-// TODO: Implement StartScan() method that iterates targets and headers.
-// TODO: Implement worker goroutine logic for performing probes (baseline, A, B) using the client.
-// TODO: Implement conversion from networking.ClientResponseData to core.ProbeData.
-// TODO: Implement logic to call processor.AnalyzeProbes and collect findings.
-// TODO: Implement concurrency management using cfg.Concurrency and the WaitGroup. 

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,103 +119,119 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 			baseDelay := time.Duration(c.cfg.RetryDelayBaseMs) * time.Millisecond
 			maxDelay := time.Duration(c.cfg.RetryDelayMaxMs) * time.Millisecond
 
-			delay := baseDelay * time.Duration(1<<(attempt-1)) // Exponencial: 2^(attempt-1)
-			// Adicionar jitter: +/- 20% do delay calculado
+			delay := baseDelay * time.Duration(1<<(attempt-1)) // Exponential: 2^(attempt-1)
+			// Add jitter: +/- 20% of calculated delay
 			jitter := time.Duration(rand.Intn(int(delay/5))) - (delay / 10)
 			delay += jitter
 
-			if delay > maxDelay && maxDelay > 0 { // maxDelay > 0 significa que há um limite
+			if delay > maxDelay && maxDelay > 0 { // maxDelay > 0 means there's a limit
 				delay = maxDelay
 			}
-			if delay < 0 { // Garantir que o delay não seja negativo devido ao jitter
+			if delay < 0 { // Ensure delay is not negative due to jitter
 				delay = 0
 			}
 
-			c.logger.Debugf("[Client] Tentativa %d/%d falhou para %s. Erro: %v. Aguardando %s antes de tentar novamente.", attempt, c.cfg.MaxRetries, reqData.URL, finalRespData.Error, delay)
+			c.logger.Debugf("[Client] Attempt %d/%d failed for %s. Error: %v. Waiting %s before trying again.", attempt, c.cfg.MaxRetries, reqData.URL, finalRespData.Error, delay)
 			time.Sleep(delay)
 		}
 
 		req, err := http.NewRequest(reqData.Method, reqData.URL, nil) // TODO: Support request body (reqData.Body)
 		if err != nil {
-			finalRespData.Error = fmt.Errorf("falha ao criar requisição para %s: %w", reqData.URL, err)
-			continue // Tenta a próxima retentativa se houver erro ao criar a requisição
+			finalRespData.Error = fmt.Errorf("failed to create request for %s: %w", reqData.URL, err)
+			continue // Try next retry if there's an error creating the request
 		}
 
+		// Set User-Agent and then any custom headers from config
 		req.Header.Set("User-Agent", c.userAgent)
+		
+		// Add any custom headers specified in config
+		for _, headerLine := range c.cfg.CustomHeaders {
+			parts := strings.SplitN(headerLine, ":", 2)
+			if len(parts) == 2 {
+				headerName := strings.TrimSpace(parts[0])
+				headerValue := strings.TrimSpace(parts[1])
+				req.Header.Set(headerName, headerValue)
+				// If the header is User-Agent, it will override the default one
+			} else {
+				c.logger.Warnf("[Client] Invalid custom header format (expected 'Name: Value'): %s", headerLine)
+			}
+		}
+		
+		// Finally add any request-specific custom headers (these have highest priority)
 		for key, values := range reqData.CustomHeaders {
 			for _, value := range values {
 				req.Header.Add(key, value)
 			}
 		}
 
-		c.logger.Debugf("[Client Attempt: %d] Enviando %s para %s com headers: %v", attempt+1, reqData.Method, reqData.URL, req.Header)
+		c.logger.Debugf("[Client Attempt: %d] Sending %s to %s with headers: %v", attempt+1, reqData.Method, reqData.URL, req.Header)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			finalRespData.Error = fmt.Errorf("falha ao executar requisição para %s (tentativa %d): %w", reqData.URL, attempt+1, err)
-			// Verificar se o erro é transiente para decidir se continua ou não
+			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d): %w", reqData.URL, attempt+1, err)
+			// Check if the error is transient to decide whether to continue
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				c.logger.Warnf("[Client] Timeout na requisição para %s (tentativa %d).", reqData.URL, attempt+1)
-				// Timeouts são bons candidatos para retentativas
+				c.logger.Warnf("[Client] Timeout on request to %s (attempt %d).", reqData.URL, attempt+1)
+				// Timeouts are good candidates for retries
 			} else {
-				// Para outros erros de rede não-timeout, podemos decidir parar ou continuar
-				// Se for um erro definitivo (ex: host não encontrado), não adianta tentar de novo.
-				// Por enquanto, vamos tentar de novo para a maioria dos erros de httpClient.Do()
+				// For other non-timeout network errors, we can decide to stop or continue
+				// If it's a definite error (e.g., host not found), retrying won't help.
+				// For now, we'll retry for most httpClient.Do() errors
 			}
-			// Se for a última tentativa, o erro será o finalRespData.Error
+			// If it's the last attempt, the error will be the finalRespData.Error
 			if attempt == c.cfg.MaxRetries {
 				return finalRespData
 			}
-			continue // Próxima tentativa
+			continue // Next attempt
 		}
 
-		// Se a requisição foi bem-sucedida (mesmo que status code não seja 2xx)
+		// If the request was successful (even if status code is not 2xx)
 		defer resp.Body.Close()
 		body, readErr := ioutil.ReadAll(resp.Body)
 		if readErr != nil {
-			finalRespData.Error = fmt.Errorf("falha ao ler corpo da resposta de %s (tentativa %d): %w", reqData.URL, attempt+1, readErr)
-			// Mesmo se falhar ao ler o corpo, o status code pode ser útil.
-			// Para consistência, vamos tratar isso como uma falha da tentativa e possivelmente tentar de novo.
+			finalRespData.Error = fmt.Errorf("failed to read response body from %s (attempt %d): %w", reqData.URL, attempt+1, readErr)
+			// Even if reading the body fails, the status code might be useful.
+			// For consistency, we'll treat this as a failed attempt and possibly retry.
 			if attempt == c.cfg.MaxRetries {
-				finalRespData.Response = resp // Ainda guardar a resposta se possível
+				finalRespData.Response = resp // Still store the response if possible
 				finalRespData.RespHeaders = resp.Header
 				return finalRespData
 			}
-			continue // Próxima tentativa
+			continue // Next attempt
 		}
 
-		c.logger.Debugf("[Client] Resposta recebida de %s (tentativa %d): Status %s, Body Size: %d", reqData.URL, attempt+1, resp.Status, len(body))
+		c.logger.Debugf("[Client] Response received from %s (attempt %d): Status %s, Body Size: %d", reqData.URL, attempt+1, resp.Status, len(body))
 
-		// Verificar se o status code HTTP deve acionar uma retentativa (ex: 5xx)
+		// Check if HTTP status code should trigger a retry (e.g., 5xx)
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
-			finalRespData.Error = fmt.Errorf("servidor retornou status %s para %s (tentativa %d)", resp.Status, reqData.URL, attempt+1)
+			finalRespData.Error = fmt.Errorf("server returned status %s for %s (attempt %d)", resp.Status, reqData.URL, attempt+1)
 			finalRespData.Response = resp
 			finalRespData.Body = body
 			finalRespData.RespHeaders = resp.Header
 			if attempt == c.cfg.MaxRetries {
 				return finalRespData
 			}
-			continue // Próxima tentativa
+			continue // Next attempt
 		}
 
-		// Requisição e leitura do corpo bem-sucedidas, e status code não é 5xx
+		// Request and body reading successful, and status code is not 5xx
 		finalRespData.Response = resp
 		finalRespData.Body = body
 		finalRespData.RespHeaders = resp.Header
-		finalRespData.Error = nil // Limpa qualquer erro de tentativas anteriores
-		return finalRespData      // Sucesso, retorna imediatamente
+		finalRespData.Error = nil // Clear any errors from previous attempts
+		return finalRespData      // Success, return immediately
 	}
 
-	// Se todas as tentativas falharem (MaxRetries atingido)
-	c.logger.Errorf("[Client] Todas as %d tentativas falharam para %s. Último erro: %v", c.cfg.MaxRetries+1, reqData.URL, finalRespData.Error)
+	// If all attempts fail (MaxRetries reached)
+	c.logger.Errorf("[Client] All %d attempts failed for %s. Last error: %v", c.cfg.MaxRetries+1, reqData.URL, finalRespData.Error)
 	return finalRespData
 }
 
-// TODO: Implementar GetJSContent(url string) ([]string, error)
-// - Este método deve buscar uma URL, parsear o HTML para encontrar tags <script src="...">
-// - Para cada src, se for um path relativo, resolver para absoluto baseado na URL original.
-// - Baixar o conteúdo de cada script JS.
-// - Retornar uma lista de strings, cada string sendo o conteúdo de um arquivo JS.
-// - Este método também deve usar a lógica de retentativas.
+// TODO: Implement GetJSContent(url string) ([]string, error)
+// - This method should fetch a URL, parse the HTML to find <script src="..."> tags
+// - For each src, if it's a relative path, resolve it to an absolute path based on the original URL.
+// - Download the content of each JS script.
+// - Return a list of strings, each string being the content of a JS file.
+// - This method should also use the retry logic.
 
 // loggerIsDebugEnabled is a helper to check if the logger is configured for debug output.
 // This is a simplistic check; a more robust Logger interface might have a IsLevelEnabled(level) method.

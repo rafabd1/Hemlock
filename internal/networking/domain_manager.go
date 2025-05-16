@@ -5,28 +5,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rafabd1/Hemlock/internal/config" // Para acessar MinRequestDelayMs e DomainCooldownMs
+	"github.com/rafabd1/Hemlock/internal/config" // To access MinRequestDelayMs and DomainCooldownMs
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
-// domainState guarda o estado de um domínio específico.
+// domainState stores the state of a specific domain.
 type domainState struct {
 	lastRequestTime     time.Time
 	blockedUntil        time.Time
-	consecutiveFailures int // Novo campo para rastrear falhas consecutivas
+	consecutiveFailures int // Field to track consecutive failures
 }
 
-// DomainManager gerencia o estado e as políticas por domínio,
-// incluindo rate limiting e detecção de bloqueios (WAF).
-// É crucial para o comportamento inteligente da ferramenta em relação a domínios específicos.
+// DomainManager manages state and policies per domain,
+// including rate limiting and blocking detection (WAF).
+// It is crucial for the intelligent behavior of the tool in relation to specific domains.
 type DomainManager struct {
-	config       *config.Config // Para ler MinRequestDelayMs, DomainCooldownMs
+	config       *config.Config // To read MinRequestDelayMs, DomainCooldownMs
 	logger       utils.Logger
 	domainStatus map[string]*domainState
-	mu           sync.RWMutex // Protege o acesso ao domainStatus
+	mu           sync.RWMutex // Protects access to domainStatus
 }
 
-// NewDomainManager cria uma nova instância do DomainManager.
+// NewDomainManager creates a new instance of DomainManager.
 func NewDomainManager(cfg *config.Config, logger utils.Logger) *DomainManager {
 	return &DomainManager{
 		config:       cfg,
@@ -35,8 +35,8 @@ func NewDomainManager(cfg *config.Config, logger utils.Logger) *DomainManager {
 	}
 }
 
-// getOrCreateDomainState recupera ou cria o estado para um domínio.
-// Deve ser chamado com o lock apropriado (leitura ou escrita) já adquirido.
+// getOrCreateDomainState retrieves or creates the state for a domain.
+// Should be called with the appropriate lock (read or write) already acquired.
 func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
 	ds, exists := dm.domainStatus[domain]
 	if !exists {
@@ -46,62 +46,62 @@ func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
 	return ds
 }
 
-// CanRequest verifica se uma requisição pode ser feita a um domínio.
-// Retorna true se puder, false caso contrário, junto com o tempo de espera necessário.
+// CanRequest checks if a request can be made to a domain.
+// Returns true if it can, false otherwise, along with the necessary wait time.
 func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	dm.mu.RLock()
-	ds := dm.getOrCreateDomainState(domain) // Leitura, não cria se não existir sob RLock
-	// Para garantir que getOrCreateDomainState possa criar, precisamos de um lock de escrita
-	// ou de uma abordagem de duplo check. Vamos simplificar por agora e assumir que 
-	// o estado será criado na primeira escrita (RecordRequestSent).
-	// Para CanRequest, se não existe, não há restrições ainda.
+	ds := dm.getOrCreateDomainState(domain) // Read, doesn't create if it doesn't exist under RLock
+	// To ensure that getOrCreateDomainState can create, we need a write lock
+	// or a double-check approach. Let's simplify for now and assume that
+	// the state will be created on the first write (RecordRequestSent).
+	// For CanRequest, if it doesn't exist, there are no restrictions yet.
 	existingDs, exists := dm.domainStatus[domain]
-	dm.mu.RUnlock() // Liberar RLock antes de um possível WLock
+	dm.mu.RUnlock() // Release RLock before a possible WLock
 
-	if !exists { // Se o domínio não foi visto, pode prosseguir sem delay
+	if !exists { // If the domain hasn't been seen, can proceed without delay
 		return true, 0
 	}
 
-	// Re-adquirir RLock para ler o estado existente com segurança
+	// Re-acquire RLock to safely read the existing state
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
-	ds = existingDs // Usar o estado que sabemos que existe
+	ds = existingDs // Use the state we know exists
 
 	now := time.Now()
 
-	// 1. Verificar se o domínio está bloqueado (cooldown)
+	// 1. Check if the domain is blocked (cooldown)
 	if ds.blockedUntil.After(now) {
 		waitTime := ds.blockedUntil.Sub(now)
-		dm.logger.Debugf("[DomainManager] Domínio '%s' está em cooldown. Espere: %s", domain, waitTime)
+		dm.logger.Debugf("[DomainManager] Domain '%s' is in cooldown. Wait: %s", domain, waitTime)
 		return false, waitTime
 	}
 
-	// 2. Verificar delay mínimo entre requisições
+	// 2. Check minimum delay between requests
 	minDelay := time.Duration(dm.config.MinRequestDelayMs) * time.Millisecond
-	if ds.lastRequestTime.IsZero() { // Primeira requisição para este domínio (após qualquer cooldown)
+	if ds.lastRequestTime.IsZero() { // First request to this domain (after any cooldown)
 		return true, 0
 	}
 
 	timeSinceLastRequest := now.Sub(ds.lastRequestTime)
 	if timeSinceLastRequest < minDelay {
 		waitTime := minDelay - timeSinceLastRequest
-		dm.logger.Debugf("[DomainManager] Delay mínimo para '%s' não atingido. Espere: %s", domain, waitTime)
+		dm.logger.Debugf("[DomainManager] Minimum delay for '%s' not met. Wait: %s", domain, waitTime)
 		return false, waitTime
 	}
 
 	return true, 0
 }
 
-// RecordRequestSent atualiza o timestamp da última requisição para o domínio.
+// RecordRequestSent updates the timestamp of the last request for the domain.
 func (dm *DomainManager) RecordRequestSent(domain string) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	ds := dm.getOrCreateDomainState(domain)
 	ds.lastRequestTime = time.Now()
-	dm.logger.Debugf("[DomainManager] Requisição registrada para '%s' em %s", domain, ds.lastRequestTime.Format(time.RFC3339))
+	dm.logger.Debugf("[DomainManager] Request recorded for '%s' at %s", domain, ds.lastRequestTime.Format(time.RFC3339))
 }
 
-// RecordRequestResult analisa o resultado de uma requisição e pode bloquear o domínio se necessário.
+// RecordRequestResult analyzes the result of a request and may block the domain if necessary.
 func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
@@ -109,61 +109,61 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 
 	if err != nil {
 		ds.consecutiveFailures++
-		dm.logger.Debugf("[DomainManager] Erro na requisição para %s: %v. Falhas consecutivas: %d. Avaliando para cooldown.", domain, err, ds.consecutiveFailures)
+		dm.logger.Debugf("[DomainManager] Error in request to %s: %v. Consecutive failures: %d. Evaluating for cooldown.", domain, err, ds.consecutiveFailures)
 
-		// Se atingir o limite de falhas consecutivas (a ser configurado, por ex, em cfg.MaxConsecutiveFailuresToBlock)
-		// Vamos usar um valor fixo por agora, ex: 3, e depois tornar configurável.
-		// TODO: Adicionar cfg.MaxConsecutiveFailuresToBlock e cfg.StatusCodesToBlockOnError
-		maxFailures := dm.config.MaxConsecutiveFailuresToBlock // Supondo que este campo exista na config
-		if maxFailures <= 0 { // Se não configurado ou desabilitado, usar um default interno ou não bloquear por falhas consecutivas
-			maxFailures = 3 // Default interno se não configurado
+		// If consecutive failures limit is reached (to be configured, e.g., in cfg.MaxConsecutiveFailuresToBlock)
+		// Let's use a fixed value for now, e.g., 3, and make it configurable later.
+		// TODO: Add cfg.MaxConsecutiveFailuresToBlock and cfg.StatusCodesToBlockOnError
+		maxFailures := dm.config.MaxConsecutiveFailuresToBlock // Assuming this field exists in config
+		if maxFailures <= 0 { // If not configured or disabled, use an internal default or don't block based on consecutive failures
+			maxFailures = 3 // Internal default if not configured
 		}
 
 		if ds.consecutiveFailures >= maxFailures {
-			dm.logger.Warnf("[DomainManager] Domínio %s atingiu %d falhas consecutivas. Aplicando cooldown.", domain, ds.consecutiveFailures)
-			dm.blockDomainInternal(domain, ds) // Chama helper interno que já tem o lock
-			ds.consecutiveFailures = 0        // Resetar após bloquear
+			dm.logger.Warnf("[DomainManager] Domain %s reached %d consecutive failures. Applying cooldown.", domain, ds.consecutiveFailures)
+			dm.blockDomainInternal(domain, ds) // Calls internal helper that already has the lock
+			ds.consecutiveFailures = 0        // Reset after blocking
 		} else if statusCode != 0 && (statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable) {
-			// Se houve um erro de rede *mas* também temos um status code problemático (raro, mas possível se o erro for na leitura do corpo após receber headers)
-			dm.logger.Warnf("[DomainManager] Erro na requisição para %s mas com status code %d. Aplicando cooldown.", domain, statusCode)
+			// If there was a network error *but* we also have a problematic status code (rare, but possible if the error is in reading the body after receiving headers)
+			dm.logger.Warnf("[DomainManager] Error in request to %s but with status code %d. Applying cooldown.", domain, statusCode)
 			dm.blockDomainInternal(domain, ds)
 			ds.consecutiveFailures = 0
 		}
-		return // Importante: retornar após tratar o erro
+		return // Important: return after handling the error
 	}
 
-	// Se err == nil (requisição HTTP em si foi bem sucedida, temos um status code)
-	// Resetar falhas consecutivas se a requisição foi bem sucedida (mesmo que não seja 2xx, mas não um erro de rede)
+	// If err == nil (HTTP request itself was successful, we have a status code)
+	// Reset consecutive failures if the request was successful (even if not 2xx, but not a network error)
 	ds.consecutiveFailures = 0 
 
 	if statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable {
-		dm.logger.Warnf("[DomainManager] Status code %d recebido de %s. Aplicando cooldown.", statusCode, domain)
+		dm.logger.Warnf("[DomainManager] Status code %d received from %s. Applying cooldown.", statusCode, domain)
 		dm.blockDomainInternal(domain, ds)
 	}
-	// Poderíamos adicionar lógica para outros status codes se necessário, ou contadores para status codes específicos.
+	// We could add logic for other status codes if needed, or counters for specific status codes.
 }
 
-// blockDomainInternal é um helper para evitar duplicação de código e garantir que o lock não seja re-adquirido.
-// Assume que o lock de escrita dm.mu já está mantido.
+// blockDomainInternal is a helper to avoid code duplication and ensure the lock isn't re-acquired.
+// Assumes the write lock dm.mu is already held.
 func (dm *DomainManager) blockDomainInternal(domain string, ds *domainState) {
 	cooldownDuration := time.Duration(dm.config.DomainCooldownMs) * time.Millisecond
 	ds.blockedUntil = time.Now().Add(cooldownDuration)
-	dm.logger.Warnf("[DomainManager] Domínio '%s' bloqueado até %s (cooldown: %s)", domain, ds.blockedUntil.Format(time.RFC3339), cooldownDuration)
+	dm.logger.Warnf("[DomainManager] Domain '%s' blocked until %s (cooldown: %s)", domain, ds.blockedUntil.Format(time.RFC3339), cooldownDuration)
 }
 
-// BlockDomain marca um domínio como bloqueado por uma duração específica.
-// Esta é a versão pública que adquire o lock.
+// BlockDomain marks a domain as blocked for a specific duration.
+// This is the public version that acquires the lock.
 func (dm *DomainManager) BlockDomain(domain string) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	ds := dm.getOrCreateDomainState(domain)
 	dm.blockDomainInternal(domain, ds)
-	// ds.consecutiveFailures = 0 // Resetar falhas aqui também pode ser uma boa ideia, se BlockDomain for chamada externamente.
-	                            // Por ora, RecordRequestResult cuida do reset após o bloqueio.
+	// ds.consecutiveFailures = 0 // Resetting failures here might also be a good idea if BlockDomain is called externally.
+	                            // For now, RecordRequestResult handles the reset after blocking.
 }
 
-// IsBlocked verifica se um domínio está atualmente bloqueado e retorna o tempo de expiração do bloqueio.
-// Retorna false se não estiver bloqueado.
+// IsBlocked checks if a domain is currently blocked and returns the expiration time of the block.
+// Returns false if not blocked.
 func (dm *DomainManager) IsBlocked(domain string) (bool, time.Time) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()

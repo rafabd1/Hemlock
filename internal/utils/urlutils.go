@@ -124,7 +124,7 @@ func ExtractRelevantToken(injectedValue string) string {
 	}
 	// Not a URL with a clear hostname, or parsing failed; return the original value
 	return injectedValue
-}
+} 
 
 // PreprocessAndGroupURLs normalizes URLs, extracts base URLs, and groups their query parameters.
 // It returns a map of base URLs to a list of their original query parameter sets,
