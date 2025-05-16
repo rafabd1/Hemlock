@@ -128,11 +128,14 @@ func ExtractRelevantToken(injectedValue string) string {
 
 // PreprocessAndGroupURLs normalizes URLs, extracts base URLs, and groups their query parameters.
 // It returns a map of base URLs to a list of their original query parameter sets,
-// and a sorted list of unique base URLs for deterministic processing.
-func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[string]string, []string) {
+// a sorted list of unique base URLs, the total count of query parameters found across all sets,
+// and the count of base URLs that have parameters.
+func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[string]string, []string, int, int) {
 	groupedParams := make(map[string][]map[string]string)
 	baseURLExistence := make(map[string]struct{})
 	var uniqueBaseURLs []string
+	totalQueryParametersFound := 0
+	baseURLsWithParamsCount := 0
 
 	if logger == nil {
 		// Provide a no-op logger if nil is passed to prevent panics
@@ -160,16 +163,12 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 		}
 		baseString := baseURL.String()
 
-		// Collect original parameters from the *rawURL* before full normalization altered them for deduplication
-		// We use u.Query() from the *normalizedFullURL* as normalizeURL already sorted them, which is fine for grouping.
-		// The key is that parameters for the *same base URL* are grouped.
 		queryParamsMap := make(map[string]string)
-		originalURLParsed, parseErr := url.Parse(rawURL) // Parse original to get its specific query params
+		originalURLParsed, parseErr := url.Parse(rawURL) 
 		if parseErr == nil {
 			for k, v := range originalURLParsed.Query() {
 				if len(v) > 0 {
-					queryParamsMap[k] = v[0] // Take the first value if multiple are present for simplicity
-					// For more complex scenarios, might need to decide how to handle multiple values for a single param name.
+					queryParamsMap[k] = v[0] 
 				}
 			}
 		}
@@ -178,21 +177,18 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 			baseURLExistence[baseString] = struct{}{}
 			uniqueBaseURLs = append(uniqueBaseURLs, baseString)
 		}
-
-		// Add the parameter set to the list for this base URL
-		// We add even if queryParamsMap is empty, to signify the base URL itself was an input
 		groupedParams[baseString] = append(groupedParams[baseString], queryParamsMap)
 	}
 
-	// Sort uniqueBaseURLs for deterministic processing order
 	sort.Strings(uniqueBaseURLs)
 
-	// Deduplicate parameter sets for each base URL (optional, but good for reducing redundant tests if inputs had exact same query strings for same base)
+	// Deduplicate parameter sets and count parameters
+	tempGroupedParams := make(map[string][]map[string]string)
 	for base, paramSets := range groupedParams {
 		dedupedSets := []map[string]string{}
 		seenSets := make(map[string]struct{})
+		currentBaseHasParams := false
 		for _, pSet := range paramSets {
-			// Create a canonical representation of the param set for deduplication
 			var paramKeys []string
 			for k := range pSet {
 				paramKeys = append(paramKeys, k)
@@ -207,17 +203,28 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 			if _, seen := seenSets[canonicalString]; !seen {
 				seenSets[canonicalString] = struct{}{}
 				dedupedSets = append(dedupedSets, pSet)
+				if len(pSet) > 0 {
+					totalQueryParametersFound += len(pSet)
+					currentBaseHasParams = true
+				}
 			}
 		}
-		groupedParams[base] = dedupedSets
+		tempGroupedParams[base] = dedupedSets
+		if currentBaseHasParams {
+			baseURLsWithParamsCount++
+		}
 	}
+	groupedParams = tempGroupedParams // Update with deduped sets
 
 	logger.Infof("Preprocessed URLs. Found %d unique base URLs.", len(uniqueBaseURLs))
+	logger.Debugf("Total query parameters found across all unique sets: %d", totalQueryParametersFound)
+	logger.Debugf("Number of base URLs with parameters: %d", baseURLsWithParamsCount)
+
 	for _, base := range uniqueBaseURLs {
 		logger.Debugf("Base URL: %s, has %d unique parameter sets.", base, len(groupedParams[base]))
 	}
 
-	return groupedParams, uniqueBaseURLs
+	return groupedParams, uniqueBaseURLs, totalQueryParametersFound, baseURLsWithParamsCount
 }
 
 // NoOpLogger is a logger that does nothing, useful for utility functions

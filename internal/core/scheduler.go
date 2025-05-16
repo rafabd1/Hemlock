@@ -37,6 +37,8 @@ type Scheduler struct {
 	wg            sync.WaitGroup
 	mu            sync.Mutex // For thread-safe access to findings slice
 	uniqueDomainCount int      // To store the count of unique domains being scanned
+	totalQueryParametersFound int // Total query parameters found in targets
+	baseURLsWithParamsCount   int // Count of base URLs that have parameters
 }
 
 // NewScheduler creates a new Scheduler instance.
@@ -48,7 +50,7 @@ func NewScheduler(cfg *config.Config, client *networking.Client, processor *Proc
 		domainManager: dm,
 		logger:        logger,
 		findings:      make([]*report.Finding, 0),
-		// wg, mu, and uniqueDomainCount are initialized to their zero values, which is appropriate.
+		// wg, mu, uniqueDomainCount, totalQueryParametersFound, baseURLsWithParamsCount are initialized to their zero values
 	}
 }
 
@@ -95,10 +97,16 @@ func buildProbeData(url string, reqData networking.ClientRequestData, respData n
 // performRequestWithDomainManagement is a helper to encapsulate DomainManager logic.
 func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData networking.ClientRequestData) networking.ClientResponseData {
 	canProceed, waitTime := s.domainManager.CanRequest(domain)
+	if !canProceed {
+		s.logger.Debugf("[Scheduler DM] Domain '%s' requires initial wait of %s. Pausing goroutine.", domain, waitTime)
+	}
 	for !canProceed {
-		s.logger.Debugf("[Scheduler DM] Domain '%s' requires waiting %s. Pausing goroutine.", domain, waitTime)
 		time.Sleep(waitTime)
 		canProceed, waitTime = s.domainManager.CanRequest(domain)
+		if !canProceed {
+			// Optional: Log subsequent waits if needed, but less frequently or with different wording
+			s.logger.Debugf("[Scheduler DM] Domain '%s' still waiting, next check after %s.", domain, waitTime)
+		}
 	}
 
 	// Can proceed
@@ -117,21 +125,27 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 }
 
 // StartScan begins the scanning process based on the scheduler's configuration.
-// It now returns the list of findings and the count of unique base URLs (domains) processed.
-func (s *Scheduler) StartScan() ([]*report.Finding, int) {
+// It now returns the list of findings, the count of unique base URLs (domains) processed,
+// the total query parameters found, and the count of base URLs with parameters.
+func (s *Scheduler) StartScan() ([]*report.Finding, int, int, int) {
 	s.logger.Infof("Preprocessing URLs...")
-	groupedBaseURLsAndParams, uniqueBaseURLs := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
-	s.uniqueDomainCount = len(uniqueBaseURLs) // Store for main.go to access if needed, or just return
+	groupedBaseURLsAndParams, uniqueBaseURLs, totalParams, baseCountWithParams := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
+	s.uniqueDomainCount = len(uniqueBaseURLs)
+	s.totalQueryParametersFound = totalParams
+	s.baseURLsWithParamsCount = baseCountWithParams
 
 	if s.uniqueDomainCount == 0 {
 		s.logger.Warnf("No processable targets found after preprocessing. Aborting scan.")
-		return s.findings, 0
+		return s.findings, 0, 0, 0
 	}
 	s.logger.Infof("Preprocessing complete. %d unique base URLs (domains) will be scanned.", s.uniqueDomainCount)
+	if s.totalQueryParametersFound > 0 {
+		s.logger.Infof("Found %d query parameters across %d base URLs that will be considered for testing if parameter tests are enabled.", s.totalQueryParametersFound, s.baseURLsWithParamsCount)
+	}
 
-	if len(s.config.HeadersToTest) == 0 && len(s.config.BasePayloads) == 0 && s.config.DefaultPayloadPrefix == "" {
-		s.logger.Warnf("No headers to test and no base payloads/prefix configured. Aborting scan as no tests can be performed.")
-		return s.findings, s.uniqueDomainCount
+	if len(s.config.HeadersToTest) == 0 && len(s.config.BasePayloads) == 0 && s.config.DefaultPayloadPrefix == "" && s.totalQueryParametersFound == 0 {
+		s.logger.Warnf("No headers to test, no base payloads/prefix configured, and no URL parameters found. Aborting scan as no tests can be performed.")
+		return s.findings, s.uniqueDomainCount, s.totalQueryParametersFound, s.baseURLsWithParamsCount
 	}
 
 	// Use a buffered channel as a semaphore to limit concurrency.
@@ -150,17 +164,27 @@ func (s *Scheduler) StartScan() ([]*report.Finding, int) {
 		}
 		baseDomain := parsedBaseURL.Hostname()
 		paramSets := groupedBaseURLsAndParams[baseURL]
-		if len(paramSets) == 0 { 
-			paramSets = []map[string]string{{}} 
-		}
-		s.logger.Infof("[Scan %d/%d] Processing Base URL: %s (Domain: %s) - %d parameter set(s) to test.", i+1, s.uniqueDomainCount, baseURL, baseDomain, len(paramSets))
 
-		for _, currentParamSet := range paramSets {
+		s.logger.Infof(
+			"[Scan %d/%d] Processing URL: %s",
+			i+1, s.uniqueDomainCount, baseURL,
+		)
+
+		for paramSetIndex, currentParamSet := range paramSets {
+			numActualParamsInThisSet := len(currentParamSet)
 			// Construct the target URL with its original parameters for this specific test iteration
 			targetURLWithOriginalParams, err := constructURLWithParams(baseURL, currentParamSet)
 			if err != nil {
 				s.logger.Warnf("Failed to construct URL from base '%s' and params %v: %v. Skipping this param set.", baseURL, currentParamSet, err)
 				continue
+			}
+
+			// Log for the current parameter set being processed
+			if len(paramSets) > 1 { // If there are multiple variants for the same base URL
+				s.logger.Infof(
+					"[Scan %d/%d - Variant %d/%d] Testing URL: %s with %d parameter(s).",
+					i+1, s.uniqueDomainCount, paramSetIndex+1, len(paramSets), targetURLWithOriginalParams, numActualParamsInThisSet,
+				)
 			}
 
 			// Perform baseline request for this specific URL + param combination
@@ -230,8 +254,8 @@ func (s *Scheduler) StartScan() ([]*report.Finding, int) {
 				payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval1"))
 			}
 
-			if len(payloadsToTest) > 0 && len(currentParamSet) > 0 {
-				s.logger.Debugf("[Param Tests] Starting for %s (Domain: %s), %d params, %d payloads per param.", targetURLWithOriginalParams, baseDomain, len(currentParamSet), len(payloadsToTest))
+			if len(payloadsToTest) > 0 && numActualParamsInThisSet > 0 {
+				s.logger.Debugf("[Param Tests] Starting for %s (Domain: %s), %d params in current set, %d payloads per param.", targetURLWithOriginalParams, baseDomain, numActualParamsInThisSet, len(payloadsToTest))
 				for paramName, originalParamValue := range currentParamSet {
 					for _, paramPayload := range payloadsToTest {
 						s.wg.Add(1)
@@ -290,7 +314,7 @@ func (s *Scheduler) StartScan() ([]*report.Finding, int) {
 
 	s.wg.Wait() // Wait for all goroutines to finish
 	s.logger.Infof("All scan tasks completed.")
-	return s.findings, s.uniqueDomainCount
+	return s.findings, s.uniqueDomainCount, s.totalQueryParametersFound, s.baseURLsWithParamsCount
 }
 
 // getStatus is a helper to safely get the status string from a response.
