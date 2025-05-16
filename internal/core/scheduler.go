@@ -3,11 +3,13 @@ package core
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rafabd1/Hemlock/internal/config"
@@ -15,6 +17,16 @@ import (
 	"github.com/rafabd1/Hemlock/internal/report"
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
+
+// TargetURLJob struct defines a unit of work for a worker.
+// It contains the specific URL (with parameters) to be tested and its base domain.
+type TargetURLJob struct {
+	URLString      string            // The full URL with specific parameters for this job
+	BaseDomain     string
+	OriginalParams map[string]string // The params that formed this specific URLString
+	Retries        int               // Number of times this job has been attempted
+	NextAttemptAt  time.Time         // Time after which this job can be retried
+}
 
 // ScanTaskResult holds the outcome of scanning a single URL.
 // This might evolve to include more details or be part of the `report.Finding` itself.
@@ -36,9 +48,12 @@ type Scheduler struct {
 	findings      []*report.Finding
 	wg            sync.WaitGroup
 	mu            sync.Mutex // For thread-safe access to findings slice
-	uniqueDomainCount int      // To store the count of unique domains being scanned
-	totalQueryParametersFound int // Total query parameters found in targets
-	baseURLsWithParamsCount   int // Count of base URLs that have parameters
+
+	jobQueue      chan TargetURLJob // Primary queue for new jobs
+	retryQueue    chan TargetURLJob // Queue for jobs that need retrying
+	activeJobs    int32             // Counter for all active jobs (main + retry)
+	maxRetries    int               // From config
+	doneChan      chan struct{}       // Signals all processing is complete
 }
 
 // NewScheduler creates a new Scheduler instance.
@@ -50,7 +65,8 @@ func NewScheduler(cfg *config.Config, client *networking.Client, processor *Proc
 		domainManager: dm,
 		logger:        logger,
 		findings:      make([]*report.Finding, 0),
-		// wg, mu, uniqueDomainCount, totalQueryParametersFound, baseURLsWithParamsCount are initialized to their zero values
+		maxRetries:    cfg.MaxRetries, // Store maxRetries from config
+		doneChan:      make(chan struct{}),
 	}
 }
 
@@ -125,196 +141,379 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 }
 
 // StartScan begins the scanning process based on the scheduler's configuration.
-// It now returns the list of findings, the count of unique base URLs (domains) processed,
-// the total query parameters found, and the count of base URLs with parameters.
-func (s *Scheduler) StartScan() ([]*report.Finding, int, int, int) {
-	s.logger.Infof("Preprocessing URLs...")
-	groupedBaseURLsAndParams, uniqueBaseURLs, totalParams, baseCountWithParams := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
-	s.uniqueDomainCount = len(uniqueBaseURLs)
-	s.totalQueryParametersFound = totalParams
-	s.baseURLsWithParamsCount = baseCountWithParams
+// It now returns only the list of findings. Counts for summary are handled in main.go.
+func (s *Scheduler) StartScan() []*report.Finding {
+	s.logger.Infof("Scheduler: Initializing scan...")
+	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
-	if s.uniqueDomainCount == 0 {
-		s.logger.Warnf("No processable targets found after preprocessing. Aborting scan.")
-		return s.findings, 0, 0, 0
-	}
-	s.logger.Infof("Preprocessing complete. %d unique base URLs (domains) will be scanned.", s.uniqueDomainCount)
-	if s.totalQueryParametersFound > 0 {
-		s.logger.Infof("Found %d query parameters across %d base URLs that will be considered for testing if parameter tests are enabled.", s.totalQueryParametersFound, s.baseURLsWithParamsCount)
+	if len(uniqueBaseURLs) == 0 {
+		s.logger.Warnf("Scheduler: No processable targets. Aborting scan.")
+		return s.findings
 	}
 
-	if len(s.config.HeadersToTest) == 0 && len(s.config.BasePayloads) == 0 && s.config.DefaultPayloadPrefix == "" && s.totalQueryParametersFound == 0 {
-		s.logger.Warnf("No headers to test, no base payloads/prefix configured, and no URL parameters found. Aborting scan as no tests can be performed.")
-		return s.findings, s.uniqueDomainCount, s.totalQueryParametersFound, s.baseURLsWithParamsCount
-	}
-
-	// Use a buffered channel as a semaphore to limit concurrency.
-	concurrencyLimit := s.config.Concurrency
-	if concurrencyLimit <= 0 {
-		concurrencyLimit = 1 // Ensure at least one worker
-	}
-	semaphore := make(chan struct{}, concurrencyLimit)
-	s.logger.Infof("Starting scan with %d concurrent workers.", concurrencyLimit)
-
-	for i, baseURL := range uniqueBaseURLs {
-		parsedBaseURL, errURLParse := url.Parse(baseURL)
-		if errURLParse != nil {
-			s.logger.Warnf("[Scan %d/%d] Failed to parse baseURL '%s': %v. Skipping this base URL.", i+1, s.uniqueDomainCount, baseURL, errURLParse)
-			continue
-		}
-		baseDomain := parsedBaseURL.Hostname()
+	var initialJobs []TargetURLJob
+	for _, baseURL := range uniqueBaseURLs {
+		parsedBase, _ := url.Parse(baseURL) // Error already handled by PreprocessAndGroupURLs
+		baseDomain := parsedBase.Hostname()
 		paramSets := groupedBaseURLsAndParams[baseURL]
+		for _, paramSet := range paramSets {
+			actualTargetURL, _ := constructURLWithParams(baseURL, paramSet) // Error unlikely if Preprocess worked
+			initialJobs = append(initialJobs, TargetURLJob{URLString: actualTargetURL, BaseDomain: baseDomain, OriginalParams: paramSet})
+		}
+	}
 
-		s.logger.Infof(
-			"[Scan %d/%d] Processing URL: %s",
-			i+1, s.uniqueDomainCount, baseURL,
-		)
+	if len(initialJobs) == 0 {
+		s.logger.Warnf("Scheduler: No testable URL jobs created. Aborting scan.")
+		return s.findings
+	}
+	s.logger.Infof("Scheduler: Created %d distinct URL jobs to process.", len(initialJobs))
 
-		for paramSetIndex, currentParamSet := range paramSets {
-			numActualParamsInThisSet := len(currentParamSet)
-			// Construct the target URL with its original parameters for this specific test iteration
-			targetURLWithOriginalParams, err := constructURLWithParams(baseURL, currentParamSet)
-			if err != nil {
-				s.logger.Warnf("Failed to construct URL from base '%s' and params %v: %v. Skipping this param set.", baseURL, currentParamSet, err)
-				continue
+	concurrencyLimit := s.config.Concurrency
+	if concurrencyLimit <= 0 { concurrencyLimit = 1 }
+
+	s.jobQueue = make(chan TargetURLJob, len(initialJobs))
+	s.retryQueue = make(chan TargetURLJob, len(initialJobs)) // Buffer size can be tuned
+	atomic.StoreInt32(&s.activeJobs, int32(len(initialJobs)))
+
+	// Start the retry manager
+	go s.retryManager()
+
+	// Populate the initial job queue
+	for _, job := range initialJobs {
+		s.jobQueue <- job
+	}
+	// close(s.jobQueue) // Don't close yet, retryManager might add to it
+
+	s.logger.Infof("Scheduler: Starting %d workers for %d initial jobs.", concurrencyLimit, len(initialJobs))
+
+	for i := 0; i < concurrencyLimit; i++ {
+		s.wg.Add(1)
+		go func(workerID int) {
+			defer s.wg.Done()
+			s.logger.Debugf("[Worker %d] Started.", workerID)
+			for job := range s.jobQueue {
+				s.processURLJob(workerID, job)
 			}
+			s.logger.Debugf("[Worker %d] Exiting (jobQueue closed).", workerID)
+		}(i)
+	}
 
-			// Log for the current parameter set being processed
-			if len(paramSets) > 1 { // If there are multiple variants for the same base URL
-				s.logger.Infof(
-					"[Scan %d/%d - Variant %d/%d] Testing URL: %s with %d parameter(s).",
-					i+1, s.uniqueDomainCount, paramSetIndex+1, len(paramSets), targetURLWithOriginalParams, numActualParamsInThisSet,
-				)
-			}
+	// Wait for all active jobs to complete (including retries)
+	<-s.doneChan
 
-			// Perform baseline request for this specific URL + param combination
-			s.logger.Debugf("[Baseline] Requesting: %s (Domain: %s)", targetURLWithOriginalParams, baseDomain)
-			baselineReqData := networking.ClientRequestData{URL: targetURLWithOriginalParams, Method: "GET"}
-			baselineRespData := s.performRequestWithDomainManagement(baseDomain, baselineReqData)
-			baselineProbe := buildProbeData(targetURLWithOriginalParams, baselineReqData, baselineRespData)
-			s.logger.Debugf("[Baseline] Response for %s - Status: %s, Body Size: %d, Error: %v", targetURLWithOriginalParams, getStatus(baselineProbe.Response), len(baselineProbe.Body), baselineProbe.Error)
+	s.wg.Wait() // Ensure all worker goroutines have finished
+	s.logger.Infof("Scheduler: All scan tasks and workers completed.")
+	return s.findings
+}
 
-			if baselineProbe.Error != nil {
-				s.logger.Warnf("[Baseline Failed] URL %s: %v. Skipping probes for this target.", targetURLWithOriginalParams, baselineProbe.Error)
-				continue 
-			}
-			if baselineProbe.Response == nil {
-				s.logger.Warnf("[Baseline Invalid] Response is nil for URL %s, though no error reported. Skipping probes.", targetURLWithOriginalParams)
-				continue 
-			}
+// retryManager monitors the retryQueue and reschedules jobs.
+func (s *Scheduler) retryManager() {
+	for job := range s.retryQueue {
+		waitTime := time.Until(job.NextAttemptAt)
+		if waitTime > 0 {
+			s.logger.Debugf("[RetryManager] Job for %s sleeping for %v before re-queueing.", job.URLString, waitTime)
+			time.Sleep(waitTime)
+		}
+		s.logger.Debugf("[RetryManager] Re-queueing job for %s (attempt %d).", job.URLString, job.Retries+1)
+		s.jobQueue <- job // Add back to the main job queue
+	}
+	s.logger.Infof("[RetryManager] Exiting (retryQueue closed).")
+}
 
-			// Test Headers
-			if len(s.config.HeadersToTest) > 0 {
-				s.logger.Debugf("[Header Tests] Starting for %s (Domain: %s), %d headers to test.", targetURLWithOriginalParams, baseDomain, len(s.config.HeadersToTest))
-				for _, headerName := range s.config.HeadersToTest {
-					s.wg.Add(1)
-					semaphore <- struct{}{}
-					go func(urlToTest, currentHeaderName, domain string, baseProbe ProbeData) {
-						defer s.wg.Done()
-						defer func() { <-semaphore }()
-						s.logger.Debugf("[Worker] Test: Header '%s' on %s", currentHeaderName, urlToTest)
+// processURLJob is executed by each worker.
+func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
+	s.logger.Infof("[Worker %d] Processing URL: %s (Attempt %d)", workerID, job.URLString, job.Retries+1)
 
-						injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + currentHeaderName)
-						// Probe A (with injected header)
-						probeAReqHeaders := http.Header{currentHeaderName: []string{injectedValue}}
-						probeAReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET", CustomHeaders: probeAReqHeaders}
-						probeARespData := s.performRequestWithDomainManagement(domain, probeAReqData)
-						probeAProbe := buildProbeData(urlToTest, probeAReqData, probeARespData)
-						s.logger.Debugf("[Worker] Probe A for %s (Header: '%s') - Status: %s, Error: %v", urlToTest, currentHeaderName, getStatus(probeAProbe.Response), probeAProbe.Error)
-						if probeAProbe.Error != nil {
-							s.logger.Warnf("[Worker] Probe A Failed: URL %s, Header '%s': %v. Analysis may be incomplete.", urlToTest, currentHeaderName, probeAProbe.Error)
-						}
+	// 1. Check with DomainManager if we can proceed with this domain
+	canProceed, domainWaitTime := s.domainManager.CanRequest(job.BaseDomain)
+	if !canProceed {
+		s.logger.Debugf("[Worker %d] Domain %s busy/standby. Re-queueing job for %s after %v.", workerID, job.BaseDomain, job.URLString, domainWaitTime)
+		job.Retries++
+		if job.Retries < s.maxRetries {
+			job.NextAttemptAt = time.Now().Add(domainWaitTime)
+			s.retryQueue <- job
+		} else {
+			s.logger.Warnf("[Worker %d] Job for %s discarded after %d retries (blocked by domain).", workerID, job.URLString, job.Retries)
+			s.decrementActiveJobs()
+		}
+		return
+	}
+	s.domainManager.RecordRequestSent(job.BaseDomain) // Record before the baseline request
 
-						// Probe B (cache check - sent after Probe A)
-						probeBReqData := networking.ClientRequestData{URL: urlToTest, Method: "GET"}
-						probeBRespData := s.performRequestWithDomainManagement(domain, probeBReqData)
-						probeBProbe := buildProbeData(urlToTest, probeBReqData, probeBRespData)
-						s.logger.Debugf("[Worker] Probe B for %s (after Header: '%s' test) - Status: %s, Error: %v", urlToTest, currentHeaderName, getStatus(probeBProbe.Response), probeBProbe.Error)
-						if probeBProbe.Error != nil {
-							s.logger.Warnf("[Worker] Probe B Failed: URL %s, Header '%s': %v. Analysis may be incomplete.", urlToTest, currentHeaderName, probeBProbe.Error)
-						}
+	// 2. Perform baseline request
+	baselineReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"}
+	baselineRespData := s.client.PerformRequest(baselineReqData) // Direct client call
+	s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(baselineRespData.Response), baselineRespData.Error)
 
-						finding, errAnalyse := s.processor.AnalyzeProbes(urlToTest, "header", currentHeaderName, injectedValue, baseProbe, probeAProbe, probeBProbe)
-						if errAnalyse != nil {
-							s.logger.Warnf("[Processor Error] URL %s, Header '%s': %v", urlToTest, currentHeaderName, errAnalyse)
-						}
-						if finding != nil {
-							s.mu.Lock()
-							s.findings = append(s.findings, finding)
-							s.mu.Unlock()
-							s.logger.Infof("🎯 [VULNERABILITY DETECTED] Type: %s | URL: %s | Via: Header '%s' | Payload: %s | Details: %s", finding.Vulnerability, urlToTest, currentHeaderName, injectedValue, finding.Description)
-						}
-					}(targetURLWithOriginalParams, headerName, baseDomain, baselineProbe)
+	if baselineRespData.Error != nil || statusCodeFromResponse(baselineRespData.Response) == 429 {
+		s.logger.Warnf("[Worker %d] Baseline for %s failed (Status: %d, Err: %v). Retrying job.",
+			workerID, job.URLString, statusCodeFromResponse(baselineRespData.Response), baselineRespData.Error)
+		job.Retries++
+		if job.Retries < s.maxRetries {
+			backoffDuration := calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement)
+			job.NextAttemptAt = time.Now().Add(backoffDuration)
+			s.retryQueue <- job
+		} else {
+			s.logger.Warnf("[Worker %d] Baseline for %s discarded after %d retries.", workerID, job.URLString, job.Retries)
+			s.decrementActiveJobs()
+		}
+		return
+	}
+
+	baselineProbe := buildProbeData(job.URLString, baselineReqData, baselineRespData)
+	if baselineProbe.Response == nil {
+		s.logger.Warnf("[Worker %d] Baseline Invalid (nil response) for %s. Discarding job.", workerID, job.URLString)
+		s.decrementActiveJobs()
+		return
+	}
+	s.logger.Debugf("[Worker %d] Baseline for %s successful.", workerID, job.URLString)
+
+	// 3. Test Headers
+	if len(s.config.HeadersToTest) > 0 {
+		s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers).", workerID, job.URLString, len(s.config.HeadersToTest))
+		for _, headerName := range s.config.HeadersToTest {
+			// Check DomainManager before each probe for this header
+			canProbeA, probeADelay := s.domainManager.CanRequest(job.BaseDomain)
+			if !canProbeA {
+				s.logger.Debugf("[Worker %d] Header Test (%s) for %s delayed by DomainManager. Re-queueing job after %v.", workerID, headerName, job.URLString, probeADelay)
+				job.Retries++
+				if job.Retries < s.maxRetries {
+					job.NextAttemptAt = time.Now().Add(probeADelay) // Use DM suggested delay
+					s.retryQueue <- job
+				} else {
+					s.logger.Warnf("[Worker %d] Job for %s discarded during header test (%s) after %d retries (DM delay).", workerID, job.URLString, headerName, job.Retries)
+					s.decrementActiveJobs()
 				}
+				return // Return from processURLJob, job will be retried
+			}
+			s.domainManager.RecordRequestSent(job.BaseDomain)
+			injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + headerName)
+			probeAReqHeaders := http.Header{headerName: []string{injectedValue}}
+			probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders}
+			probeARespData := s.client.PerformRequest(probeAReqData)
+			s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+			probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
+			s.logger.Debugf("[Worker %d] Probe A (Header: '%s') for %s - Status: %s, Error: %v", workerID, headerName, job.URLString, getStatus(probeAProbe.Response), probeAProbe.Error)
+
+			if statusCodeFromResponse(probeARespData.Response) == 429 { // Handle 429 for Probe A
+				s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s got 429. Re-queueing job.", workerID, headerName, job.URLString)
+				job.Retries++
+				if job.Retries < s.maxRetries {
+					// DomainManager's RecordRequestResult already set standby. Get that standby time.
+					_, standbyTime := s.domainManager.IsStandby(job.BaseDomain)
+					job.NextAttemptAt = standbyTime
+					s.retryQueue <- job
+				} else {
+					s.logger.Warnf("[Worker %d] Job for %s discarded during Probe A (Header: '%s') after %d retries (429).", workerID, job.URLString, headerName, job.Retries)
+					s.decrementActiveJobs()
+				}
+				return // Return from processURLJob, job will be retried
 			}
 
-			// Test URL Parameters
-			payloadsToTest := s.config.BasePayloads
-			if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" {
-				payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval1"))
+			// Probe B
+			canProbeB, probeBDelay := s.domainManager.CanRequest(job.BaseDomain)
+			if !canProbeB {
+				s.logger.Debugf("[Worker %d] Header Test Probe B (%s) for %s delayed by DM. Re-queueing job after %v.", workerID, headerName, job.URLString, probeBDelay)
+				job.Retries++
+				if job.Retries < s.maxRetries {
+					job.NextAttemptAt = time.Now().Add(probeBDelay)
+					s.retryQueue <- job
+				} else {
+					s.logger.Warnf("[Worker %d] Job for %s discarded during header test Probe B (%s) after %d retries (DM delay).", workerID, job.URLString, headerName, job.Retries)
+					s.decrementActiveJobs()
+				}
+				return
+			}
+			s.domainManager.RecordRequestSent(job.BaseDomain)
+			probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"}
+			probeBRespData := s.client.PerformRequest(probeBReqData)
+			s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+			probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
+			s.logger.Debugf("[Worker %d] Probe B (Header: '%s') for %s - Status: %s, Error: %v", workerID, headerName, job.URLString, getStatus(probeBProbe.Response), probeBProbe.Error)
+
+			if statusCodeFromResponse(probeBRespData.Response) == 429 { // Handle 429 for Probe B
+				s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s got 429. Re-queueing job.", workerID, headerName, job.URLString)
+				job.Retries++
+				if job.Retries < s.maxRetries {
+					_, standbyTime := s.domainManager.IsStandby(job.BaseDomain)
+					job.NextAttemptAt = standbyTime
+					s.retryQueue <- job
+				} else {
+					s.logger.Warnf("[Worker %d] Job for %s discarded during Probe B (Header: '%s') after %d retries (429).", workerID, job.URLString, headerName, job.Retries)
+					s.decrementActiveJobs()
+				}
+				return
 			}
 
-			if len(payloadsToTest) > 0 && numActualParamsInThisSet > 0 {
-				s.logger.Debugf("[Param Tests] Starting for %s (Domain: %s), %d params in current set, %d payloads per param.", targetURLWithOriginalParams, baseDomain, numActualParamsInThisSet, len(payloadsToTest))
-				for paramName, originalParamValue := range currentParamSet {
-					for _, paramPayload := range payloadsToTest {
-						s.wg.Add(1)
-						semaphore <- struct{}{}
-						go func(urlBase, currentParamName, currentOriginalParamValue, currentParamPayload, domain string, baseProbe ProbeData, originalParams map[string]string) {
-							defer s.wg.Done()
-							defer func() { <-semaphore }()
-							s.logger.Debugf("[Worker] Test: Param '%s=%s' on base %s", currentParamName, currentParamPayload, urlBase)
-							
-							// Construct URL for Probe A with the modified parameter
-							probeAURL, errProbeAURL := modifyURLQueryParam(urlBase, currentParamName, currentParamPayload)
-							if errProbeAURL != nil {
-								s.logger.Warnf("[Worker] Failed to construct Probe A URL for param test (%s=%s) on %s: %v", currentParamName, currentParamPayload, urlBase, errProbeAURL)
-								return
-							}
+			// Analyze Probes if both were successful (or at least not 429 that caused a job retry)
+			if probeAProbe.Error == nil && probeBProbe.Error == nil { // Basic check, can be refined
+				finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", headerName, injectedValue, baselineProbe, probeAProbe, probeBProbe)
+				if errAnalyse != nil {
+					s.logger.Warnf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, headerName, job.URLString, errAnalyse)
+				}
+				if finding != nil {
+					s.mu.Lock()
+					s.findings = append(s.findings, finding)
+					s.mu.Unlock()
+					s.logger.Infof("🎯 [VULN by Worker %d] Type: %s | URL: %s | Via: Header '%s' | Details: %s", workerID, finding.Vulnerability, job.URLString, headerName, finding.Description)
+				}
+			} else {
+				s.logger.Debugf("[Worker %d] Skipping analysis for header '%s' on %s due to probe errors not causing job retry.", workerID, headerName, job.URLString)
+			}
+		} // End loop headers
+	}
 
-							// Probe A (with injected parameter value)
-							probeAReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET"}
-							probeARespData := s.performRequestWithDomainManagement(domain, probeAReqData)
-							probeAProbe := buildProbeData(probeAURL, probeAReqData, probeARespData)
-							s.logger.Debugf("[Worker] Probe A for %s (Param '%s=%s') - Status: %s, Error: %v", probeAURL, currentParamName, currentParamPayload, getStatus(probeAProbe.Response), probeAProbe.Error)
-							if probeAProbe.Error != nil {
-								s.logger.Warnf("[Worker] Probe A Failed: URL %s, Param '%s=%s': %v. Analysis may be incomplete.", probeAURL, currentParamName, currentParamPayload, probeAProbe.Error)
-							}
+	// 4. Test URL Parameters (similar structure to header tests)
+	payloadsToTest := s.config.BasePayloads
+	if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" {
+		payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval"))
+	}
 
-							// Construct URL for Probe B (original parameters)
-							probeBURL, errProbeBURL := constructURLWithParams(urlBase, originalParams)
-							if errProbeBURL != nil {
-								s.logger.Warnf("[Worker] Failed to construct Probe B URL for param test (original params) on %s: %v", urlBase, errProbeBURL)
-								return // Cannot perform cache check if original URL can't be reconstructed
-							}
-							probeBReqData := networking.ClientRequestData{URL: probeBURL, Method: "GET"}
-							probeBRespData := s.performRequestWithDomainManagement(domain, probeBReqData)
-							probeBProbe := buildProbeData(probeBURL, probeBReqData, probeBRespData)
-							s.logger.Debugf("[Worker] Probe B for %s (after Param '%s=%s' test) - Status: %s, Error: %v", probeBURL, currentParamName, currentParamPayload, getStatus(probeBProbe.Response), probeBProbe.Error)
-							if probeBProbe.Error != nil {
-								s.logger.Warnf("[Worker] Probe B Failed: URL %s, Param '%s=%s': %v. Analysis may be incomplete.", probeBURL, currentParamName, currentParamPayload, probeBProbe.Error)
-							}
-
-							finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", currentParamName, currentParamPayload, baseProbe, probeAProbe, probeBProbe)
-							if errAnalyseParam != nil {
-								s.logger.Warnf("[Processor Error] URL %s, Param '%s=%s': %v", probeAURL, currentParamName, currentParamPayload, errAnalyseParam)
-							}
-							if finding != nil {
-								s.mu.Lock()
-								s.findings = append(s.findings, finding)
-								s.mu.Unlock()
-								s.logger.Infof("🎯 [VULNERABILITY DETECTED] Type: %s | URL: %s | Via: Param '%s' | Payload: %s | Details: %s", finding.Vulnerability, probeAURL, currentParamName, currentParamPayload, finding.Description)
-							}
-						}(baseURL, paramName, originalParamValue, paramPayload, baseDomain, baselineProbe, currentParamSet)
+	if len(payloadsToTest) > 0 && len(job.OriginalParams) > 0 {
+		s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param).", workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest))
+		for paramName := range job.OriginalParams {
+			for _, paramPayload := range payloadsToTest {
+				// Check DomainManager before Probe A for this param
+				canProbeParamA, paramProbeADelay := s.domainManager.CanRequest(job.BaseDomain)
+				if !canProbeParamA {
+					s.logger.Debugf("[Worker %d] Param Test (%s) for %s delayed. Re-queueing job after %v.", workerID, paramName, job.URLString, paramProbeADelay)
+					job.Retries++
+					if job.Retries < s.maxRetries {
+						job.NextAttemptAt = time.Now().Add(paramProbeADelay)
+						s.retryQueue <- job
+					} else {
+						s.logger.Warnf("[Worker %d] Job for %s discarded (param %s retry limit).", workerID, job.URLString, paramName)
+						s.decrementActiveJobs()
 					}
+					return // Return from processURLJob
 				}
-			}
-		} // End loop currentParamSet
-	} // End loop uniqueBaseURLs
+				s.domainManager.RecordRequestSent(job.BaseDomain)
+				probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, paramName, paramPayload)
+				if errProbeAURL != nil {
+					s.logger.Warnf("[Worker %d] Failed to construct Probe A URL for param test (%s=%s): %v", workerID, paramName, paramPayload, errProbeAURL)
+					continue // Skip this payload test
+				}
+				probeAReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET"}
+				probeARespData := s.client.PerformRequest(probeAReqData)
+				s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+				probeAProbe := buildProbeData(probeAURL, probeAReqData, probeARespData)
+				s.logger.Debugf("[Worker %d] Probe A (Param '%s=%s') for %s - Status: %s, Error: %v", workerID, paramName, paramPayload, probeAURL, getStatus(probeAProbe.Response), probeAProbe.Error)
 
-	s.wg.Wait() // Wait for all goroutines to finish
-	s.logger.Infof("All scan tasks completed.")
-	return s.findings, s.uniqueDomainCount, s.totalQueryParametersFound, s.baseURLsWithParamsCount
+				if statusCodeFromResponse(probeARespData.Response) == 429 { // Handle 429 for Param Probe A
+					s.logger.Warnf("[Worker %d] Probe A (Param '%s') for %s got 429. Re-queueing job.", workerID, paramName, probeAURL)
+					job.Retries++
+					if job.Retries < s.maxRetries {
+						_, standbyTime := s.domainManager.IsStandby(job.BaseDomain)
+						job.NextAttemptAt = standbyTime
+						s.retryQueue <- job
+					} else {
+						s.logger.Warnf("[Worker %d] Job for %s discarded (Param '%s' Probe A 429 retry limit).", workerID, probeAURL, paramName)
+						s.decrementActiveJobs()
+					}
+					return // Return from processURLJob
+				}
+
+				// Probe B for param test
+				canProbeParamB, paramProbeBDelay := s.domainManager.CanRequest(job.BaseDomain)
+				if !canProbeParamB {
+					s.logger.Debugf("[Worker %d] Param Test Probe B (%s) for %s delayed. Re-queueing job after %v.", workerID, paramName, job.URLString, paramProbeBDelay)
+					job.Retries++
+					if job.Retries < s.maxRetries {
+						job.NextAttemptAt = time.Now().Add(paramProbeBDelay)
+						s.retryQueue <- job
+					} else {
+						s.logger.Warnf("[Worker %d] Job for %s discarded (param %s Probe B retry limit).", workerID, job.URLString, paramName)
+						s.decrementActiveJobs()
+					}
+					return
+				}
+				s.domainManager.RecordRequestSent(job.BaseDomain)
+				probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"}
+				probeBRespData := s.client.PerformRequest(probeBReqData)
+				s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+				probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
+				s.logger.Debugf("[Worker %d] Probe B (Param '%s=%s') for %s - Status: %s, Error: %v", workerID, paramName, paramPayload, job.URLString, getStatus(probeBProbe.Response), probeBProbe.Error)
+
+				if statusCodeFromResponse(probeBRespData.Response) == 429 { // Handle 429 for Param Probe B
+					s.logger.Warnf("[Worker %d] Probe B (Param '%s') for %s got 429. Re-queueing job.", workerID, paramName, job.URLString)
+					job.Retries++
+					if job.Retries < s.maxRetries {
+						_, standbyTime := s.domainManager.IsStandby(job.BaseDomain)
+						job.NextAttemptAt = standbyTime
+						s.retryQueue <- job
+					} else {
+						s.logger.Warnf("[Worker %d] Job for %s discarded (Param '%s' Probe B 429 retry limit).", workerID, job.URLString, paramName)
+						s.decrementActiveJobs()
+					}
+					return
+				}
+
+				// Analyze Probes for param test
+				if probeAProbe.Error == nil && probeBProbe.Error == nil {
+					finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", paramName, paramPayload, baselineProbe, probeAProbe, probeBProbe)
+					if errAnalyseParam != nil {
+						s.logger.Warnf("[Worker %d] Processor Error (Param '%s=%s') for URL %s: %v", workerID, paramName, paramPayload, probeAURL, errAnalyseParam)
+					}
+					if finding != nil {
+						s.mu.Lock()
+						s.findings = append(s.findings, finding)
+						s.mu.Unlock()
+						s.logger.Infof("🎯 [VULN by Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: %s | Details: %s", workerID, finding.Vulnerability, probeAURL, paramName, paramPayload, finding.Description)
+					}
+				} else {
+					s.logger.Debugf("[Worker %d] Skipping analysis for param '%s' on %s due to probe errors not causing job retry.", workerID, paramName, job.URLString)
+				}
+			} // End loop payloadsToTest
+		} // End loop job.OriginalParams
+	}
+
+	s.logger.Debugf("[Worker %d] Successfully finished all tests for job: %s", workerID, job.URLString)
+	s.decrementActiveJobs() // Job fully completed (no unhandled errors/retries led to early exit)
+}
+
+func (s *Scheduler) decrementActiveJobs() {
+	if atomic.AddInt32(&s.activeJobs, -1) == 0 {
+		s.logger.Infof("All active jobs completed. Closing job queues.")
+		close(s.jobQueue)   // Safe to close now, no new jobs will be added by retryManager if activeJobs is 0
+		close(s.retryQueue) // retryManager will exit
+		close(s.doneChan)   // Signal StartScan to unblock
+	}
+}
+
+func statusCodeFromResponse(resp *http.Response) int {
+	if resp == nil { return 0 }
+	return resp.StatusCode
+}
+
+// calculateBackoff calculates an exponential backoff duration for job retries.
+// It uses the number of retries and configuration parameters for initial, max, and increment durations.
+// Note: This backoff is for the JOB retry, not directly for domain standby which is handled by DomainManager.
+func calculateBackoff(retries int, initialDuration, maxDuration, incrementStep time.Duration) time.Duration {
+	if retries <= 0 {
+		return initialDuration // Should not happen if called after at least one retry increment
+	}
+
+	// Exponential backoff: initialDuration * (2^(retries-1))
+	// We use a multiplier that increases, e.g., 1, 2, 4, 8 for retries 1, 2, 3, 4
+	backoffFactor := math.Pow(2, float64(retries-1))
+	delay := time.Duration(float64(initialDuration) * backoffFactor)
+
+	// If an increment step is defined and it's the first real retry (retries = 1, so backoffFactor = 1, delay = initialDuration)
+	// and initialDuration itself is less than a typical increment, we might want to ensure at least one incrementStep.
+	// However, the current formula should naturally scale it up.
+	// Let's ensure it doesn't exceed maxDuration.
+	if delay > maxDuration {
+		delay = maxDuration
+	}
+
+	// Ensure it's at least the initial duration (or a minimum sensible value if initial is very small)
+	if delay < initialDuration && initialDuration > 0 { // If initialDuration is 0, this would be an issue
+        delay = initialDuration
+    } else if delay <= 0 { // Fallback if initialDuration was 0 or negative
+        delay = time.Second * 10 // Default to a small sensible delay
+    }
+
+	return delay
 }
 
 // getStatus is a helper to safely get the status string from a response.

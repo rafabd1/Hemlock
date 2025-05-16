@@ -27,13 +27,20 @@ type Config struct {
 	ParsedProxies        []ProxyEntry
 	HeadersFile          string // Path to a file containing additional headers to test
 	TargetsFile          string // Path to a file containing target URLs
-	DelayMs              int    // Renamed from MinRequestDelayMs
+	DelayMs              int    // Initial delay, can be used to seed TargetRPS or as a floor
 	MaxRetries           int    // Maximum number of retries per request
-	MaxConsecutiveFailuresToBlock int    // Number of consecutive network failures to block a domain
 	CustomHeaders        []string // Custom HTTP headers to add to every request (format: "Name: Value")
 	UserAgent            string   // User-Agent still needed for default if no -H "User-Agent: ..." is provided
-	NoColor bool // To disable colored output
-	Silent  bool // To suppress non-critical logs
+	NoColor              bool     // To disable colored output
+	Silent               bool     // To suppress non-critical logs
+
+	// New fields for dynamic rate limiting and standby
+	InitialTargetRPS         float64       `mapstructure:"initial-target-rps"`
+	MinTargetRPS             float64       `mapstructure:"min-target-rps"`
+	MaxTargetRPS             float64       `mapstructure:"max-target-rps"`
+	InitialStandbyDuration   time.Duration `mapstructure:"initial-standby-duration"`
+	MaxStandbyDuration       time.Duration `mapstructure:"max-standby-duration"`
+	StandbyDurationIncrement time.Duration `mapstructure:"standby-duration-increment"`
 }
 
 // ProxyEntry holds the parsed components of a proxy string.
@@ -83,10 +90,17 @@ func GetDefaultConfig() *Config {
 		TargetsFile:          "",
 		DelayMs:              500,    // Renamed from MinRequestDelayMs
 		MaxRetries:           3,    // Default of 3 retries
-		MaxConsecutiveFailuresToBlock: 3,    // Default to 3 consecutive failures
 		CustomHeaders:        []string{},
 		NoColor:              false,
 		Silent:               false,
+
+		// Defaults for new fields
+		InitialTargetRPS:         1.0,
+		MinTargetRPS:             0.5,
+		MaxTargetRPS:             10.0,
+		InitialStandbyDuration:   1 * time.Minute,
+		MaxStandbyDuration:       5 * time.Minute,
+		StandbyDurationIncrement: 1 * time.Minute,
 	}
 }
 
@@ -181,14 +195,34 @@ func (c *Config) Validate() error {
 	if c.DelayMs < 0 { // Renamed from MinRequestDelayMs
 		return fmt.Errorf("delayMs cannot be negative")
 	}
-	if c.MaxConsecutiveFailuresToBlock < 0 { // 0 can mean disabled, but not negative
-		return fmt.Errorf("maxConsecutiveFailuresToBlock cannot be negative")
+
+	// Validations for new fields
+	if c.InitialTargetRPS <= 0 {
+		return fmt.Errorf("initialTargetRPS must be positive")
+	}
+	if c.MinTargetRPS <= 0 {
+		return fmt.Errorf("minTargetRPS must be positive")
+	}
+	if c.MaxTargetRPS < c.MinTargetRPS {
+		return fmt.Errorf("maxTargetRPS (%.2f) must be greater than or equal to minTargetRPS (%.2f)", c.MaxTargetRPS, c.MinTargetRPS)
+	}
+	if c.InitialTargetRPS > c.MaxTargetRPS {
+		return fmt.Errorf("initialTargetRPS (%.2f) must not exceed maxTargetRPS (%.2f)", c.InitialTargetRPS, c.MaxTargetRPS)
+	}
+	if c.InitialStandbyDuration <= 0 {
+		return fmt.Errorf("initialStandbyDuration must be positive")
+	}
+	if c.MaxStandbyDuration < c.InitialStandbyDuration {
+		return fmt.Errorf("maxStandbyDuration must be greater than or equal to initialStandbyDuration")
+	}
+	if c.StandbyDurationIncrement <= 0 {
+		return fmt.Errorf("standbyDurationIncrement must be positive")
 	}
 	return nil
 }
 
 // String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, DelayMs: %d, MaxConsecutiveFailuresToBlock: %d, CustomHeaders (count): %d",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.DelayMs, c.MaxConsecutiveFailuresToBlock, len(c.CustomHeaders))
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s, MaxRetries: %d, DelayMs: %d, CustomHeaders (count): %d, InitialRPS: %.2f, MaxRPS: %.2f",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.MaxRetries, c.DelayMs, len(c.CustomHeaders), c.InitialTargetRPS, c.MaxTargetRPS)
 } 

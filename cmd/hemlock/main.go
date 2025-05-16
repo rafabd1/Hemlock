@@ -80,9 +80,16 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.TargetsFile = vp.GetString("targets-file")
 		cfg.DelayMs = vp.GetInt("delay")
 		cfg.MaxRetries = vp.GetInt("max-retries")
-		cfg.MaxConsecutiveFailuresToBlock = vp.GetInt("max-consecutive-failures")
 		cfg.NoColor = vp.GetBool("no-color")
 		cfg.Silent = vp.GetBool("silent")
+
+		// Populate new RPS and Standby fields from Viper
+		cfg.InitialTargetRPS = vp.GetFloat64("initial-rps")
+		cfg.MinTargetRPS = vp.GetFloat64("min-rps")
+		cfg.MaxTargetRPS = vp.GetFloat64("max-rps")
+		cfg.InitialStandbyDuration = vp.GetDuration("initial-standby")
+		cfg.MaxStandbyDuration = vp.GetDuration("max-standby")
+		cfg.StandbyDurationIncrement = vp.GetDuration("standby-increment")
 
 		// Restaurar UserAgent padrão se o Viper o zerou (porque a flag não existe mais)
 		if cfg.UserAgent == "" {
@@ -198,11 +205,8 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file")
 	    }
 
-		// Pre-process URLs here to get parameter counts for the summary
-		// Note: This is a bit redundant as Scheduler will do it again, but needed for summary before scan starts.
-		_, _, totalParamsFoundForSummary, baseURLsWithParamsCountForSummary := utils.PreprocessAndGroupURLs(cfg.Targets, logger) 
-		// Suppress logger output from this specific call if it's too verbose before the main scan log
-		// For now, we assume the logger level will handle this appropriately, or we'd need a temp silent logger.
+		// Pre-process URLs for summary
+		_, _, totalParamsFoundForSummary, baseURLsWithParamsCountForSummary := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
 
 		// Enhanced Initial Statistics Log
 		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo {
@@ -250,8 +254,18 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				fmt.Println(" Proxies: None configured")
 			}
 			fmt.Printf(" Max Retries per Request: %d\n", cfg.MaxRetries)
-			fmt.Printf(" Delay Between Requests (same domain): %dms\n", cfg.DelayMs)
-			fmt.Printf(" Max Consecutive Failures to Block Domain: %d\n", cfg.MaxConsecutiveFailuresToBlock)
+			fmt.Printf(" Initial Delay (per domain, before RPS takes over): %dms\n", cfg.DelayMs)
+			
+			// New RPS and Standby info in summary
+			fmt.Println(" Dynamic Rate Limiting (per domain):")
+			fmt.Printf("   Initial Target RPS: %.2f req/s\n", cfg.InitialTargetRPS)
+			fmt.Printf("   Min Target RPS (after 429): %.2f req/s\n", cfg.MinTargetRPS)
+			fmt.Printf("   Max Target RPS: %.2f req/s\n", cfg.MaxTargetRPS)
+			fmt.Println(" Domain Standby (after 429 Too Many Requests):")
+			fmt.Printf("   Initial Standby Duration: %s\n", cfg.InitialStandbyDuration)
+			fmt.Printf("   Max Standby Duration: %s\n", cfg.MaxStandbyDuration)
+			fmt.Printf("   Standby Increment on repeat: %s\n", cfg.StandbyDurationIncrement)
+
 			if cfg.OutputFile != "" {
 				fmt.Printf(" Output File: %s (Format: %s)\n", cfg.OutputFile, cfg.OutputFormat)
 			} else {
@@ -265,39 +279,39 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 
 		// Initialize services
 		httpClient, errClient := networking.NewClient(&cfg, logger)
-	if errClient != nil {
-		logger.Fatalf("Failed to create HTTP client: %v", errClient)
-	}
+		if errClient != nil {
+			logger.Fatalf("Failed to create HTTP client: %v", errClient)
+		}
 		logger.Debugf("HTTP client initialized.")
 
 		processor := core.NewProcessor(&cfg, logger)
-	logger.Debugf("Processor initialized.")
+		logger.Debugf("Processor initialized.")
 
 		domainManager := networking.NewDomainManager(&cfg, logger)
 		logger.Debugf("DomainManager initialized.")
 
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
-	logger.Debugf("Scheduler initialized.")
+		logger.Debugf("Scheduler initialized.")
 
-		// StartScan agora retorna contagens, mas elas não são usadas diretamente aqui, pois o sumário já usou as suas próprias.
-		findings, _, _, _ := scheduler.StartScan()
+		// Correção: StartScan agora retorna apenas findings
+		findings := scheduler.StartScan()
 
 		logger.Infof("Scan completed. Generating report for %d finding(s)...", len(findings))
-	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
-	if errReport != nil {
-		logger.Errorf("Failed to generate report: %v", errReport)
-		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
-			logger.Warnf("Attempting to print report to stdout as fallback...")
-			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
-			if fbErr != nil {
-				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+		if errReport != nil {
+			logger.Errorf("Failed to generate report: %v", errReport)
+			if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+				logger.Warnf("Attempting to print report to stdout as fallback...")
+				fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+				if fbErr != nil {
+					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+				}
 			}
+		} else {
+			logger.Infof("Report generated successfully.")
 		}
-	} else {
-		logger.Infof("Report generated successfully.")
-	}
 
-	logger.Infof("Hemlock Cache Scanner finished.")
+		logger.Infof("Hemlock Cache Scanner finished.")
 		return nil
 	},
 }
@@ -331,7 +345,14 @@ func init() {
 
 	// Retry flags
 	rootCmd.PersistentFlags().IntP("max-retries", "r", defaults.MaxRetries, "Maximum number of retries per request")
-	rootCmd.PersistentFlags().Int("max-consecutive-failures", defaults.MaxConsecutiveFailuresToBlock, "Number of consecutive network failures to block a domain (0 to disable this method)")
+
+	// ADD New Flags for RPS and Standby
+	rootCmd.PersistentFlags().Float64("initial-rps", defaults.InitialTargetRPS, "Initial target requests per second per domain")
+	rootCmd.PersistentFlags().Float64("min-rps", defaults.MinTargetRPS, "Minimum target RPS per domain (after a 429 response)")
+	rootCmd.PersistentFlags().Float64("max-rps", defaults.MaxTargetRPS, "Maximum target requests per second per domain")
+	rootCmd.PersistentFlags().Duration("initial-standby", defaults.InitialStandbyDuration, "Initial standby duration for a domain after a 429 response")
+	rootCmd.PersistentFlags().Duration("max-standby", defaults.MaxStandbyDuration, "Maximum standby duration for a domain")
+	rootCmd.PersistentFlags().Duration("standby-increment", defaults.StandbyDurationIncrement, "Increment to standby duration on repeated 429 responses")
 
 	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Disable colors in text output")
 	rootCmd.PersistentFlags().Bool("silent", defaults.Silent, "Suppress all logs except final results (findings)")

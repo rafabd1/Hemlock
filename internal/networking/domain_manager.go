@@ -1,7 +1,6 @@
 package networking
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -9,22 +8,33 @@ import (
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
+// Default configuration values for DomainManager - these will eventually move to config.Config
 const (
-	// DefaultDomainCooldownMs is the default cooldown period for a domain after being blocked.
-	DefaultDomainCooldownMs = 60000 // 1 minute (formerly from config.DomainCooldownMs)
+	DefaultInitialTargetRPS      = 1.0
+	DefaultMinTargetRPS          = 0.5 // Minimum RPS after a hard block like 429
+	DefaultMaxTargetRPS          = 10.0
+	DefaultInitialStandbyDuration = 1 * time.Minute
+	DefaultMaxStandbyDuration     = 5 * time.Minute
+	DefaultStandbyDurationIncrement = 1 * time.Minute // How much to increase standby on repeated 429s
 )
 
-// DefaultStatusCodesToBlock lists HTTP status codes that should always trigger a domain cooldown.
-var DefaultStatusCodesToBlock = []int{403, 429, 503} // (formerly from config.StatusCodesToBlock)
+// DefaultStatusCodesToBlock lists HTTP status codes that should always trigger a domain cooldown/standby.
+// We'll focus on 429 for now as per requirements.
+var DefaultStatusCodesToBlock = []int{429} // Primarily 429 for standby
 
 // DefaultStatusCodesToBlockOnError lists HTTP status codes that, if an error also occurs, trigger a domain cooldown.
 var DefaultStatusCodesToBlockOnError = []int{} // (formerly from config.StatusCodesToBlockOnError)
 
 // domainState stores the state of a specific domain.
 type domainState struct {
-	lastRequestTime     time.Time
-	blockedUntil        time.Time
-	consecutiveFailures int // Field to track consecutive failures
+	lastRequestTime     time.Time     // Timestamp of the last request *allowed* to this domain
+	// blockedUntil        time.Time     // General cooldown, e.g., after consecutive errors (to be refined or replaced by RPS logic)
+	consecutiveFailures int           // Counter for generic errors
+
+	// Fields for dynamic rate limiting and standby
+	TargetRPS             float64       // Current target requests per second
+	StandbyUntil          time.Time     // If domain is in forced standby (e.g., after 429)
+	CurrentStandbyDuration time.Duration // Duration for the *next* standby period
 }
 
 // DomainManager manages state and policies per domain,
@@ -47,148 +57,119 @@ func NewDomainManager(cfg *config.Config, logger utils.Logger) *DomainManager {
 }
 
 // getOrCreateDomainState retrieves or creates the state for a domain.
-// Should be called with the appropriate lock (read or write) already acquired.
+// Should be called with the appropriate lock (write) already acquired.
 func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
 	ds, exists := dm.domainStatus[domain]
 	if !exists {
-		ds = &domainState{}
+		ds = &domainState{
+			TargetRPS:             DefaultInitialTargetRPS,      // Initialize with default RPS
+			CurrentStandbyDuration: DefaultInitialStandbyDuration, // Initialize standby duration
+		}
 		dm.domainStatus[domain] = ds
+		dm.logger.Debugf("[DomainManager] Initialized state for domain '%s' with TargetRPS: %.2f", domain, ds.TargetRPS)
 	}
 	return ds
 }
 
 // CanRequest checks if a request can be made to a domain.
-// Returns true if it can, false otherwise, along with the necessary wait time.
 func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
-	dm.mu.RLock()
-	// ds := dm.getOrCreateDomainState(domain) // Read, doesn't create if it doesn't exist under RLock
-	// To ensure that getOrCreateDomainState can create, we need a write lock
-	// or a double-check approach. Let's simplify for now and assume that
-	// the state will be created on the first write (RecordRequestSent).
-	// For CanRequest, if it doesn't exist, there are no restrictions yet.
-	existingDs, exists := dm.domainStatus[domain]
-	dm.mu.RUnlock() // Release RLock before a possible WLock
+	dm.mu.Lock() // Need write lock to ensure state creation if it doesn't exist
+	ds := dm.getOrCreateDomainState(domain) // Ensures state exists
+	dm.mu.Unlock()
 
-	if !exists { // If the domain hasn't been seen, can proceed without delay
-		return true, 0
-	}
-
-	// Re-acquire RLock to safely read the existing state
-	dm.mu.RLock()
+	dm.mu.RLock() // Now use RLock for reading the state
 	defer dm.mu.RUnlock()
-	ds := existingDs // Use the state we know exists
 
 	now := time.Now()
 
-	// 1. Check if the domain is blocked (cooldown)
-	if ds.blockedUntil.After(now) {
-		waitTime := ds.blockedUntil.Sub(now)
-		dm.logger.Debugf("[DomainManager] Domain '%s' is in cooldown. Wait: %s", domain, waitTime)
+	// 1. Check if domain is in forced standby (e.g. after a 429)
+	if ds.StandbyUntil.After(now) {
+		waitTime := ds.StandbyUntil.Sub(now)
+		dm.logger.Debugf("[DomainManager] Domain '%s' is in STANDBY. Wait: %s", domain, waitTime)
 		return false, waitTime
 	}
 
-	// 2. Check minimum delay between requests
-	minDelay := time.Duration(dm.config.DelayMs) * time.Millisecond
-	if ds.lastRequestTime.IsZero() { // First request to this domain (after any cooldown)
-		return true, 0
+	// 2. Check rate limiting based on TargetRPS
+	if ds.TargetRPS <= 0 { // Should not happen if MinTargetRPS is positive
+		dm.logger.Warnf("[DomainManager] Domain '%s' has TargetRPS <= 0 (%.2f). Allowing request with default delay.", domain, ds.TargetRPS)
+	} else {
+		requiredDelay := time.Duration(1.0/ds.TargetRPS * float64(time.Second))
+		if !ds.lastRequestTime.IsZero() {
+			timeSinceLastRequest := now.Sub(ds.lastRequestTime)
+			if timeSinceLastRequest < requiredDelay {
+				waitTime := requiredDelay - timeSinceLastRequest
+				dm.logger.Debugf("[DomainManager] Domain '%s' TargetRPS (%.2f req/s) not met. Wait: %s", domain, ds.TargetRPS, waitTime)
+				return false, waitTime
+			}
+		}
 	}
 
-	timeSinceLastRequest := now.Sub(ds.lastRequestTime)
-	if timeSinceLastRequest < minDelay {
-		waitTime := minDelay - timeSinceLastRequest
-		dm.logger.Debugf("[DomainManager] Minimum delay for '%s' not met. Wait: %s", domain, waitTime)
-		return false, waitTime
-	}
+	// 3. Fallback to config.DelayMs if TargetRPS logic allows immediate request (e.g., first request)
+	// This ensures the old DelayMs is still a minimum guard if RPS is very high or it's the first req.
+	// However, the primary control should be TargetRPS.
+	// For now, let's assume TargetRPS is the main controller.
+	// The config.DelayMs can be seen as an initial seed for TargetRPS if desired, or a floor.
 
 	return true, 0
 }
 
-// RecordRequestSent updates the timestamp of the last request for the domain.
+// RecordRequestSent updates the timestamp of the last request *allowed* for the domain.
 func (dm *DomainManager) RecordRequestSent(domain string) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	ds := dm.getOrCreateDomainState(domain)
 	ds.lastRequestTime = time.Now()
-	dm.logger.Debugf("[DomainManager] Request recorded for '%s' at %s", domain, ds.lastRequestTime.Format(time.RFC3339))
+	// dm.logger.Debugf("[DomainManager] Request recorded for '%s' at %s", domain, ds.lastRequestTime.Format(time.RFC3339))
 }
 
-// RecordRequestResult analyzes the result of a request and may block the domain if necessary.
+// RecordRequestResult analyzes the result of a request.
 func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	ds := dm.getOrCreateDomainState(domain)
 
-	blockDomain := false
-	reason := ""
+	if statusCode == 429 {
+		dm.logger.Warnf("[DomainManager] Domain '%s' received status 429 (Too Many Requests). Applying standby.", domain)
+		ds.StandbyUntil = time.Now().Add(ds.CurrentStandbyDuration)
+		ds.TargetRPS = DefaultMinTargetRPS // Reduce RPS drastically
+		dm.logger.Warnf("[DomainManager] Domain '%s' standby until %s. TargetRPS reduced to %.2f. Next standby will be for %s.", 
+			domain, ds.StandbyUntil.Format(time.RFC3339), ds.TargetRPS, ds.CurrentStandbyDuration+DefaultStandbyDurationIncrement)
+		
+		// Increase standby duration for next time, up to a max
+		ds.CurrentStandbyDuration += DefaultStandbyDurationIncrement
+		if ds.CurrentStandbyDuration > DefaultMaxStandbyDuration {
+			ds.CurrentStandbyDuration = DefaultMaxStandbyDuration
+		}
+		ds.consecutiveFailures = 0 // Reset failures after a 429 block
+		return // Handled 429, no further processing for this result needed here for now
+	}
 
 	if err != nil {
 		ds.consecutiveFailures++
-		dm.logger.Debugf("[DomainManager] Error in request to %s: %v. Consecutive failures: %d. Evaluating for cooldown.", domain, err, ds.consecutiveFailures)
-
-		maxFailures := dm.config.MaxConsecutiveFailuresToBlock
-		if maxFailures > 0 && ds.consecutiveFailures >= maxFailures {
-			blockDomain = true
-			reason = fmt.Sprintf("reached %d consecutive failures", ds.consecutiveFailures)
-		} else if statusCode != 0 {
-			// Check if this status code, in conjunction with an error, should block
-			for _, codeToBlock := range DefaultStatusCodesToBlockOnError {
-				if statusCode == codeToBlock {
-					blockDomain = true
-					reason = fmt.Sprintf("received status code %d with a network error", statusCode)
-					break
-				}
-			}
-		}
+		dm.logger.Debugf("[DomainManager] Error for domain %s: %v. Consecutive failures: %d.", domain, err, ds.consecutiveFailures)
+		// TODO: Future: If consecutiveFailures reach a threshold, moderately decrease TargetRPS (dynamic rate limiting)
+		// For now, we are removing the direct block by consecutive failures from config.
 	} else {
-		// No network error, reset consecutive failures
+		// Successful request (non-429 and no network error)
 		ds.consecutiveFailures = 0
-
-		// Check if this status code alone should block
-		for _, codeToBlock := range DefaultStatusCodesToBlock {
-			if statusCode == codeToBlock {
-				blockDomain = true
-				reason = fmt.Sprintf("received status code %d", statusCode)
-				break
-			}
-		}
-	}
-
-	if blockDomain {
-		dm.logger.Warnf("[DomainManager] Domain %s: %s. Applying cooldown.", domain, reason)
-		dm.blockDomainInternal(domain, ds)
-		ds.consecutiveFailures = 0 // Reset after blocking, regardless of the reason
+		dm.logger.Debugf("[DomainManager] Successful request recorded for domain %s (status: %d). Consecutive failures reset.", domain, statusCode)
+		// TODO: Future: If requests are consistently successful, gradually increase TargetRPS up to DefaultMaxTargetRPS (dynamic rate limiting)
 	}
 }
 
-// blockDomainInternal is a helper to avoid code duplication and ensure the lock isn't re-acquired.
-// Assumes the write lock dm.mu is already held.
-func (dm *DomainManager) blockDomainInternal(domain string, ds *domainState) {
-	cooldownDuration := time.Duration(DefaultDomainCooldownMs) * time.Millisecond
-	ds.blockedUntil = time.Now().Add(cooldownDuration)
-	dm.logger.Warnf("[DomainManager] Domain '%s' blocked until %s (cooldown: %s)", domain, ds.blockedUntil.Format(time.RFC3339), cooldownDuration)
-}
+// BlockDomain is now primarily for external forceful blocking if ever needed, or can be removed.
+// The main blocking logic for 429 is within RecordRequestResult.
+// func (dm *DomainManager) BlockDomain(domain string) { ... }
 
-// BlockDomain marks a domain as blocked for a specific duration.
-// This is the public version that acquires the lock.
-func (dm *DomainManager) BlockDomain(domain string) {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-	ds := dm.getOrCreateDomainState(domain)
-	dm.blockDomainInternal(domain, ds)
-	// ds.consecutiveFailures = 0 // Resetting failures here might also be a good idea if BlockDomain is called externally.
-	                            // For now, RecordRequestResult handles the reset after blocking.
-}
-
-// IsBlocked checks if a domain is currently blocked and returns the expiration time of the block.
-// Returns false if not blocked.
-func (dm *DomainManager) IsBlocked(domain string) (bool, time.Time) {
+// IsStandby can be simplified or focused on the StandbyUntil status.
+func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 	dm.mu.RLock()
 	defer dm.mu.RUnlock()
 	ds, exists := dm.domainStatus[domain]
-	if !exists || ds.blockedUntil.IsZero() || time.Now().After(ds.blockedUntil) {
+	if !exists || ds.StandbyUntil.IsZero() || time.Now().After(ds.StandbyUntil) {
 		return false, time.Time{}
 	}
-	return true, ds.blockedUntil
+	return true, ds.StandbyUntil
 }
 
 // GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.
