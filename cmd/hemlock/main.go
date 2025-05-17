@@ -134,9 +134,10 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// Load targets from --targets-file if specified (takes precedence over --targets)
 		if cfg.TargetsFile != "" {
 			fileTargets, err := config.LoadLinesFromFile(cfg.TargetsFile)
-		if err != nil {
+			if err != nil {
+				logger.Errorf("Error reading targets from file '%s': %v", cfg.TargetsFile, err)
 				return fmt.Errorf("error reading targets from file '%s': %w", cfg.TargetsFile, err)
-		}
+			}
 			cfg.Targets = fileTargets
 		} else if len(cfg.Targets) > 0 { 
 		    if len(cfg.Targets) == 1 && strings.Contains(cfg.Targets[0], ",") {
@@ -167,16 +168,26 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				}
 			}
 			if foundPath == "" {
-				return fmt.Errorf("default headers file ('%s') not found in standard locations and --headers-file not specified. This file is essential", defaultHeadersFilename)
+				// Logger might not be initialized yet if this is an early essential file check.
+				// However, standard practice is to initialize logger ASAP.
+				// Assuming logger is initialized before this critical check.
+				// If not, this specific error might need to remain fmt.Errorf or a pre-logger error handler.
+				// Based on current structure, logger should be initialized.
+				errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations and --headers-file not specified. This file is essential", defaultHeadersFilename)
+				logger.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
 			}
 		} 
 
 		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile) // Pass verbosity to loadHeaders if its logs need to be conditional
 		if err != nil {
+			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
 			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
 		}
 		if len(loadedHeaders) == 0 {
-			return fmt.Errorf("headers file '%s' is empty", cfg.HeadersFile)
+			errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
+			logger.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
 		}
 		cfg.HeadersToTest = loadedHeaders
 

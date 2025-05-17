@@ -20,7 +20,6 @@ type WorkerPool struct {
 	ctx        context.Context
 	cancel     context.CancelFunc // To signal workers to stop
 	shutdownWg sync.WaitGroup   // To wait for all workers to finish during shutdown
-	activeJobs int32            // Atomic counter for active jobs (optional, for more detailed stats)
 	mu         sync.Mutex       // For protecting access to isClosed and jobQueue closing
 	isClosed   bool
 }
