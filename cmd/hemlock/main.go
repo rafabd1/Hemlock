@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,7 +111,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			// Check if input is a file path
 			if _, err := os.Stat(cfg.Input); err == nil {
 				// Input is a file, load targets from it
-				logger.Infof("Input '%s' detected as a file. Reading targets from file.", cfg.Input)
+				logger.Debugf("Input '%s' detected as a file. Reading targets from file.", cfg.Input)
 				fileTargets, errLoad := config.LoadLinesFromFile(cfg.Input)
 				if errLoad != nil {
 					logger.Errorf("Error reading targets from input file '%s': %v", cfg.Input, errLoad)
@@ -120,7 +121,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				cfg.TargetsFile = cfg.Input // Store the fact it came from a file for logging consistency
 			} else {
 				// Input is not a file, treat as comma-separated list or single URL
-				logger.Infof("Input '%s' detected as URL(s).", cfg.Input)
+				logger.Debugf("Input '%s' detected as URL(s).", cfg.Input)
 				if strings.Contains(cfg.Input, ",") {
 					cfg.Targets = strings.Split(cfg.Input, ",")
 				} else {
@@ -161,7 +162,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			}
 		} 
 
-		logger.Infof("Using headers from: %s", cfg.HeadersFile)
+		logger.Debugf("Using headers from: %s", cfg.HeadersFile)
 		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
 		if err != nil {
 			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
@@ -190,8 +191,8 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Display Banner (only if not in silent mode and verbosity is info or higher)
-		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo {
+		// 1. Display Banner (somente se não estiver no modo silencioso)
+		if !cfg.Silent {
 			banner := `
    _    _                _            _    
   | |  | |              | |          | |   
@@ -200,24 +201,18 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
   | |  | |  __/ | | | | | | (_) | (__|   < 
   |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
 `
-			version := "v0.1.1" // Placeholder version, update as needed
-			author := "github.com/rafabd1"    // Placeholder author, update as needed
+			version := "v0.1.2" // Atualizar conforme necessário
+			author := "github.com/rafabd1"
+			// Usar logger.RawPrintf ou similar se existir para não adicionar prefixo de log ao banner
+			// Por enquanto, usando fmt.Printf para o banner.
 			fmt.Printf("%s\n", banner)
-			fmt.Printf("\t\t\t\tVersion: %s by %s\n\n", version, author)
+			fmt.Printf("\t\t\tWeb Cache Poisoning Scanner | %s by %s\n\n", version, author)
 		}
 		
-		// Log file loading info (simplified as Input provides context now)
-		if cfg.TargetsFile != "" { // TargetsFile is populated if input was a file
-			logger.Infof("Targets loaded from file: %s", cfg.TargetsFile)
-		} else if len(cfg.Targets) > 0 {
-			logger.Infof("Using %d target(s) from --input argument.", len(cfg.Targets))
-		} 
-		// HeadersFile logging is already done in PersistentPreRunE
-		
+		// 2. Validar configuração (após o banner, antes de mais logs)
 		if err := cfg.Validate(); err != nil {
 			logger.Fatalf("Invalid configuration: %v", err)
 		}
-
 		if len(cfg.Targets) == 0 {
 			logger.Fatalf("No targets specified. Use --input or -i to provide a URL, list of URLs, or a file path.")
 		}
@@ -225,85 +220,87 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file location.")
 	    }
 
-		// Pre-process URLs for summary (optional, could be removed if too verbose)
-		_, _, totalParamsFoundForSummary, baseURLsWithParamsCountForSummary := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
+		// Log sobre a origem dos alvos
+		if cfg.TargetsFile != "" {
+			logger.Infof("Targets: Loaded %d URLs from file: %s", len(cfg.Targets), cfg.TargetsFile)
+		} else {
+			logger.Infof("Targets: %d URL(s) provided via direct input argument.", len(cfg.Targets))
+		}
+		// Log sobre a origem dos headers (já existia um similar, vamos garantir que esteja no formato e local corretos)
+		// O log logger.Infof("Using headers from: %s", cfg.HeadersFile) foi movido para Debugf em PersistentPreRunE
+		// Adicionamos um aqui mais conciso e focado no que foi carregado, não no processo de encontrar.
+		logger.Infof("Headers: %d loaded to test from: '%s'", len(cfg.HeadersToTest), cfg.HeadersFile)
 
-		// Enhanced Initial Statistics Log
-		if !cfg.Silent && utils.StringToLogLevel(cfg.Verbosity) <= utils.LevelInfo {
-			fmt.Println("------------------------------------------------------------")
-			fmt.Println(" Scan Configuration Summary")
-			fmt.Println("------------------------------------------------------------")
-			fmt.Printf(" Targets Provided: %d (via --input '%s')\n", len(cfg.Targets), cfg.Input)
-			fmt.Printf(" Headers to Test: %d loaded from '%s'\n", len(cfg.HeadersToTest), cfg.HeadersFile)
+		// 3. Log de Configuração Essencial (Formato SecretHound)
+		rateLimitStr := fmt.Sprintf("%.2f req/s per domain", cfg.MaxTargetRPS)
+		if cfg.MaxTargetRPS == 0 {
+			rateLimitStr = fmt.Sprintf("Auto (Initial: %.2f, Min: %.2f, Max Default: %.2f req/s per domain)", cfg.InitialTargetRPS, cfg.MinTargetRPS, config.DefaultMaxInternalRPS)
+		}
+		logger.Infof("HTTP config: %s timeout | %d max retries | %s", cfg.RequestTimeout, cfg.MaxRetries, rateLimitStr)
+		logger.Infof("Concurrency: %d workers | Headers: %d loaded from '%s'", cfg.Concurrency, len(cfg.HeadersToTest), cfg.HeadersFile)
 
-			// Parameter test info (payload flags removed, so this is about internal logic now)
-			// This might need adjustment if BasePayloads/DefaultPayloadPrefix are always default
-			paramTestsImplicitlyEnabled := cfg.DefaultPayloadPrefix != "" || len(cfg.BasePayloads) > 0
-			if paramTestsImplicitlyEnabled && totalParamsFoundForSummary > 0 {
-				fmt.Printf(" URL Parameter Tests: Implicitly enabled, %d params found in %d base URLs\n", totalParamsFoundForSummary, baseURLsWithParamsCountForSummary)
-			} else if paramTestsImplicitlyEnabled {
-				fmt.Println(" URL Parameter Tests: Implicitly enabled, but no URL parameters found in targets.")
-			} else {
-				fmt.Println(" URL Parameter Tests: Implicitly disabled (internal payload config empty)")
-			}
-
-			fmt.Printf(" Concurrency: %d workers\n", cfg.Concurrency)
-			fmt.Printf(" Request Timeout: %s\n", cfg.RequestTimeout.String())
-			
-			if len(cfg.CustomHeaders) > 0 {
-				fmt.Printf(" Custom Global Headers (%d):\n", len(cfg.CustomHeaders))
-				for _, h := range cfg.CustomHeaders {
-					fmt.Printf("   - %s\n", h)
-				}
-			} else {
-				fmt.Println(" Custom Global Headers: None")
-			}
-
-			if len(cfg.ParsedProxies) > 0 {
-				fmt.Printf(" Proxies: %d configured\n", len(cfg.ParsedProxies))
-			} else {
-				fmt.Println(" Proxies: None configured")
-			}
-			fmt.Printf(" Max Retries per Request: %d\n", cfg.MaxRetries)
-			
-			// Rate Limit Info
-			if cfg.MaxTargetRPS > 0 {
-				fmt.Printf(" Rate Limit: Up to %.2f requests/second per domain\n", cfg.MaxTargetRPS)
-			} else {
-				fmt.Printf(" Rate Limit: Auto (Initial: %.2f req/s, Min: %.2f req/s per domain)\n", cfg.InitialTargetRPS, cfg.MinTargetRPS)
-			}
-			fmt.Printf(" TLS Verification: %s\n", map[bool]string{true: "Disabled (insecure)", false: "Enabled"}[cfg.InsecureSkipVerify])
-
-			if cfg.OutputFile != "" {
-				fmt.Printf(" Output File: %s (Format: %s)\n", cfg.OutputFile, cfg.OutputFormat)
-			} else {
-				fmt.Printf(" Output: stdout (Format: %s)\n", cfg.OutputFormat)
-			}
-			fmt.Printf(" Log Level: %s (Verbosity Level: %d)\n", cfg.Verbosity, cfg.VerbosityLevel)
-			fmt.Println("------------------------------------------------------------")
+		if cfg.OutputFile != "" {
+			logger.Infof("Output: Results will be saved to %s (Format: %s)", cfg.OutputFile, cfg.OutputFormat)
+		} else {
+			logger.Infof("Output: Results to stdout (Format: %s)", cfg.OutputFormat)
 		}
 
-		logger.Infof("Hemlock Cache Scanner initializing...")
+		if cfg.InsecureSkipVerify {
+			logger.Infof("SSL/TLS certificate verification disabled")
+		}
+		if len(cfg.ParsedProxies) > 0 {
+		    logger.Infof("Proxies: %d configured", len(cfg.ParsedProxies))
+		}
 
-		// Initialize services
+		// 4. Processamento de URLs e Geração de Jobs
+		// Pre-process URLs for initial logging
+		// We only need uniqueBaseURLs here for logging purposes.
+		// The scheduler will perform its own full preprocessing.
+		// Capturamos totalParamsFound e numURLsWithParams para o log.
+		_, uniqueBaseURLs, totalParamsFound, numURLsWithParams := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
+		// No error is returned by PreprocessAndGroupURLs; it logs errors internally.
+
+		// Calculate numUniqueDomains from uniqueBaseURLs
+		numUniqueDomains := 0
+		if len(uniqueBaseURLs) > 0 {
+			domainSet := make(map[string]struct{})
+			for _, baseURL := range uniqueBaseURLs {
+				u, errParseURL := url.Parse(baseURL)
+				if errParseURL == nil {
+					domainSet[u.Hostname()] = struct{}{}
+				} else {
+					// Log a warning if a base URL cannot be parsed, though this should be rare
+					// if PreprocessAndGroupURLs produced it.
+					logger.Warnf("Could not parse base URL '%s' from preprocessed list to count domain: %v", baseURL, errParseURL)
+				}
+			}
+			numUniqueDomains = len(domainSet)
+		}
+
+		if len(uniqueBaseURLs) == 0 {
+			logger.Fatalf("No processable URLs after pre-processing. Check your target list and filters.")
+		}
+		logger.Infof("Processing %d unique target URLs across %d domains.", len(uniqueBaseURLs), numUniqueDomains)
+
+		if totalParamsFound > 0 && numURLsWithParams > 0 {
+			logger.Infof("Parameters: Extracted %d total unique query parameters from %d URLs.", totalParamsFound, numURLsWithParams)
+		}
+
+		// 5. Inicializar Serviços e Iniciar Scan
+		logger.Infof("Hemlock Cache Scanner initializing scan...")
+
 		httpClient, errClient := networking.NewClient(&cfg, logger)
 		if errClient != nil {
 			logger.Fatalf("Failed to create HTTP client: %v", errClient)
 		}
-		logger.Debugf("HTTP client initialized.")
 
 		processor := core.NewProcessor(&cfg, logger)
-		logger.Debugf("Processor initialized.")
-
 		domainManager := networking.NewDomainManager(&cfg, logger)
-		logger.Debugf("DomainManager initialized.")
-
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
-		logger.Debugf("Scheduler initialized.")
 
 		findings := scheduler.StartScan() 
 
-		logger.Infof("Scan completed. Generating report for %d finding(s)...", len(findings))
+		logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(findings))
 		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
 		if errReport != nil {
 			logger.Errorf("Failed to generate report: %v", errReport)
@@ -314,8 +311,10 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
 				}
 			}
-		} else {
+		} else if len(findings) > 0 {
 			logger.Infof("Report generated successfully.")
+		} else {
+		    logger.Infof("No vulnerabilities found or report not generated due to no findings.")
 		}
 
 		logger.Infof("Hemlock Cache Scanner finished.")

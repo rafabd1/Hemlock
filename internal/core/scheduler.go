@@ -115,7 +115,7 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 // StartScan begins the scanning process based on the scheduler's configuration.
 // It now returns only the list of findings. Counts for summary are handled in main.go.
 func (s *Scheduler) StartScan() []*report.Finding {
-	s.logger.Infof("Scheduler: Initializing scan...")
+	s.logger.Debugf("Scheduler: Initializing scan...")
 	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
 	if len(uniqueBaseURLs) == 0 {
@@ -138,7 +138,6 @@ func (s *Scheduler) StartScan() []*report.Finding {
 		s.logger.Warnf("Scheduler: No testable URL jobs created. Aborting scan.")
 		return s.findings
 	}
-	s.logger.Infof("Scheduler: Created %d distinct URL jobs to process.", len(initialJobs))
 
 	concurrencyLimit := s.config.Concurrency
 	if concurrencyLimit <= 0 { concurrencyLimit = 1 }

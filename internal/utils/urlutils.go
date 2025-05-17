@@ -259,7 +259,7 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 	}
 	groupedParams = tempGroupedParams // Update with deduped sets
 
-	logger.Infof("Preprocessed URLs. Found %d unique base URLs after filtering.", len(uniqueBaseURLs)) // Updated log
+	logger.Debugf("Preprocessed URLs. Found %d unique base URLs after filtering.", len(uniqueBaseURLs)) // Updated log to Debugf
 	logger.Debugf("Total query parameters found across all unique sets: %d", totalQueryParametersFound)
 	logger.Debugf("Number of base URLs with parameters: %d", baseURLsWithParamsCount)
 
