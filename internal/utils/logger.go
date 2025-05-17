@@ -2,10 +2,11 @@ package utils
 
 import (
 	"fmt"
-	"io" // Adicionado para io.Writer
+	"io"
 	"log"
 	"os"
 	"strings"
+	"time"
 )
 
 // Logger defines a simple interface for logging.
@@ -34,11 +35,11 @@ type defaultLogger struct {
 type LogLevel int
 
 const (
-	LevelDebug LogLevel = iota // Exported: utils.LevelDebug
-	LevelInfo                  // Exported: utils.LevelInfo
-	LevelWarn                  // Exported: utils.LevelWarn
-	LevelError                 // Exported: utils.LevelError
-	LevelFatal                 // Exported: utils.LevelFatal
+	LevelDebug LogLevel = iota
+	LevelInfo
+	LevelWarn
+	LevelError
+	LevelFatal
 )
 
 // ANSI color codes
@@ -48,6 +49,7 @@ const (
 	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
 	colorBlue   = "\033[34m"
+	colorDim    = "\033[2m"
 	// colorPurple = "\033[35m"
 	// colorCyan   = "\033[36m"
 	// colorWhite  = "\033[37m"
@@ -62,27 +64,13 @@ func colorize(s string, color string, noColor bool) string {
 
 // NewDefaultLogger creates a new logger with specified options.
 func NewDefaultLogger(level LogLevel, noColor bool, silent bool) Logger {
-	flags := log.Ldate | log.Ltime | log.Lshortfile
+	flags := 0
 
-	debugPrefix := "DEBUG: "
-	infoPrefix := "INFO:  "
-	warnPrefix := "WARN:  "
-	errorPrefix := "ERROR: "
-	fatalPrefix := "FATAL: "
+	emptyPrefix := ""
 
-	if !noColor {
-		debugPrefix = colorize(debugPrefix, colorBlue, noColor)
-		infoPrefix = colorize(infoPrefix, colorGreen, noColor)
-		warnPrefix = colorize(warnPrefix, colorYellow, noColor)
-		errorPrefix = colorize(errorPrefix, colorRed, noColor)
-		fatalPrefix = colorize(fatalPrefix, colorRed, noColor)
-	}
-
-	// Se silent, a maioria dos logs vai para ioutil.Discard
 	var debugOut io.Writer = os.Stdout
 	var infoOut io.Writer = os.Stdout
 	var warnOut io.Writer = os.Stdout
-	// errorOut e fatalOut sempre serão os.Stderr
 	var errorOut io.Writer = os.Stderr
 	var fatalOut io.Writer = os.Stderr
 
@@ -90,63 +78,77 @@ func NewDefaultLogger(level LogLevel, noColor bool, silent bool) Logger {
 		debugOut = io.Discard
 		infoOut = io.Discard
 		warnOut = io.Discard
-		// error e fatal continuam em stderr
 	}
 
 	return &defaultLogger{
-		debugLogger: log.New(debugOut, debugPrefix, flags),
-		infoLogger:  log.New(infoOut, infoPrefix, flags),
-		warnLogger:  log.New(warnOut, warnPrefix, flags),
-		errorLogger: log.New(errorOut, errorPrefix, flags),
-		fatalLogger: log.New(fatalOut, fatalPrefix, flags),
+		debugLogger: log.New(debugOut, emptyPrefix, flags),
+		infoLogger:  log.New(infoOut, emptyPrefix, flags),
+		warnLogger:  log.New(warnOut, emptyPrefix, flags),
+		errorLogger: log.New(errorOut, emptyPrefix, flags),
+		fatalLogger: log.New(fatalOut, emptyPrefix, flags),
 		logLevel:    level,
 		noColor:     noColor,
 		silent:      silent,
 	}
 }
 
+func (l *defaultLogger) logInternal(logger *log.Logger, levelStr string, levelColor string, format string, v ...interface{}) {
+	currentTime := time.Now().Format("15:04:05")
+	prefix := fmt.Sprintf("%s [%s] ",
+		colorize(fmt.Sprintf("[%s]", currentTime), colorDim, l.noColor),
+		colorize(levelStr, levelColor, l.noColor),
+	)
+	message := fmt.Sprintf(format, v...)
+	logger.Print(prefix + message)
+}
+
+func (l *defaultLogger) logFatalfInternal(logger *log.Logger, levelStr string, levelColor string, format string, v ...interface{}) {
+	currentTime := time.Now().Format("15:04:05")
+	prefix := fmt.Sprintf("%s [%s] ",
+		colorize(fmt.Sprintf("[%s]", currentTime), colorDim, l.noColor),
+		colorize(levelStr, levelColor, l.noColor),
+	)
+	message := fmt.Sprintf(format, v...)
+	logger.Fatal(prefix + message)
+}
+
 func (l *defaultLogger) Debugf(format string, v ...interface{}) {
-	if l.silent && l.logLevel > LevelDebug { // Em silent, debug só loga se o nível for explicitamente debug
+	if l.silent && l.logLevel > LevelDebug {
 		return
 	}
 	if l.logLevel <= LevelDebug {
-		l.debugLogger.Printf(format, v...)
+		l.logInternal(l.debugLogger, "DEBUG", colorBlue, format, v...)
 	}
 }
 
 func (l *defaultLogger) Infof(format string, v ...interface{}) {
-	if l.silent && l.logLevel > LevelInfo { // Em silent, info só loga se o nível for info/debug
+	if l.silent && l.logLevel > LevelInfo {
 		return
 	}
 	if l.logLevel <= LevelInfo {
-		l.infoLogger.Printf(format, v...)
+		l.logInternal(l.infoLogger, "INFO", colorGreen, format, v...)
 	}
 }
 
 func (l *defaultLogger) Warnf(format string, v ...interface{}) {
-	if l.silent && l.logLevel > LevelWarn { // Em silent, warn só loga se o nível for warn/info/debug
+	if l.silent && l.logLevel > LevelWarn {
 		return
 	}
 	if l.logLevel <= LevelWarn {
-		l.warnLogger.Printf(format, v...)
+		l.logInternal(l.warnLogger, "WARN", colorYellow, format, v...)
 	}
 }
 
 func (l *defaultLogger) Errorf(format string, v ...interface{}) {
-	// Errorf sempre loga, independente de silent, se o nível de log permitir
 	if l.logLevel <= LevelError {
-		l.errorLogger.Printf(format, v...)
+		l.logInternal(l.errorLogger, "ERROR", colorRed, format, v...)
 	}
 }
 
 func (l *defaultLogger) Fatalf(format string, v ...interface{}) {
-	// Fatalf sempre loga, independente de silent, se o nível de log permitir (que sempre será, por ser fatal)
 	if l.logLevel <= LevelFatal {
-		l.fatalLogger.Fatalf(format, v...)
+		l.logFatalfInternal(l.fatalLogger, "FATAL", colorRed, format, v...)
 	}
-	// Fallback se por algum motivo o nível de log for maior que fatal (não deveria acontecer)
-	// ou se o logger não chamar os.Exit(1) por si só.
-	// No entanto, log.Fatalf já chama os.Exit(1).
 }
 
 // StringToLogLevel converts a log level string to LogLevel type.
@@ -164,8 +166,6 @@ func StringToLogLevel(levelStr string) LogLevel {
 	case "fatal":
 		return LevelFatal
 	default:
-		// Usar fmt para evitar dependência cíclica se o logger padrão ainda não estiver inicializado
-		// ou se este for chamado antes do logger global ser setado.
 		fmt.Fprintf(os.Stderr, "Unknown log level string '%s', defaulting to INFO.\n", levelStr)
 		return LevelInfo
 	}

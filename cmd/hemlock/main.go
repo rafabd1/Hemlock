@@ -191,6 +191,10 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Define ANSI color codes directly here for the banner
+		const colorGreenForBanner = "\033[32m"
+		const colorResetForBanner = "\033[0m"
+
 		// 1. Display Banner (somente se não estiver no modo silencioso)
 		if !cfg.Silent {
 			banner := `
@@ -203,9 +207,13 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 `
 			version := "v0.1.2" // Atualizar conforme necessário
 			author := "github.com/rafabd1"
-			// Usar logger.RawPrintf ou similar se existir para não adicionar prefixo de log ao banner
-			// Por enquanto, usando fmt.Printf para o banner.
-			fmt.Printf("%s\n", banner)
+
+			// Apply color to the banner string
+			coloredBanner := banner
+			if !cfg.NoColor {
+				coloredBanner = colorGreenForBanner + banner + colorResetForBanner
+			}
+			fmt.Printf("%s\n", coloredBanner)
 			fmt.Printf("\t\t\tWeb Cache Poisoning Scanner | %s by %s\n\n", version, author)
 		}
 		
