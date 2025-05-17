@@ -30,6 +30,7 @@ type domainState struct {
 	lastRequestTime     time.Time     // Timestamp of the last request *allowed* to this domain
 	// blockedUntil        time.Time     // General cooldown, e.g., after consecutive errors (to be refined or replaced by RPS logic)
 	consecutiveFailures int           // Counter for generic errors
+	consecutiveSuccesses int           // New: Counter for successful requests
 
 	// Fields for dynamic rate limiting and standby
 	TargetRPS             float64       // Current target requests per second
@@ -64,6 +65,7 @@ func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
 		ds = &domainState{
 			TargetRPS:             dm.config.InitialTargetRPS,      // Use config value
 			CurrentStandbyDuration: dm.config.InitialStandbyDuration, // Use config value
+			consecutiveSuccesses:  0,
 		}
 		dm.domainStatus[domain] = ds
 		if dm.config.VerbosityLevel >= 2 { // -vv
@@ -95,16 +97,9 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	}
 
 	// 2. Check rate limiting based on TargetRPS
-	if ds.TargetRPS <= 0 { // Should use MinTargetRPS from config as absolute floor if this happens
-		var effectiveRPS float64
-		if dm.config.MinTargetRPS > 0 {
-			effectiveRPS = dm.config.MinTargetRPS
-		} else {
-			effectiveRPS = 0.1 // A very small default if MinTargetRPS is not set or zero
-		}
-		// This is a state correction, should be visible in normal mode.
-		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' has invalid TargetRPS (%.2f). Corrected to effective RPS: %.2f.", domain, ds.TargetRPS, effectiveRPS)
-		ds.TargetRPS = effectiveRPS // Correct the state
+	if ds.TargetRPS < dm.config.MinTargetRPS {
+		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' TargetRPS (%.2f) was below MinTargetRPS (%.2f). Corrected.", domain, ds.TargetRPS, dm.config.MinTargetRPS)
+		ds.TargetRPS = dm.config.MinTargetRPS
 	}
 	
 	requiredDelay := time.Duration(1.0/ds.TargetRPS * float64(time.Second))
@@ -147,16 +142,22 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 	ds := dm.getOrCreateDomainState(domain)
 	now := time.Now()
 
+	// Determine the effective maximum RPS for this domain
+	effectiveMaxRPS := config.DefaultMaxInternalRPS // Use internal default (e.g., 30 rps)
+	if dm.config.MaxTargetRPS > 0 { // If user specified a limit via -l
+		effectiveMaxRPS = dm.config.MaxTargetRPS
+	}
+
 	if statusCode == 429 {
 		appliedStandbyDuration := ds.CurrentStandbyDuration
 		ds.StandbyUntil = now.Add(appliedStandbyDuration)
 		
-		// Reduce RPS, ensuring it doesn't go below configured MinTargetRPS
 		newRPS := ds.TargetRPS / 2 // Example: Halve RPS on 429
 		if newRPS < dm.config.MinTargetRPS {
 			newRPS = dm.config.MinTargetRPS
 		}
 		ds.TargetRPS = newRPS
+		ds.consecutiveSuccesses = 0 // Reset successes on 429
 
 		if dm.config.VerbosityLevel >= 1 { // -v
 			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Applying standby for %s. StandbyUntil: %s. TargetRPS reduced to %.2f.", 
@@ -178,6 +179,7 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 
 	if err != nil {
 		ds.consecutiveFailures++
+		ds.consecutiveSuccesses = 0 // Reset successes on error
 		if dm.config.VerbosityLevel >= 2 { // -vv
 			dm.logger.Debugf("[DomainManager] RecordRequestResult: Error for domain '%s': %v. Consecutive failures: %d.", domain, err, ds.consecutiveFailures)
 		} else if dm.config.VerbosityLevel >= 1 { // -v
@@ -187,10 +189,30 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 	} else {
 		// Successful request (non-429 and no network error)
 		ds.consecutiveFailures = 0
-		// TODO: Future: If requests are consistently successful, gradually increase TargetRPS up to MaxTargetRPS from config
-		// For now, just log success, RPS increase will be a future enhancement.
-		if dm.config.VerbosityLevel >= 2 { // -vv
-			dm.logger.Debugf("[DomainManager] RecordRequestResult: Successful request (status: %d, no error) for domain '%s'. Consecutive failures reset.", statusCode, domain)
+		ds.consecutiveSuccesses++
+
+		if ds.consecutiveSuccesses >= config.DefaultSuccessThreshold {
+			newRPS := ds.TargetRPS + config.DefaultRPSIncrement
+			if newRPS > effectiveMaxRPS {
+				newRPS = effectiveMaxRPS
+			}
+			if newRPS > ds.TargetRPS { // Only log if RPS actually changed
+				ds.TargetRPS = newRPS
+				ds.consecutiveSuccesses = 0 // Reset counter after incrementing RPS
+				if dm.config.VerbosityLevel >= 1 {
+					dm.logger.Infof("[DomainManager] Domain '%s' reached %d successes. TargetRPS increased to %.2f (Max: %.2f).", 
+						domain, config.DefaultSuccessThreshold, ds.TargetRPS, effectiveMaxRPS)
+				}
+			} else if ds.TargetRPS < effectiveMaxRPS { 
+			    // RPS is already at max, or increment is too small. Reset counter to allow future evaluation if max changes or for stability.
+			    ds.consecutiveSuccesses = 0 
+			}
+			// If newRPS == ds.TargetRPS (already at max), we don't log, just reset counter.
+		} 
+		
+		if dm.config.VerbosityLevel >= 2 { 
+			dm.logger.Debugf("[DomainManager] Successful request (status: %d) for '%s'. Consecutive successes: %d/%d. Current RPS: %.2f", 
+				statusCode, domain, ds.consecutiveSuccesses, config.DefaultSuccessThreshold, ds.TargetRPS)
 		}
 	}
 }

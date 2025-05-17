@@ -2,8 +2,9 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -28,7 +29,6 @@ type Config struct {
 	ParsedProxies        []ProxyEntry
 	HeadersFile          string // Path to a file containing additional headers to test
 	TargetsFile          string // Path to a file containing target URLs
-	DelayMs              int    // Initial delay, can be used to seed TargetRPS or as a floor
 	MaxRetries           int    // Maximum number of retries per request
 	CustomHeaders        []string // Custom HTTP headers to add to every request (format: "Name: Value")
 	UserAgent            string   // User-Agent still needed for default if no -H "User-Agent: ..." is provided
@@ -42,34 +42,61 @@ type Config struct {
 	InitialStandbyDuration   time.Duration `mapstructure:"initial-standby-duration"`
 	MaxStandbyDuration       time.Duration `mapstructure:"max-standby-duration"`
 	StandbyDurationIncrement time.Duration `mapstructure:"standby-duration-increment"`
+
+	// New fields for unified input
+	Input string // New: For unified input -i, --input
+
+	// New field for insecure skip verify
+	InsecureSkipVerify bool // New: For --insecure flag
 }
 
-// ProxyEntry holds the parsed components of a proxy string.
+// ProxyEntry holds the parsed information for a single proxy.
 type ProxyEntry struct {
-	Scheme   string
-	Host     string
-	Port     string
-	User     string
-	Password string
+	URL      string // Full proxy URL, e.g., http://user:pass@host:port
+	Scheme   string // http, https, socks5, etc.
+	Host     string // host:port
+	Username string // Optional
+	Password string // Optional
 }
 
-// String returns the proxy URL string representation.
-// Omits user/pass if not present. Defaults to http scheme if not present.
-func (pe *ProxyEntry) String() string {
-	userInfo := ""
-	if pe.User != "" {
-		userInfo = pe.User
-		if pe.Password != "" {
-			userInfo += ":" + pe.Password
+// String method for ProxyEntry to construct the full proxy URL string.
+// This is useful for http.Transport.Proxy.
+func (p *ProxyEntry) String() string {
+	if p.URL != "" { // If a full URL is already provided, use it (e.g. by ParseProxyInput)
+		// Optionally, re-parse and re-build if username/password might need to be injected
+		// into a p.URL that doesn't already have them, but for now, assume p.URL is authoritative if set.
+		u, err := url.Parse(p.URL)
+		if err == nil {
+			if p.Username != "" || p.Password != "" {
+				u.User = url.UserPassword(p.Username, p.Password)
+				return u.String()
+			}
+			return p.URL // Return original p.URL if no user/pass to inject or already there
 		}
-		userInfo += "@"
+		// If p.URL is set but malformed (should not happen if ParseProxyInput is robust), fall through or log. 
 	}
-	schemeToUse := pe.Scheme
-	if schemeToUse == "" {
-		schemeToUse = "http" // Default to http if scheme is empty
+	
+	// Fallback or alternative construction if p.URL is not set but Scheme/Host are
+	if p.Scheme != "" && p.Host != "" {
+		var u url.URL
+		u.Scheme = p.Scheme
+		u.Host = p.Host
+		if p.Username != "" || p.Password != "" {
+			u.User = url.UserPassword(p.Username, p.Password)
+		}
+		return u.String()
 	}
-	return fmt.Sprintf("%s://%s%s:%s", schemeToUse, userInfo, pe.Host, pe.Port)
+	return p.URL // Default to p.URL if other parts are missing
 }
+
+// Valores padrão para RPS se não especificados ou se MaxTargetRPS (flag -l) for 0.
+const (
+	DefaultInitialRPS       float64 = 5.0
+	DefaultMinRPS           float64 = 5.0  // Mínimo de 5 req/s como solicitado
+	DefaultMaxInternalRPS   float64 = 30.0 // Máximo de 30 req/s se -l 0 ou não especificado
+	DefaultSuccessThreshold int     = 10   // Aumentar RPS a cada N sucessos
+	DefaultRPSIncrement     float64 = 1.0  // Quanto aumentar o RPS
+)
 
 // GetDefaultConfig returns a Config struct populated with default values.
 // Viper in main.go will set these defaults and override them with flags.
@@ -90,7 +117,6 @@ func GetDefaultConfig() *Config {
 		ParsedProxies:        []ProxyEntry{},
 		HeadersFile:          "", // Will be set by flag or default in main.go
 		TargetsFile:          "",
-		DelayMs:              500,    // Renamed from MinRequestDelayMs
 		MaxRetries:           3,    // Default of 3 retries
 		CustomHeaders:        []string{},
 		NoColor:              false,
@@ -103,6 +129,12 @@ func GetDefaultConfig() *Config {
 		InitialStandbyDuration:   1 * time.Minute,
 		MaxStandbyDuration:       5 * time.Minute,
 		StandbyDurationIncrement: 1 * time.Minute,
+
+		// Defaults for new fields for unified input
+		Input: "", // Default for new input flag
+
+		// Defaults for new field for insecure skip verify
+		InsecureSkipVerify: false, // Default for new --insecure flag
 	}
 }
 
@@ -125,19 +157,22 @@ func LoadConfig(userConfigFilePath string /* parameter no longer used */) (*Conf
 
 // LoadLinesFromFile is still useful for loading targets/headers from files specified by flags.
 func LoadLinesFromFile(filePath string) ([]string, error) {
-	content, err := ioutil.ReadFile(filePath)
+	if filePath == "" {
+		return nil, fmt.Errorf("file path cannot be empty")
+	}
+	content, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}
 	lines := strings.Split(string(content), "\n")
-	var result []string
+	var cleanedLines []string
 	for _, line := range lines {
 		trimmedLine := strings.TrimSpace(line)
-		if trimmedLine != "" && !strings.HasPrefix(trimmedLine, "#") { // Ignore comments and empty lines
-			result = append(result, trimmedLine)
+		if trimmedLine != "" && !strings.HasPrefix(trimmedLine, "#") { // Skip empty lines and comments
+			cleanedLines = append(cleanedLines, trimmedLine)
 		}
 	}
-	return result, nil
+	return cleanedLines, nil
 }
 
 // deduplicateStringSlice is still useful.
@@ -194,11 +229,6 @@ func (c *Config) Validate() error {
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("maxRetries cannot be negative")
 	}
-	if c.DelayMs < 0 { // Renamed from MinRequestDelayMs
-		return fmt.Errorf("delayMs cannot be negative")
-	}
-
-	// Validations for new fields
 	if c.InitialTargetRPS <= 0 {
 		return fmt.Errorf("initialTargetRPS must be positive")
 	}
@@ -220,11 +250,21 @@ func (c *Config) Validate() error {
 	if c.StandbyDurationIncrement <= 0 {
 		return fmt.Errorf("standbyDurationIncrement must be positive")
 	}
+	if c.MaxTargetRPS < 0 {
+		return fmt.Errorf("rate-limit (MaxTargetRPS) cannot be negative")
+	}
+
+	// Validate output format
+	validFormats := map[string]bool{"text": true, "json": true}
+	if _, ok := validFormats[strings.ToLower(c.OutputFormat)]; !ok {
+		return fmt.Errorf("invalid output format: %s. Must be 'text' or 'json'", c.OutputFormat)
+	}
+
 	return nil
 }
 
 // String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s (Level: %d), MaxRetries: %d, DelayMs: %d, CustomHeaders (count): %d, InitialRPS: %.2f, MaxRPS: %.2f",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.VerbosityLevel, c.MaxRetries, c.DelayMs, len(c.CustomHeaders), c.InitialTargetRPS, c.MaxTargetRPS)
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s (Level: %d), MaxRetries: %d, InitialRPS: %.2f, MaxRPS: %.2f",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.VerbosityLevel, c.MaxRetries, c.InitialTargetRPS, c.MaxTargetRPS)
 } 

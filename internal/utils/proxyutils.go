@@ -3,6 +3,7 @@ package utils
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -124,17 +125,34 @@ func ParseProxyInput(proxyInput string, logger Logger) ([]config.ProxyEntry, err
 			        }
 			    }
 			    if port == "" { // still no port
-			        logger.Warnf("Proxy string '%s' resulted in empty port. Skipping.", trimmedStr)
+			        logger.Warnf("Proxy string '%s' resulted in empty port after attempting to manually parse host:port. Skipping.", trimmedStr)
 			        continue
 			    }
 			}
 		}
 
+		// Construct the full host string (hostname:port)
+		fullHost := host
+		if port != "" {
+			fullHost = net.JoinHostPort(host, port)
+		}
+
+		// Reconstruct a canonical URL for the ProxyEntry.URL field, including user info if present
+		var entryURL string
+		empURL := url.URL{
+			Scheme: scheme,
+			Host:   fullHost,
+		}
+		if user != "" {
+			empURL.User = url.UserPassword(user, pass)
+		}
+		entryURL = empURL.String()
+
 		parsedProxies = append(parsedProxies, config.ProxyEntry{
+			URL:      entryURL, // Store the reconstructed, canonical URL
 			Scheme:   scheme,
-			Host:     host,
-			Port:     port,
-			User:     user,
+			Host:     fullHost, // Store as host:port
+			Username: user,     // Correct field name
 			Password: pass,
 		})
 	}
@@ -144,7 +162,9 @@ func ParseProxyInput(proxyInput string, logger Logger) ([]config.ProxyEntry, err
 	} else if len(parsedProxies) > 0 {
 	    logger.Infof("Successfully parsed %d proxies.", len(parsedProxies))
 	    for _, p := range parsedProxies {
-	        logger.Debugf("Parsed proxy: %s://%s:%s User: %s", p.Scheme, p.Host, p.Port, p.User)
+	        // Use p.String() which should be defined in config.ProxyEntry and handles formatting.
+	        // Or, if logging specific parsed components:
+	        logger.Debugf("Parsed proxy details: Scheme: %s, Host: %s, Username: %s, Full: %s", p.Scheme, p.Host, p.Username, p.String())
 	    }
 	}
 

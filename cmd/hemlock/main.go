@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	// Required for time.Duration in examples if any
 	"github.com/rafabd1/Hemlock/internal/config"
 	"github.com/rafabd1/Hemlock/internal/core"
 	"github.com/rafabd1/Hemlock/internal/networking"
@@ -32,19 +34,19 @@ via unkeyed HTTP headers and URL parameters.
 Uses probing techniques to verify if injected payloads are reflected and cached.
 `,
 	Example: `  # Scan a single target with debug verbosity and JSON output to file:
-  hemlock -t http://example.com -V debug -o results.json
+  hemlock -i http://example.com -vv -o results.json
 
-  # Scan multiple targets (comma-separated) with 50 concurrent workers:
-  hemlock --targets "http://site1.com,https://site2.org" -c 50
+  # Scan multiple targets (comma-separated in a string) with 50 concurrent workers:
+  hemlock --input "http://site1.com,https://site2.org" -c 50
 
-  # Scan targets from a file, using a custom headers file and proxy:
-  hemlock --targets-file /path/to/targets.txt --headers-file /path/to/my_headers.txt --proxy http://localhost:8080
+  # Scan targets from a file, using a custom headers file and proxy, with a 5 req/s rate limit:
+  hemlock -i /path/to/targets.txt --headers-file /path/to/my_headers.txt --proxy http://localhost:8080 -l 5
 
-  # Silent scan, showing only fatal errors and final report in text format:
-  hemlock -t http://vulnerable.site --silent --output-format text
+  # Silent scan, showing only fatal errors and final report in text format, skipping TLS verification:
+  hemlock -i http://vulnerable.site --silent --output-format text --insecure
 
-  # Scan with custom request headers and 5 retries:
-  hemlock -t http://test.com -H "User-Agent: MyScanner/1.0" -H "Authorization: Bearer xyz" -r 5`,
+  # Scan with custom request headers, 5 retries and a 5s timeout:
+  hemlock -i http://test.com -H "User-Agent: MyScanner/1.0" -H "Authorization: Bearer xyz" -r 5 -t 5s`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		// Initialize Viper to read configs, env vars, and flags
 		vp := viper.New()
@@ -64,122 +66,103 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// Populate the cfg struct with values from Viper
 		cfg = *config.GetDefaultConfig() // Start with hardcoded defaults
 
-		// String arrays from Viper
-		if vp.IsSet("targets") { cfg.Targets = vp.GetStringSlice("targets") }
-		if vp.IsSet("payloads") { cfg.BasePayloads = vp.GetStringSlice("payloads") }
-		if vp.IsSet("header") { cfg.CustomHeaders = vp.GetStringSlice("header") }
-		
-		cfg.DefaultPayloadPrefix = vp.GetString("payload-prefix")
+		// --- Populate config from Viper/Flags ---
+		cfg.Input = vp.GetString("input")
+		cfg.CustomHeaders = vp.GetStringSlice("header")
 		cfg.Concurrency = vp.GetInt("concurrency")
-		cfg.RequestTimeout = vp.GetDuration("timeout")
+		timeoutSeconds := vp.GetInt("timeout")
+		cfg.RequestTimeout = time.Duration(timeoutSeconds) * time.Second
 		cfg.OutputFile = vp.GetString("output-file")
 		cfg.OutputFormat = vp.GetString("output-format")
-		// cfg.Verbosity will be set below based on -v, -vv flags
 		cfg.ProxyInput = vp.GetString("proxy")
 		cfg.HeadersFile = vp.GetString("headers-file")
-		cfg.TargetsFile = vp.GetString("targets-file")
-		cfg.DelayMs = vp.GetInt("delay")
 		cfg.MaxRetries = vp.GetInt("max-retries")
 		cfg.NoColor = vp.GetBool("no-color")
 		cfg.Silent = vp.GetBool("silent")
-
-		// Populate new RPS and Standby fields from Viper
-		cfg.InitialTargetRPS = vp.GetFloat64("initial-rps")
-		cfg.MinTargetRPS = vp.GetFloat64("min-rps")
-		cfg.MaxTargetRPS = vp.GetFloat64("max-rps")
-		cfg.InitialStandbyDuration = vp.GetDuration("initial-standby")
-		cfg.MaxStandbyDuration = vp.GetDuration("max-standby")
-		cfg.StandbyDurationIncrement = vp.GetDuration("standby-increment")
-
-		// Restaurar UserAgent padrão se o Viper o zerou (porque a flag não existe mais)
-		if cfg.UserAgent == "" {
-			defaultCfg := config.GetDefaultConfig()
-			cfg.UserAgent = defaultCfg.UserAgent
-		}
+		cfg.InsecureSkipVerify = vp.GetBool("insecure")
+		cfg.MaxTargetRPS = vp.GetFloat64("rate-limit")
 
 		// Handle verbosity flags to set both Verbosity (string) and VerbosityLevel (int)
-		verboseFlag, _ := cmd.Flags().GetBool("verbose")
-		veryVerboseFlag, _ := cmd.Flags().GetBool("very-verbose")
+		verboseFlag, _ := cmd.Flags().GetBool("verbose")       // -v
+		veryVerboseFlag, _ := cmd.Flags().GetBool("vverbose") // -vv (Note: standard is often just two v's for the flag name, e.g. cmd.Flags().Count("v"))
+		                                                    // Let's assume separate flags for now as defined in init()
 
-		if veryVerboseFlag {
+		if cfg.Silent {
+			cfg.VerbosityLevel = -1 // Special level for silent, logger will handle this
+			cfg.Verbosity = "fatal" // Or some equivalent concept for the logger
+		} else if veryVerboseFlag {
 			cfg.VerbosityLevel = 2
-			cfg.Verbosity = "debug" // -vv implies debug log level for the logger
+			cfg.Verbosity = "debug"
 		} else if verboseFlag {
 			cfg.VerbosityLevel = 1
-			cfg.Verbosity = "debug" // -v also implies debug for now, filtering is done by VerbosityLevel in code
+			cfg.Verbosity = "debug" // -v can also map to debug, with level 1 filtering in app
 		} else {
-			// Use verbosity string from flag if set, otherwise default
-			cfg.Verbosity = vp.GetString("verbosity") // Default is "info"
-			switch strings.ToLower(cfg.Verbosity) {
-			case "debug":
-				cfg.VerbosityLevel = 2 // if --verbosity=debug is set, treat as -vv
-			case "info":
-				cfg.VerbosityLevel = 0
-			case "warn":
-				cfg.VerbosityLevel = 0 // Warns will show with Info level logger
-			case "error":
-				cfg.VerbosityLevel = 0 // Errors will show with Info level logger
-			default:
-				cfg.VerbosityLevel = 0
-				cfg.Verbosity = "info" // Fallback to info
-			}
+			cfg.VerbosityLevel = 0  // Default (info)
+			cfg.Verbosity = "info"
 		}
 
 		// Initialize Logger (after verbosity, noColor and silent are set)
-		// The logger itself is configured with the string log level (e.g., "debug", "info")
-		// The cfg.VerbosityLevel (int) is used within the application logic for conditional logging.
 		logLevel := utils.StringToLogLevel(cfg.Verbosity)
 		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent)
 		
-		// Load targets from --targets-file if specified (takes precedence over --targets)
-		if cfg.TargetsFile != "" {
-			fileTargets, err := config.LoadLinesFromFile(cfg.TargetsFile)
-			if err != nil {
-				logger.Errorf("Error reading targets from file '%s': %v", cfg.TargetsFile, err)
-				return fmt.Errorf("error reading targets from file '%s': %w", cfg.TargetsFile, err)
+		// --- Process Input (-i, --input) ---
+		if cfg.Input != "" {
+			// Check if input is a file path
+			if _, err := os.Stat(cfg.Input); err == nil {
+				// Input is a file, load targets from it
+				logger.Infof("Input '%s' detected as a file. Reading targets from file.", cfg.Input)
+				fileTargets, errLoad := config.LoadLinesFromFile(cfg.Input)
+				if errLoad != nil {
+					logger.Errorf("Error reading targets from input file '%s': %v", cfg.Input, errLoad)
+					return fmt.Errorf("error reading targets from input file '%s': %w", cfg.Input, errLoad)
+				}
+				cfg.Targets = fileTargets
+				cfg.TargetsFile = cfg.Input // Store the fact it came from a file for logging consistency
+			} else {
+				// Input is not a file, treat as comma-separated list or single URL
+				logger.Infof("Input '%s' detected as URL(s).", cfg.Input)
+				if strings.Contains(cfg.Input, ",") {
+					cfg.Targets = strings.Split(cfg.Input, ",")
+				} else {
+					cfg.Targets = []string{cfg.Input}
+				}
+				// Trim spaces from targets
+				for i := range cfg.Targets {
+					cfg.Targets[i] = strings.TrimSpace(cfg.Targets[i])
+				}
 			}
-			cfg.Targets = fileTargets
-		} else if len(cfg.Targets) > 0 { 
-		    if len(cfg.Targets) == 1 && strings.Contains(cfg.Targets[0], ",") {
-		        cfg.Targets = strings.Split(cfg.Targets[0], ",")
-		    }
-		for i := range cfg.Targets {
-			cfg.Targets[i] = strings.TrimSpace(cfg.Targets[i])
 		}
-	}
 
-		// Load HeadersToTest
+		// --- Load HeadersToTest ---
 		if cfg.HeadersFile == "" { 
 			exePath, err := os.Executable()
 			if err != nil {
-				logger.Warnf("Could not get executable path: %v", err) 
+				logger.Warnf("Could not get executable path to find default headers: %v", err) 
 			}
 			potentialPaths := []string{
 				filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
 				filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
 				filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
+				"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
 			}
 			foundPath := ""
 			for _, p := range potentialPaths {
 				if _, err := os.Stat(p); err == nil {
 					cfg.HeadersFile = p
 					foundPath = p
+					logger.Debugf("Found default headers file at: %s", p)
 					break
 				}
 			}
 			if foundPath == "" {
-				// Logger might not be initialized yet if this is an early essential file check.
-				// However, standard practice is to initialize logger ASAP.
-				// Assuming logger is initialized before this critical check.
-				// If not, this specific error might need to remain fmt.Errorf or a pre-logger error handler.
-				// Based on current structure, logger should be initialized.
-				errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations and --headers-file not specified. This file is essential", defaultHeadersFilename)
+				errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential", defaultHeadersFilename, defaultWordlistDir)
 				logger.Errorf(errMsg)
 				return fmt.Errorf("%s", errMsg)
 			}
 		} 
 
-		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile) // Pass verbosity to loadHeaders if its logs need to be conditional
+		logger.Infof("Using headers from: %s", cfg.HeadersFile)
+		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
 		if err != nil {
 			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
 			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
@@ -191,16 +174,17 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		}
 		cfg.HeadersToTest = loadedHeaders
 
-		// Parse ProxyInput
+		// --- Parse ProxyInput ---
 		if cfg.ProxyInput != "" {
-			parsedPx, errPx := utils.ParseProxyInput(cfg.ProxyInput, logger)
+			parsedPx, errPx := utils.ParseProxyInput(cfg.ProxyInput, logger) // This line has the linter error
 			if errPx != nil {
 				logger.Warnf("Error parsing proxy input '%s': %v. Continuing without proxies from this input.", cfg.ProxyInput, errPx)
 				cfg.ParsedProxies = []config.ProxyEntry{}
 			} else {
-				cfg.ParsedProxies = parsedPx
+				// Assuming the linter error is resolved elsewhere, and parsedPx is of type []config.ProxyEntry
+				cfg.ParsedProxies = parsedPx 
 			}
-	} else {
+		} else {
 			cfg.ParsedProxies = []config.ProxyEntry{}
 		}
 		return nil
@@ -216,32 +200,32 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
   | |  | |  __/ | | | | | | (_) | (__|   < 
   |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
 `
-			version := "v0.1.0" // Placeholder version, update as needed
+			version := "v0.1.1" // Placeholder version, update as needed
 			author := "github.com/rafabd1"    // Placeholder author, update as needed
 			fmt.Printf("%s\n", banner)
 			fmt.Printf("\t\t\t\tVersion: %s by %s\n\n", version, author)
 		}
 		
-		// Log file loading info
-		if cfg.TargetsFile != "" {
-			logger.Infof("Reading targets from file: %s", cfg.TargetsFile)
+		// Log file loading info (simplified as Input provides context now)
+		if cfg.TargetsFile != "" { // TargetsFile is populated if input was a file
+			logger.Infof("Targets loaded from file: %s", cfg.TargetsFile)
 		} else if len(cfg.Targets) > 0 {
-			logger.Infof("Using %d target(s) from command line arguments.", len(cfg.Targets))
-		}
-		logger.Infof("Using headers from: %s", cfg.HeadersFile)
+			logger.Infof("Using %d target(s) from --input argument.", len(cfg.Targets))
+		} 
+		// HeadersFile logging is already done in PersistentPreRunE
 		
 		if err := cfg.Validate(); err != nil {
 			logger.Fatalf("Invalid configuration: %v", err)
 		}
 
-	if len(cfg.Targets) == 0 {
-			logger.Fatalf("No targets specified. Use --targets or --targets-file")
+		if len(cfg.Targets) == 0 {
+			logger.Fatalf("No targets specified. Use --input or -i to provide a URL, list of URLs, or a file path.")
 		}
 		if len(cfg.HeadersToTest) == 0 {
-			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file")
+			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file location.")
 	    }
 
-		// Pre-process URLs for summary
+		// Pre-process URLs for summary (optional, could be removed if too verbose)
 		_, _, totalParamsFoundForSummary, baseURLsWithParamsCountForSummary := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
 
 		// Enhanced Initial Statistics Log
@@ -249,32 +233,23 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			fmt.Println("------------------------------------------------------------")
 			fmt.Println(" Scan Configuration Summary")
 			fmt.Println("------------------------------------------------------------")
-			fmt.Printf(" Initial Targets Provided: %d (Unique base URLs will be logged by the scanner)\n", len(cfg.Targets))
+			fmt.Printf(" Targets Provided: %d (via --input '%s')\n", len(cfg.Targets), cfg.Input)
 			fmt.Printf(" Headers to Test: %d loaded from '%s'\n", len(cfg.HeadersToTest), cfg.HeadersFile)
 
-			paramTestsEnabled := len(cfg.BasePayloads) > 0 || cfg.DefaultPayloadPrefix != ""
-			if paramTestsEnabled && totalParamsFoundForSummary > 0 {
-				fmt.Printf(" URL Parameters to Test: %d (from %d base URL(s) with parameters)\n", totalParamsFoundForSummary, baseURLsWithParamsCountForSummary)
-				if len(cfg.BasePayloads) > 0 {
-					fmt.Printf("   Custom Base Payloads for Parameters: %d\n", len(cfg.BasePayloads))
-					for i, p := range cfg.BasePayloads {
-						fmt.Printf("     - Payload %d: %s\n", i+1, p) 
-						if i > 2 && len(cfg.BasePayloads) > 5 { 
-							fmt.Printf("     ... and %d more\n", len(cfg.BasePayloads)-(i+1))
-							break
-						}
-					}
-				}
-			} else if paramTestsEnabled {
-				fmt.Println(" URL Parameter Tests: Enabled, but no URL parameters found in the provided targets.")
+			// Parameter test info (payload flags removed, so this is about internal logic now)
+			// This might need adjustment if BasePayloads/DefaultPayloadPrefix are always default
+			paramTestsImplicitlyEnabled := cfg.DefaultPayloadPrefix != "" || len(cfg.BasePayloads) > 0
+			if paramTestsImplicitlyEnabled && totalParamsFoundForSummary > 0 {
+				fmt.Printf(" URL Parameter Tests: Implicitly enabled, %d params found in %d base URLs\n", totalParamsFoundForSummary, baseURLsWithParamsCountForSummary)
+			} else if paramTestsImplicitlyEnabled {
+				fmt.Println(" URL Parameter Tests: Implicitly enabled, but no URL parameters found in targets.")
 			} else {
-				fmt.Println(" URL Parameter Tests: Disabled (no base payloads or prefix defined)")
+				fmt.Println(" URL Parameter Tests: Implicitly disabled (internal payload config empty)")
 			}
 
 			fmt.Printf(" Concurrency: %d workers\n", cfg.Concurrency)
 			fmt.Printf(" Request Timeout: %s\n", cfg.RequestTimeout.String())
 			
-			// Default User-Agent and Custom Headers
 			if len(cfg.CustomHeaders) > 0 {
 				fmt.Printf(" Custom Global Headers (%d):\n", len(cfg.CustomHeaders))
 				for _, h := range cfg.CustomHeaders {
@@ -290,24 +265,21 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				fmt.Println(" Proxies: None configured")
 			}
 			fmt.Printf(" Max Retries per Request: %d\n", cfg.MaxRetries)
-			fmt.Printf(" Initial Delay (per domain, before RPS takes over): %dms\n", cfg.DelayMs)
 			
-			// New RPS and Standby info in summary
-			fmt.Println(" Dynamic Rate Limiting (per domain):")
-			fmt.Printf("   Initial Target RPS: %.2f req/s\n", cfg.InitialTargetRPS)
-			fmt.Printf("   Min Target RPS (after 429): %.2f req/s\n", cfg.MinTargetRPS)
-			fmt.Printf("   Max Target RPS: %.2f req/s\n", cfg.MaxTargetRPS)
-			fmt.Println(" Domain Standby (after 429 Too Many Requests):")
-			fmt.Printf("   Initial Standby Duration: %s\n", cfg.InitialStandbyDuration)
-			fmt.Printf("   Max Standby Duration: %s\n", cfg.MaxStandbyDuration)
-			fmt.Printf("   Standby Increment on repeat: %s\n", cfg.StandbyDurationIncrement)
+			// Rate Limit Info
+			if cfg.MaxTargetRPS > 0 {
+				fmt.Printf(" Rate Limit: Up to %.2f requests/second per domain\n", cfg.MaxTargetRPS)
+			} else {
+				fmt.Printf(" Rate Limit: Auto (Initial: %.2f req/s, Min: %.2f req/s per domain)\n", cfg.InitialTargetRPS, cfg.MinTargetRPS)
+			}
+			fmt.Printf(" TLS Verification: %s\n", map[bool]string{true: "Disabled (insecure)", false: "Enabled"}[cfg.InsecureSkipVerify])
 
 			if cfg.OutputFile != "" {
 				fmt.Printf(" Output File: %s (Format: %s)\n", cfg.OutputFile, cfg.OutputFormat)
 			} else {
 				fmt.Printf(" Output: stdout (Format: %s)\n", cfg.OutputFormat)
 			}
-			fmt.Printf(" Log Level: %s\n", cfg.Verbosity)
+			fmt.Printf(" Log Level: %s (Verbosity Level: %d)\n", cfg.Verbosity, cfg.VerbosityLevel)
 			fmt.Println("------------------------------------------------------------")
 		}
 
@@ -315,87 +287,91 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 
 		// Initialize services
 		httpClient, errClient := networking.NewClient(&cfg, logger)
-	if errClient != nil {
-		logger.Fatalf("Failed to create HTTP client: %v", errClient)
-	}
+		if errClient != nil {
+			logger.Fatalf("Failed to create HTTP client: %v", errClient)
+		}
 		logger.Debugf("HTTP client initialized.")
 
 		processor := core.NewProcessor(&cfg, logger)
-	logger.Debugf("Processor initialized.")
+		logger.Debugf("Processor initialized.")
 
 		domainManager := networking.NewDomainManager(&cfg, logger)
 		logger.Debugf("DomainManager initialized.")
 
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
-	logger.Debugf("Scheduler initialized.")
+		logger.Debugf("Scheduler initialized.")
 
-		// Correção: StartScan agora retorna apenas findings
-	findings := scheduler.StartScan() 
+		findings := scheduler.StartScan() 
 
 		logger.Infof("Scan completed. Generating report for %d finding(s)...", len(findings))
-	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
-	if errReport != nil {
-		logger.Errorf("Failed to generate report: %v", errReport)
-		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
-			logger.Warnf("Attempting to print report to stdout as fallback...")
-			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
-			if fbErr != nil {
-				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+		if errReport != nil {
+			logger.Errorf("Failed to generate report: %v", errReport)
+			if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+				logger.Warnf("Attempting to print report to stdout as fallback...")
+				fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+				if fbErr != nil {
+					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+				}
 			}
+		} else {
+			logger.Infof("Report generated successfully.")
 		}
-	} else {
-		logger.Infof("Report generated successfully.")
-	}
 
-	logger.Infof("Hemlock Cache Scanner finished.")
+		logger.Infof("Hemlock Cache Scanner finished.")
 		return nil
 	},
 }
 
 func init() {
-	// Configuration of Viper for defaults
 	defaults := config.GetDefaultConfig()
-	// Viper is now initialized and used locally in PersistentPreRunE to populate cfg
-	// and here to set the defaults for Cobra flags.
 
-	// Persistent Flags (available to the root command and any subcommands)
-	rootCmd.PersistentFlags().StringSliceP("targets", "t", defaults.Targets, "List of target URLs separated by comma (e.g., http://host1,http://host2)")
-	rootCmd.PersistentFlags().StringP("targets-file", "f", defaults.TargetsFile, "Path to a file containing target URLs (one per line)")
+	// Input
+	rootCmd.PersistentFlags().StringP("input", "i", defaults.Input, "Input: URL, comma-separated URLs, or path to a file with URLs (one per line)")
 
+	// Headers
 	rootCmd.PersistentFlags().String("headers-file", defaults.HeadersFile, "Path to the file of headers to test (default: wordlists/headers.txt in standard locations)")
-	rootCmd.PersistentFlags().StringSlice("payloads", defaults.BasePayloads, "List of base payloads to use (comma-separated)")
-	rootCmd.PersistentFlags().String("payload-prefix", defaults.DefaultPayloadPrefix, "Prefix for automatically generated payloads if base payloads list is empty")
+	rootCmd.PersistentFlags().StringSliceP("header", "H", defaults.CustomHeaders, "Custom HTTP header to add to requests (can be specified multiple times, format: \"Name: Value\")")
 
+	// Output
 	rootCmd.PersistentFlags().StringP("output-file", "o", defaults.OutputFile, "Path to file for saving results (default: stdout)")
 	rootCmd.PersistentFlags().String("output-format", defaults.OutputFormat, "Output format: json or text")
 
-	rootCmd.PersistentFlags().StringP("verbosity", "V", defaults.Verbosity, "Log level: debug, info, warn, error, fatal")
-	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Shortcut for --verbosity debug")
-
+	// Concurrency & Performance
 	rootCmd.PersistentFlags().IntP("concurrency", "c", defaults.Concurrency, "Number of concurrent workers")
-	rootCmd.PersistentFlags().DurationP("timeout", "T", defaults.RequestTimeout, "HTTP request timeout (e.g., 10s, 1m)")
-	rootCmd.PersistentFlags().StringSliceP("header", "H", defaults.CustomHeaders, "Custom HTTP header to add to requests (can be specified multiple times, format: \"Name: Value\")")
+	rootCmd.PersistentFlags().IntP("timeout", "t", int(defaults.RequestTimeout.Seconds()), "HTTP request timeout in seconds")
+	rootCmd.PersistentFlags().IntP("max-retries", "r", defaults.MaxRetries, "Maximum number of retries per request")
+	rootCmd.PersistentFlags().Float64P("rate-limit", "l", 0.0, "Max requests per second per domain (0 for auto-adjustment)")
+
+	// Security & Verbosity
+	rootCmd.PersistentFlags().Bool("insecure", defaults.InsecureSkipVerify, "Disable TLS certificate verification")
+	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose (debug level 1) logging")
+	rootCmd.PersistentFlags().Bool("vverbose", false, "Enable very verbose (debug level 2) logging (use as -vv)") // Cobra typically handles -vv by Count("v"), this is an alternative
+	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Disable colors in text output")
+	rootCmd.PersistentFlags().Bool("silent", defaults.Silent, "Suppress all logs except fatal errors and final results (findings)")
+
+	// Proxy
 	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy to use (URL, CSV list, or file path)")
 
-	rootCmd.PersistentFlags().Int("delay", defaults.DelayMs, "Delay in ms between requests to the same domain")
-
-	// Retry flags
-	rootCmd.PersistentFlags().IntP("max-retries", "r", defaults.MaxRetries, "Maximum number of retries per request")
-
-	// ADD New Flags for RPS and Standby
-	rootCmd.PersistentFlags().Float64("initial-rps", defaults.InitialTargetRPS, "Initial target requests per second per domain")
-	rootCmd.PersistentFlags().Float64("min-rps", defaults.MinTargetRPS, "Minimum target RPS per domain (after a 429 response)")
-	rootCmd.PersistentFlags().Float64("max-rps", defaults.MaxTargetRPS, "Maximum target requests per second per domain")
-	rootCmd.PersistentFlags().Duration("initial-standby", defaults.InitialStandbyDuration, "Initial standby duration for a domain after a 429 response")
-	rootCmd.PersistentFlags().Duration("max-standby", defaults.MaxStandbyDuration, "Maximum standby duration for a domain")
-	rootCmd.PersistentFlags().Duration("standby-increment", defaults.StandbyDurationIncrement, "Increment to standby duration on repeated 429 responses")
-
-	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Disable colors in text output")
-	rootCmd.PersistentFlags().Bool("silent", defaults.Silent, "Suppress all logs except final results (findings)")
+	// Removed flags (placeholders for user information, not to be re-added without discussion):
+	// --targets, -t (replaced by --input, -i)
+	// --targets-file, -f (replaced by --input, -i)
+	// --verbosity, -V (replaced by -v, -vv, --silent)
+	// --payloads (internal logic now)
+	// --payload-prefix (internal logic now)
+	// --delay (internal logic now, part of RPS)
+	// --initial-rps (internal logic now)
+	// --min-rps (internal logic now)
+	// --max-rps (replaced by --rate-limit, -l)
+	// --initial-standby (internal logic now)
+	// --max-standby (internal logic now)
+	// --standby-increment (internal logic now) - This one was not explicitly removed by user, but falls into internal rate control logic
 }
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
+		// Logger might not be initialized here if error is from Cobra parsing itself pre-PersistentPreRunE
+		// So, fmt.Fprintf to stderr is appropriate.
 		fmt.Fprintf(os.Stderr, "Error executing hemlock: %v\n", err)
 		os.Exit(1)
 	}

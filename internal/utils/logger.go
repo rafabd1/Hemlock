@@ -3,7 +3,6 @@ package utils
 import (
 	"fmt"
 	"io" // Adicionado para io.Writer
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -88,9 +87,9 @@ func NewDefaultLogger(level LogLevel, noColor bool, silent bool) Logger {
 	var fatalOut io.Writer = os.Stderr
 
 	if silent {
-		debugOut = ioutil.Discard
-		infoOut = ioutil.Discard
-		warnOut = ioutil.Discard
+		debugOut = io.Discard
+		infoOut = io.Discard
+		warnOut = io.Discard
 		// error e fatal continuam em stderr
 	}
 
