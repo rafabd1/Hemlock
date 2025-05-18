@@ -1,6 +1,8 @@
 package networking
 
 import (
+	// Será usado em etapas futuras
+	"math"
 	"sync"
 	"time"
 
@@ -27,18 +29,29 @@ var DefaultStatusCodesToBlock = []int{429} // Primarily 429 for standby
 // DefaultStatusCodesToBlockOnError lists HTTP status codes that, if an error also occurs, trigger a domain cooldown.
 var DefaultStatusCodesToBlockOnError = []int{} // (formerly from config.StatusCodesToBlockOnError)
 
-// domainState stores the state of a specific domain.
-type domainState struct {
-	lastRequestTime     time.Time     // Timestamp of the last request *allowed* to this domain
-	// blockedUntil        time.Time     // General cooldown, e.g., after consecutive errors (to be refined or replaced by RPS logic)
-	consecutiveFailures int           // Counter for generic errors
-	consecutiveSuccesses int           // New: Counter for successful requests
-	transientErrorCount  int           // New: Counter for non-critical errors
+// DomainBucket armazena o estado de um domínio específico usando um mecanismo de token bucket.
+type DomainBucket struct {
+	tokens                 float64   // Número atual de tokens disponíveis
+	lastRefillTime         time.Time // Última vez que os tokens foram reabastecidos
+	refillRate             float64   // Tokens adicionados por segundo (derivado de MaxTargetRPS)
+	maxTokens              float64   // Capacidade máxima do bucket (derivado de MaxTargetRPS)
+	lastRequestTime        time.Time // Timestamp da última requisição permitida para este domínio
 
-	// Fields for dynamic rate limiting and standby
-	TargetRPS             float64       // Current target requests per second
-	StandbyUntil          time.Time     // If domain is in forced standby (e.g., after 429)
-	CurrentStandbyDuration time.Duration // Duration for the *next* standby period
+	// Campos para standby explícito
+	standbyUntil           time.Time     // Se o domínio está em cooldown forçado (ex: após 429)
+	currentStandbyDuration time.Duration // Duração para o *próximo* período de standby
+}
+
+// refill atualiza os tokens no bucket com base no tempo passado desde a última recarga.
+func (b *DomainBucket) refill() {
+	now := time.Now()
+	elapsed := now.Sub(b.lastRefillTime)
+	if elapsed <= 0 {
+		return
+	}
+	tokensToAdd := elapsed.Seconds() * b.refillRate
+	b.tokens = math.Min(b.maxTokens, b.tokens+tokensToAdd)
+	b.lastRefillTime = now // Atualiza o tempo da última recarga, mesmo que tokensToAdd seja 0.
 }
 
 // DomainManager manages state and policies per domain,
@@ -47,7 +60,7 @@ type domainState struct {
 type DomainManager struct {
 	config       *config.Config // To read MinRequestDelayMs, DomainCooldownMs, DelayMs
 	logger       utils.Logger
-	domainStatus map[string]*domainState
+	domainStatus map[string]*DomainBucket
 	mu           sync.Mutex // Changed to sync.Mutex for simplicity with Lock/Unlock pattern
 }
 
@@ -56,191 +69,147 @@ func NewDomainManager(cfg *config.Config, logger utils.Logger) *DomainManager {
 	return &DomainManager{
 		config:       cfg,
 		logger:       logger,
-		domainStatus: make(map[string]*domainState),
+		domainStatus: make(map[string]*DomainBucket),
 	}
 }
 
-// getOrCreateDomainState retrieves or creates the state for a domain.
+// getOrCreateDomainBucket retrieves or creates the state for a domain.
 // Assumes the caller holds the lock.
-func (dm *DomainManager) getOrCreateDomainState(domain string) *domainState {
-	ds, exists := dm.domainStatus[domain]
+func (dm *DomainManager) getOrCreateDomainBucket(domain string) *DomainBucket {
+	bucket, exists := dm.domainStatus[domain]
 	if !exists {
-		ds = &domainState{
-			TargetRPS:             dm.config.InitialTargetRPS,      // Use config value
-			CurrentStandbyDuration: dm.config.InitialStandbyDuration, // Use config value
-			consecutiveSuccesses:  0,
-			transientErrorCount:   0, // Initialize new field
+		targetRate := dm.config.MaxTargetRPS
+		if targetRate <= 0 { // Se -l 0 ou não especificado, usa o default interno.
+			targetRate = config.DefaultMaxInternalRPS 
+			if dm.config.VerbosityLevel >= 2 {
+				dm.logger.Debugf("[DomainManager] MaxTargetRPS para '%s' não especificado (-l <= 0), usando DefaultMaxInternalRPS: %.2f req/s", domain, targetRate)
+			}
 		}
-		dm.domainStatus[domain] = ds
+		if targetRate <= 0 { // Fallback adicional se DefaultMaxInternalRPS também for zero (improvável mas seguro)
+		    targetRate = 1.0 // Garante uma taxa mínima positiva
+		    dm.logger.Warnf("[DomainManager] TargetRate para '%s' resultou em zero ou negativo, usando fallback de 1.0 req/s", domain)
+		}
+
+
+		bucket = &DomainBucket{
+			tokens:                 targetRate, // Começa com o balde cheio
+			maxTokens:              targetRate,
+			refillRate:             targetRate,
+			lastRefillTime:         time.Now(),
+			standbyUntil:           time.Time{}, // Zero value, não em standby
+			currentStandbyDuration: dm.config.InitialStandbyDuration,
+			lastRequestTime:        time.Time{}, // Inicializa lastRequestTime
+		}
+		dm.domainStatus[domain] = bucket
 		if dm.config.VerbosityLevel >= 2 { // -vv
-			dm.logger.Debugf("[DomainManager] Initialized state for domain '%s' with TargetRPS: %.2f, InitialStandby: %s", 
-				domain, ds.TargetRPS, ds.CurrentStandbyDuration)
+			dm.logger.Debugf("[DomainManager] Initialized bucket for domain '%s': MaxTokens=%.2f, RefillRate=%.2f/s, InitialStandbyDuration=%s",
+				domain, bucket.maxTokens, bucket.refillRate, bucket.currentStandbyDuration)
 		}
 	}
-	return ds
+	return bucket
 }
 
-// CanRequest checks if a request can be made to a domain.
+// CanRequest checks if a request can be made to a domain based on standby status and token availability.
+// If allowed, it consumes a token.
 func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	ds := dm.getOrCreateDomainState(domain) 
+	bucket := dm.getOrCreateDomainBucket(domain)
 	now := time.Now()
 
-	// 1. Check if domain is in forced standby
-	if ds.StandbyUntil.After(now) {
-		waitTime := ds.StandbyUntil.Sub(now)
-		if dm.config.VerbosityLevel >= 1 { // Changed to >=1 for better visibility of standby
-			dm.logger.Infof("[DomainManager] Domain '%s' in STANDBY. Waiting for %s. (StandbyUntil: %s)", 
-				domain, waitTime, ds.StandbyUntil.Format(time.RFC3339))
+	// 1. Verificar standby explícito
+	if bucket.standbyUntil.After(now) {
+		waitTime := bucket.standbyUntil.Sub(now)
+		if dm.config.VerbosityLevel >= 1 {
+			dm.logger.Infof("[DomainManager] Domain '%s' in STANDBY. Waiting for %s. (StandbyUntil: %s)",
+				domain, waitTime, bucket.standbyUntil.Format(time.RFC3339))
 		}
 		return false, waitTime
 	}
 
-	// 2. Check rate limiting based on TargetRPS
-	if ds.TargetRPS <= 0 { // Safety check for TargetRPS
-		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' TargetRPS was %.2f. Resetting to MinTargetRPS (%.2f).", domain, ds.TargetRPS, dm.config.MinTargetRPS)
-		ds.TargetRPS = dm.config.MinTargetRPS
+	// 2. Reabastecer tokens
+	bucket.refill() 
+
+	// 3. Verificar disponibilidade de tokens
+	if bucket.tokens >= 1.0 {
+		bucket.tokens-- // Consome um token
+		if dm.config.VerbosityLevel >= 2 {
+			dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. Token consumed. Tokens remaining: %.2f. RefillRate: %.2f/s",
+				domain, bucket.tokens, bucket.refillRate)
+		}
+		return true, 0
 	}
-	if ds.TargetRPS < dm.config.MinTargetRPS { // Ensure it respects MinTargetRPS from config
-		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' TargetRPS (%.2f) was below configured MinTargetRPS (%.2f). Corrected.", domain, ds.TargetRPS, dm.config.MinTargetRPS)
-		ds.TargetRPS = dm.config.MinTargetRPS
+
+	// Sem tokens, calcular tempo de espera para o próximo token
+	var waitTime time.Duration
+	if bucket.refillRate > 0 {
+		neededTokens := 1.0 - bucket.tokens // Quantos tokens (ou fração) faltam para chegar a 1.0
+		if neededTokens <= 0 { neededTokens = 1.0 } // Garante que esperamos por pelo menos 1 token se os tokens forem >= 0 mas < 1
+		waitTime = time.Duration(neededTokens/bucket.refillRate*float64(time.Second)) + 1*time.Millisecond // Pequeno buffer para garantir que o token esteja disponível
+	} else {
+		waitTime = time.Hour // Fallback para taxa de recarga zero
+		dm.logger.Warnf("[DomainManager] Domain '%s' has zero refillRate. Wait time set to 1 hour.", domain)
 	}
 	
-	requiredDelay := time.Duration(1.0/ds.TargetRPS * float64(time.Second))
-	if !ds.lastRequestTime.IsZero() {
-		timeSinceLastRequest := now.Sub(ds.lastRequestTime)
-		if timeSinceLastRequest < requiredDelay {
-			waitTime := requiredDelay - timeSinceLastRequest
-			if dm.config.VerbosityLevel >= 1 { // Changed to >=1 for RPS limit waits
-				dm.logger.Infof("[DomainManager] Domain '%s' TargetRPS limit (%.2f req/s => %.3fs delay) not met. LastReq: %.3fs ago. Waiting for %s.", 
-					domain, ds.TargetRPS, requiredDelay.Seconds(), timeSinceLastRequest.Seconds(), waitTime)
-			}
-			return false, waitTime
-		}
+	if dm.config.VerbosityLevel >= 1 { 
+		dm.logger.Infof("[DomainManager] Domain '%s' NO token available (%.2f tokens). RefillRate: %.2f/s. Waiting for %s.",
+			domain, bucket.tokens, bucket.refillRate, waitTime)
 	}
-
-	if dm.config.VerbosityLevel >= 2 {
-		dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. TargetRPS: %.2f. LastReq: %s. Now: %s", 
-			domain, ds.TargetRPS, ds.lastRequestTime.Format(time.RFC3339), now.Format(time.RFC3339))
-	}
-	return true, 0
+	return false, waitTime
 }
 
-// RecordRequestSent updates the timestamp of the last request *allowed* for the domain.
+// RecordRequestSent atualiza o timestamp da última requisição para o domínio.
+// Com a lógica de token bucket, o papel principal desta função é registrar o tempo.
+// O consumo do "direito" de fazer a requisição (token) já ocorreu em CanRequest.
 func (dm *DomainManager) RecordRequestSent(domain string) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
-	ds := dm.getOrCreateDomainState(domain)
-	ds.lastRequestTime = time.Now()
+	bucket := dm.getOrCreateDomainBucket(domain)
+	bucket.lastRequestTime = time.Now() 
 	if dm.config.VerbosityLevel >= 2 { 
-		dm.logger.Debugf("[DomainManager] RecordRequestSent: Domain '%s' lastRequestTime updated to %s", domain, ds.lastRequestTime.Format(time.RFC3339))
+		dm.logger.Debugf("[DomainManager] RecordRequestSent: Domain '%s' lastRequestTime updated to %s. Current tokens: %.2f", 
+			domain, bucket.lastRequestTime.Format(time.RFC3339), bucket.tokens)
 	}
 }
 
-// RecordRequestResult analyzes the result of a request.
+// RecordRequestResult analisa o resultado de uma requisição e atualiza o estado do domínio.
 func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
-	ds := dm.getOrCreateDomainState(domain)
+	bucket := dm.getOrCreateDomainBucket(domain)
 	now := time.Now()
 
-	// Determine the effective maximum RPS for this domain
-	effectiveMaxRPS := config.DefaultMaxInternalRPS // Use internal default (e.g., 30 rps)
-	if dm.config.MaxTargetRPS > 0 { // If user specified a limit via -l
-		effectiveMaxRPS = dm.config.MaxTargetRPS
-	}
-
 	if statusCode == 429 {
-		previousRPS := ds.TargetRPS
-		appliedStandbyDuration := ds.CurrentStandbyDuration
-		ds.StandbyUntil = now.Add(appliedStandbyDuration)
+		appliedStandbyDuration := bucket.currentStandbyDuration
+		bucket.standbyUntil = now.Add(appliedStandbyDuration)
 		
-		newRPS := ds.TargetRPS / 2 // Example: Halve RPS on 429
-		if newRPS < dm.config.MinTargetRPS {
-			newRPS = dm.config.MinTargetRPS
-		}
-		ds.TargetRPS = newRPS
-		ds.consecutiveSuccesses = 0 // Reset successes on 429
-		ds.transientErrorCount = 0 // Reset transient errors on hard block
-		ds.consecutiveFailures = 0 
+		previousTokens := bucket.tokens
+		bucket.tokens = 0 // Zera os tokens para forçar espera pela recarga após o standby.
 
-		if dm.config.VerbosityLevel >= 1 { // -v
-			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Previous RPS: %.2f. New RPS: %.2f. Applying standby for %s until %s.", 
-				domain, previousRPS, ds.TargetRPS, appliedStandbyDuration, ds.StandbyUntil.Format(time.RFC3339))
+		if dm.config.VerbosityLevel >= 1 { 
+			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Tokens zeroed (was %.2f). Applying standby for %s until %s.",
+				domain, previousTokens, appliedStandbyDuration, bucket.standbyUntil.Format(time.RFC3339))
 		}
 		
-		// Increase standby duration for next time, up to MaxStandbyDuration from config
-		ds.CurrentStandbyDuration += dm.config.StandbyDurationIncrement
-		if ds.CurrentStandbyDuration > dm.config.MaxStandbyDuration {
-			ds.CurrentStandbyDuration = dm.config.MaxStandbyDuration
+		bucket.currentStandbyDuration += dm.config.StandbyDurationIncrement
+		if bucket.currentStandbyDuration > dm.config.MaxStandbyDuration {
+			bucket.currentStandbyDuration = dm.config.MaxStandbyDuration
 		}
-		dm.logger.Infof("[DomainManager] Domain '%s' next standby duration for 429s increased to %s.", domain, ds.CurrentStandbyDuration)
-
-		return 
+		dm.logger.Infof("[DomainManager] Domain '%s' next standby duration for 429s increased to %s.", domain, bucket.currentStandbyDuration)
+		return
 	}
 
 	if err != nil {
-		// Log antes de zerar consecutiveSuccesses
 		if dm.config.VerbosityLevel >= 1 {
-			dm.logger.Warnf("[DomainManager] Request error for domain '%s' (Current RPS: %.2f, ConsecutiveSuccesses before reset: %d, TransientErrors: %d/%d): %v.", 
-				domain, ds.TargetRPS, ds.consecutiveSuccesses, ds.transientErrorCount, DefaultTransientErrorThreshold, err)
+			dm.logger.Warnf("[DomainManager] Request error for domain '%s' (Status: %d, Tokens: %.2f, RefillRate: %.2f/s): %v.",
+				domain, statusCode, bucket.tokens, bucket.refillRate, err)
 		}
-		ds.consecutiveFailures++
-		ds.transientErrorCount++
 	} else {
-		// Successful request (non-429 and no network error)
-		ds.consecutiveFailures = 0
-		ds.consecutiveSuccesses++
-
-		if ds.consecutiveSuccesses >= config.DefaultSuccessThreshold {
-			previousRPS := ds.TargetRPS
-			newRPS := ds.TargetRPS + config.DefaultRPSIncrement
-			if newRPS > effectiveMaxRPS {
-				newRPS = effectiveMaxRPS
-			}
-			if newRPS > ds.TargetRPS { 
-				ds.TargetRPS = newRPS
-				ds.consecutiveSuccesses = 0 
-				if dm.config.VerbosityLevel >= 1 {
-					dm.logger.Infof("[DomainManager] Domain '%s' reached %d successes. TargetRPS increased from %.2f to %.2f (Configured Max: %.2f).", 
-						domain, config.DefaultSuccessThreshold, previousRPS, ds.TargetRPS, effectiveMaxRPS)
-				}
-			} else if ds.TargetRPS < effectiveMaxRPS { 
-			    ds.consecutiveSuccesses = 0 
-				if dm.config.VerbosityLevel >= 2 { // Log only if verbose and RPS didn't change but could have
-					dm.logger.Debugf("[DomainManager] Domain '%s' reached %d successes, but TargetRPS already at/near effectiveMaxRPS (%.2f). Resetting success count.", 
-						domain, config.DefaultSuccessThreshold, ds.TargetRPS)
-				}
-			} else { // Already at effectiveMaxRPS
-			    ds.consecutiveSuccesses = 0 // Still reset to require new successes for future adjustments
-			    if dm.config.VerbosityLevel >= 2 {
-			        dm.logger.Debugf("[DomainManager] Domain '%s' reached %d successes. TargetRPS (%.2f) already at effectiveMaxRPS (%.2f). Success count reset.", 
-			            domain, config.DefaultSuccessThreshold, ds.TargetRPS, effectiveMaxRPS)
-			    }
-			}
-		} 
-		
 		if dm.config.VerbosityLevel >= 2 { 
-			dm.logger.Debugf("[DomainManager] Successful request (status: %d) for '%s'. Consecutive successes: %d/%d. Current RPS: %.2f", 
-				statusCode, domain, ds.consecutiveSuccesses, config.DefaultSuccessThreshold, ds.TargetRPS)
+			dm.logger.Debugf("[DomainManager] Successful request (status: %d) for '%s'. Tokens: %.2f. RefillRate: %.2f/s",
+				statusCode, domain, bucket.tokens, bucket.refillRate)
 		}
-	}
-
-	if ds.transientErrorCount >= DefaultTransientErrorThreshold {
-		dm.logger.Warnf("[DomainManager] Domain '%s' reached transient error threshold (%d). Resetting consecutive successes and reducing RPS.", domain, DefaultTransientErrorThreshold)
-		ds.consecutiveSuccesses = 0
-		
-		previousRPS := ds.TargetRPS
-		ds.TargetRPS *= DefaultRPSReductionFactorOnError
-		if ds.TargetRPS < dm.config.MinTargetRPS {
-			ds.TargetRPS = dm.config.MinTargetRPS
-		}
-		if ds.TargetRPS != previousRPS && dm.config.VerbosityLevel >=1 {
-			dm.logger.Infof("[DomainManager] Domain '%s' TargetRPS reduced from %.2f to %.2f due to transient errors.", domain, previousRPS, ds.TargetRPS)
-		}
-		ds.transientErrorCount = 0 // Reset counter after action
 	}
 }
 
@@ -252,18 +221,18 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
-	ds := dm.getOrCreateDomainState(domain)
+	bucket := dm.getOrCreateDomainBucket(domain) 
 	
-	if ds.StandbyUntil.IsZero() || time.Now().After(ds.StandbyUntil) {
+	if bucket.standbyUntil.IsZero() || time.Now().After(bucket.standbyUntil) {
 		if dm.config.VerbosityLevel >= 2 {
 			dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' is NOT in standby.", domain)
 		}
 		return false, time.Time{}
 	}
-	if dm.config.VerbosityLevel >= 1 { // Changed to >=1 for better visibility
-		dm.logger.Infof("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, ds.StandbyUntil.Format(time.RFC3339))
+	if dm.config.VerbosityLevel >= 1 { 
+		dm.logger.Infof("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, bucket.standbyUntil.Format(time.RFC3339))
 	}
-	return true, ds.StandbyUntil
+	return true, bucket.standbyUntil
 }
 
 // GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.

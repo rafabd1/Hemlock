@@ -1,6 +1,7 @@
 package networking
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -41,6 +42,7 @@ type ClientRequestData struct {
 	Method        string
 	Body          []byte // For POST, PUT, etc.
 	CustomHeaders http.Header
+	Ctx           context.Context
 }
 
 // ClientResponseData holds the outcome of an HTTP request.
@@ -157,7 +159,18 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 			time.Sleep(delay)
 		}
 
-		req, err := http.NewRequest(reqData.Method, reqData.URL, strings.NewReader(string(reqData.Body)))
+		var req *http.Request
+		var err error
+
+		// Usar contexto se disponível
+		if reqData.Ctx != nil {
+			req, err = http.NewRequestWithContext(reqData.Ctx, reqData.Method, reqData.URL, strings.NewReader(string(reqData.Body)))
+		} else {
+			// Fallback para o caso de Ctx não ser fornecido (idealmente, deve ser sempre fornecido)
+			c.logger.Warnf("[Client] Performing request for %s without context. Consider passing a context.", reqData.URL)
+			req, err = http.NewRequest(reqData.Method, reqData.URL, strings.NewReader(string(reqData.Body)))
+		}
+		
 		if err != nil {
 			finalRespData.Error = fmt.Errorf("failed to create request for %s: %w", reqData.URL, err)
 			continue 
