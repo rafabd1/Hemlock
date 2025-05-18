@@ -106,12 +106,49 @@ func IsCacheable(resp *http.Response) bool {
 		return false
 	}
 
+	// Se Cache-Control: public está presente, é explicitamente cacheável.
+	if ccHeader != "" {
+		directives := strings.Split(ccHeader, ",")
+		for _, directive := range directives {
+			d := strings.ToLower(strings.TrimSpace(directive))
+			if d == "public" {
+				return true // Explicitamente cacheável por "public"
+			}
+			// Se max-age > 0, já é tratado acima e não retornaria false.
+			// Se s-maxage > 0, também indica cacheabilidade por caches compartilhados.
+			if strings.HasPrefix(d, "s-maxage=") {
+				if parts := strings.Split(d, "="); len(parts) == 2 {
+					if parts[1] != "0" { // s-maxage > 0
+						return true
+					}
+				}
+			}
+		}
+	}
+	// Se Expires válido e no futuro, já é tratado acima e não retornaria false.
 
-	// Default to true if no explicit non-cacheable directives are found.
-	// This assumes that if a response doesn't say "don't cache", it might be cached by some intermediary proxy,
-	// especially if it has cache-friendly status codes (200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501).
-	// A more advanced version could also check the status code.
-	return true
+	// Se não há diretivas explícitas proibindo E NEM PERMITINDO explicitamente o cache,
+	// então a cacheabilidade depende do código de status.
+	switch resp.StatusCode {
+	case http.StatusOK, // 200
+		http.StatusNonAuthoritativeInfo, // 203
+		http.StatusNoContent,            // 204 - Cacheável, mas sem corpo.
+		http.StatusPartialContent,       // 206
+		http.StatusMultipleChoices,      // 300
+		http.StatusMovedPermanently,     // 301
+		http.StatusNotFound,             // 404
+		http.StatusMethodNotAllowed,     // 405
+		http.StatusGone,                 // 410
+		http.StatusRequestURITooLong,    // 414
+		http.StatusNotImplemented:       // 501
+		return true // Estes são implicitamente cacheáveis por padrão se não houver outras restrições.
+	default:
+		// Outros códigos de status (ex: 403, 400, 500, 502, 503, 504) não são cacheáveis por padrão
+		// a menos que explicitamente permitido por Cache-Control (max-age, public, s-maxage) ou Expires.
+		// Como já verificamos essas permissões explícitas acima, se chegamos aqui com um status code
+		// não listado acima, ele não é cacheável por padrão.
+		return false
+	}
 }
 
 // BodyContains checks if a substring is present in a byte slice (e.g., response body).
