@@ -48,6 +48,11 @@ type Config struct {
 
 	// New field for insecure skip verify
 	InsecureSkipVerify bool // New: For --insecure flag
+
+	// New fields for DomainConductor specific delays
+	ConductorMinPositiveRetryDelayAfter429 time.Duration `mapstructure:"conductor-min-positive-retry-delay-after-429"`
+	ConductorInitialRetryDelay             time.Duration `mapstructure:"conductor-initial-retry-delay"`
+	ConductorMaxRetryBackoff               time.Duration `mapstructure:"conductor-max-retry-backoff"`
 }
 
 // ProxyEntry holds the parsed information for a single proxy.
@@ -135,6 +140,11 @@ func GetDefaultConfig() *Config {
 
 		// Defaults for new field for insecure skip verify
 		InsecureSkipVerify: false, // Default for new --insecure flag
+
+		// Defaults for DomainConductor delays
+		ConductorMinPositiveRetryDelayAfter429: 100 * time.Millisecond,
+		ConductorInitialRetryDelay:             1 * time.Second,
+		ConductorMaxRetryBackoff:               30 * time.Second,
 	}
 }
 
@@ -252,6 +262,20 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxTargetRPS < 0 {
 		return fmt.Errorf("rate-limit (MaxTargetRPS) cannot be negative")
+	}
+
+	// Validations for DomainConductor delays
+	if c.ConductorMinPositiveRetryDelayAfter429 <= 0 {
+		return fmt.Errorf("conductorMinPositiveRetryDelayAfter429 must be positive")
+	}
+	if c.ConductorInitialRetryDelay <= 0 {
+		return fmt.Errorf("conductorInitialRetryDelay must be positive")
+	}
+	if c.ConductorMaxRetryBackoff <= 0 {
+		return fmt.Errorf("conductorMaxRetryBackoff must be positive")
+	}
+	if c.ConductorMaxRetryBackoff < c.ConductorInitialRetryDelay {
+		return fmt.Errorf("conductorMaxRetryBackoff must be greater than or equal to conductorInitialRetryDelay")
 	}
 
 	// Validate output format

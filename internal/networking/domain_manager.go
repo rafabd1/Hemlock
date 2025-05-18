@@ -85,36 +85,36 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 
-	ds := dm.getOrCreateDomainState(domain)
+	ds := dm.getOrCreateDomainState(domain) 
 	now := time.Now()
 
 	// 1. Check if domain is in forced standby
 	if ds.StandbyUntil.After(now) {
 		waitTime := ds.StandbyUntil.Sub(now)
-		if dm.config.VerbosityLevel >= 1 {
-			dm.logger.Infof("[DomainManager] Domain '%s' in STANDBY. Waiting for %s. (StandbyUntil: %s)",
+		if dm.config.VerbosityLevel >= 1 { // Changed to >=1 for better visibility of standby
+			dm.logger.Infof("[DomainManager] Domain '%s' in STANDBY. Waiting for %s. (StandbyUntil: %s)", 
 				domain, waitTime, ds.StandbyUntil.Format(time.RFC3339))
 		}
 		return false, waitTime
 	}
 
 	// 2. Check rate limiting based on TargetRPS
-	if ds.TargetRPS <= 0 {
+	if ds.TargetRPS <= 0 { // Safety check for TargetRPS
 		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' TargetRPS was %.2f. Resetting to MinTargetRPS (%.2f).", domain, ds.TargetRPS, dm.config.MinTargetRPS)
 		ds.TargetRPS = dm.config.MinTargetRPS
 	}
-	if ds.TargetRPS < dm.config.MinTargetRPS {
+	if ds.TargetRPS < dm.config.MinTargetRPS { // Ensure it respects MinTargetRPS from config
 		dm.logger.Warnf("[DomainManager] CanRequest: Domain '%s' TargetRPS (%.2f) was below configured MinTargetRPS (%.2f). Corrected.", domain, ds.TargetRPS, dm.config.MinTargetRPS)
 		ds.TargetRPS = dm.config.MinTargetRPS
 	}
-
+	
 	requiredDelay := time.Duration(1.0/ds.TargetRPS * float64(time.Second))
 	if !ds.lastRequestTime.IsZero() {
 		timeSinceLastRequest := now.Sub(ds.lastRequestTime)
 		if timeSinceLastRequest < requiredDelay {
 			waitTime := requiredDelay - timeSinceLastRequest
-			if dm.config.VerbosityLevel >= 1 {
-				dm.logger.Infof("[DomainManager] Domain '%s' TargetRPS limit (%.2f req/s => %.3fs delay) not met. LastReq: %.3fs ago. Waiting for %s.",
+			if dm.config.VerbosityLevel >= 1 { // Changed to >=1 for RPS limit waits
+				dm.logger.Infof("[DomainManager] Domain '%s' TargetRPS limit (%.2f req/s => %.3fs delay) not met. LastReq: %.3fs ago. Waiting for %s.", 
 					domain, ds.TargetRPS, requiredDelay.Seconds(), timeSinceLastRequest.Seconds(), waitTime)
 			}
 			return false, waitTime
@@ -122,7 +122,7 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 	}
 
 	if dm.config.VerbosityLevel >= 2 {
-		dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. TargetRPS: %.2f. LastReq: %s. Now: %s",
+		dm.logger.Debugf("[DomainManager] CanRequest: Domain '%s' ALLOWED. TargetRPS: %.2f. LastReq: %s. Now: %s", 
 			domain, ds.TargetRPS, ds.lastRequestTime.Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 	return true, 0
@@ -264,45 +264,6 @@ func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 		dm.logger.Infof("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, ds.StandbyUntil.Format(time.RFC3339))
 	}
 	return true, ds.StandbyUntil
-}
-
-// GetNextAvailableTime calculates the earliest time a request can be sent to the domain.
-// It considers both standby and RPS limits.
-func (dm *DomainManager) GetNextAvailableTime(domain string) time.Time {
-	dm.mu.Lock()
-	defer dm.mu.Unlock()
-
-	ds := dm.getOrCreateDomainState(domain)
-	now := time.Now()
-
-	var rpsNextAvailableTime time.Time
-	if ds.TargetRPS <= 0 { // Safety for RPS, should be caught by CanRequest corrections too
-		// If RPS is invalid, assume it can be tried now, relying on CanRequest/RecordRequestResult to fix RPS.
-		// Or, more conservatively, set a small default delay.
-		rpsNextAvailableTime = now // Or now.Add(smallDefaultDelayIfRPSError)
-	} else {
-		requiredDelay := time.Duration(1.0/ds.TargetRPS * float64(time.Second))
-		if ds.lastRequestTime.IsZero() {
-			rpsNextAvailableTime = now // No previous request, can go now (from RPS perspective)
-		} else {
-			rpsNextAvailableTime = ds.lastRequestTime.Add(requiredDelay)
-		}
-	}
-
-	// Consider standby time
-	standbyNextAvailableTime := ds.StandbyUntil // This is already an absolute time
-
-	// The domain is available at the LATER of these two times
-	nextAvailable := rpsNextAvailableTime
-	if standbyNextAvailableTime.After(rpsNextAvailableTime) {
-		nextAvailable = standbyNextAvailableTime
-	}
-
-	// If the calculated nextAvailable is in the past, it means it's available now.
-	if nextAvailable.Before(now) {
-		return now
-	}
-	return nextAvailable
 }
 
 // GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.
