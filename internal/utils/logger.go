@@ -158,7 +158,7 @@ func (l *defaultLogger) Infof(format string, v ...interface{}) {
 		return
 	}
 	if l.logLevel <= LevelInfo {
-		l.logInternal(l.infoLogger, "INFO ", colorGreen, format, v...)
+		l.logInternal(l.infoLogger, "INFO", colorGreen, format, v...)
 	}
 }
 
@@ -167,7 +167,7 @@ func (l *defaultLogger) Warnf(format string, v ...interface{}) {
 		return
 	}
 	if l.logLevel <= LevelWarn {
-		l.logInternal(l.warnLogger, "WARN ", colorYellow, format, v...)
+		l.logInternal(l.warnLogger, "WARN", colorYellow, format, v...)
 	}
 }
 

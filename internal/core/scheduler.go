@@ -1,6 +1,7 @@
 package core
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"math"
@@ -35,6 +36,60 @@ type ScanTaskResult struct {
 	Finding *report.Finding // nil if no finding
 	Error   error
 }
+
+// HeapItem representa um item na priority queue (min-heap) do jobFeederLoop.
+// Contém o job e o tempo para sua próxima tentativa, usado para priorização.
+// Index é necessário para heap.Fix e heap.Remove.
+type HeapItem struct {
+	Job           TargetURLJob
+	NextAttemptAt time.Time // Prioridade do heap, quanto menor (mais cedo), maior a prioridade
+	Index         int       // O índice do item na heap.
+}
+
+// JobPriorityQueue implementa heap.Interface para HeapItems.
+// É um min-heap baseado em NextAttemptAt.
+type JobPriorityQueue []*HeapItem
+
+func (pq JobPriorityQueue) Len() int { return len(pq) }
+
+func (pq JobPriorityQueue) Less(i, j int) bool {
+	// Queremos Pop para nos dar o menor (mais antigo) NextAttemptAt.
+	return pq[i].NextAttemptAt.Before(pq[j].NextAttemptAt)
+}
+
+func (pq JobPriorityQueue) Swap(i, j int) {
+	pq[i], pq[j] = pq[j], pq[i]
+	pq[i].Index = i
+	pq[j].Index = j
+}
+
+// Push adiciona um HeapItem à fila.
+func (pq *JobPriorityQueue) Push(x interface{}) {
+	n := len(*pq)
+	item := x.(*HeapItem)
+	item.Index = n
+	*pq = append(*pq, item)
+}
+
+// Pop remove e retorna o HeapItem com a menor NextAttemptAt (maior prioridade) da fila.
+func (pq *JobPriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil  // Evita memory leak
+	item.Index = -1 // for safety
+	*pq = old[0 : n-1]
+	return item
+}
+
+// update modifica a prioridade e o valor de um HeapItem na fila.
+// Não é diretamente usado pelo jobFeederLoop atual, mas é uma função padrão para heaps.
+// func (pq *JobPriorityQueue) update(item *HeapItem, job TargetURLJob, nextAttemptAt time.Time) {
+// 	heap.Remove(pq, item.Index)
+// 	item.Job = job
+// 	item.NextAttemptAt = nextAttemptAt
+// 	heap.Push(pq, item)
+// }
 
 // Scheduler orchestrates the scanning process.
 // It manages target URLs, headers to test, concurrency, and coordinates
@@ -226,86 +281,175 @@ func (s *Scheduler) StartScan() []*report.Finding {
 }
 
 // jobFeederLoop é uma goroutine que pega jobs da pendingJobsQueue,
-// espera por job.NextAttemptAt se necessário, e então envia para workerJobQueue.
+// espera por job.NextAttemptAt se necessário (usando um min-heap),
+// verifica a permissão do DomainManager, e então envia para workerJobQueue.
 func (s *Scheduler) jobFeederLoop() {
 	defer s.wg.Done()
-	defer close(s.workerJobQueue) 
+	defer close(s.workerJobQueue)
 
 	if s.config.VerbosityLevel >= 1 {
 		s.logger.Infof("[JobFeeder] Started.")
 	}
 
+	waitingJobsHeap := new(JobPriorityQueue)
+	heap.Init(waitingJobsHeap)
+
+	var timer *time.Timer
+	scheduleNextWakeup := func() {
+		if timer != nil {
+			timer.Stop() // Parar timer anterior para evitar que dispare desnecessariamente
+		}
+		if waitingJobsHeap.Len() == 0 {
+			// Nenhum job esperando, não precisa de timer por enquanto.
+			// O loop será acordado por novos jobs da pendingJobsQueue ou pelo s.ctx.Done().
+			if s.config.VerbosityLevel >= 2 {
+				s.logger.Debugf("[JobFeeder] Heap is empty. Timer not set.")
+			}
+			return
+		}
+
+		nextJobTime := (*waitingJobsHeap)[0].NextAttemptAt
+		waitTime := time.Until(nextJobTime)
+
+		if waitTime <= 0 {
+			// O próximo job já está pronto ou deveria estar.
+			// Disparar imediatamente (ou quase) para processá-lo.
+			// Usar um timer pequeno para evitar busy-loop, mas permitir processamento imediato.
+			waitTime = 1 * time.Millisecond 
+			if s.config.VerbosityLevel >= 2 {
+				s.logger.Debugf("[JobFeeder] Next job in heap is ready or past due. Setting short timer.")
+			}
+		} else {
+			if s.config.VerbosityLevel >= 2 {
+				s.logger.Debugf("[JobFeeder] Next job in heap at %s. Setting timer for %s.", nextJobTime.Format(time.RFC3339), waitTime)
+			}
+		}
+		timer = time.NewTimer(waitTime)
+	}
+	defer func() { // Garante que o timer seja parado se o loop sair
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	scheduleNextWakeup() // Agendar o primeiro wakeup (se houver algo no heap, o que não haverá inicialmente)
+
 	for {
+		var timerChan <-chan time.Time
+		if timer != nil {
+			timerChan = timer.C
+		}
+
 		select {
 		case job, ok := <-s.pendingJobsQueue:
-			if !ok { 
+			if !ok { // pendingJobsQueue foi fechada
 				if s.config.VerbosityLevel >= 1 {
-					s.logger.Infof("[JobFeeder] pendingJobsQueue closed. Exiting loop.")
+					s.logger.Infof("[JobFeeder] pendingJobsQueue closed. Processing remaining jobs in heap and exiting.")
 				}
-				return 
-			}
-
-			now := time.Now()
-			if now.Before(job.NextAttemptAt) {
-				waitTime := job.NextAttemptAt.Sub(now)
-				if s.config.VerbosityLevel >= 2 { // -vv
-					s.logger.Debugf("[JobFeeder] Job %s (for %s) needs to wait %s (until %s). Sleeping.", 
-						job.URLString, job.BaseDomain, waitTime, job.NextAttemptAt.Format(time.RFC3339))
-				}
-				select {
-				case <-time.After(waitTime):
-					// Continuar para enviar para workerJobQueue
-				case <-s.ctx.Done():
-					if s.config.VerbosityLevel >= 1 {
-						s.logger.Infof("[JobFeeder] Scheduler context done while job %s was sleeping for NextAttemptAt. Discarding and decrementing active jobs.", job.URLString)
+				// Processar o que resta no heap antes de sair
+				for waitingJobsHeap.Len() > 0 {
+					item := heap.Pop(waitingJobsHeap).(*HeapItem)
+					if time.Now().Before(item.NextAttemptAt) {
+						// Se o job ainda não está pronto, esperar por ele.
+						// Ou, alternativamente, descartar se o contexto estiver feito.
+						select {
+						case <-time.After(time.Until(item.NextAttemptAt)):
+						case <-s.ctx.Done():
+							s.logger.Infof("[JobFeeder] Context done while draining heap (job %s). Discarding.", item.Job.URLString)
+							s.decrementActiveJobs()
+							continue
+						}
 					}
-					s.decrementActiveJobs() // DECREMENTAR AQUI (Cenário A)
-					continue 
+					s.trySendToWorkerOrRequeue(item.Job, waitingJobsHeap)
 				}
+				return // Sai do jobFeederLoop
 			}
 
 			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[JobFeeder] Attempting to send job %s (for %s) to workerJobQueue.", job.URLString, job.BaseDomain)
+				s.logger.Debugf("[JobFeeder] Received job %s (for %s, next attempt at %s) from pendingJobsQueue. Adding to heap.",
+					job.URLString, job.BaseDomain, job.NextAttemptAt.Format(time.RFC3339))
 			}
+			heap.Push(waitingJobsHeap, &HeapItem{Job: job, NextAttemptAt: job.NextAttemptAt})
+			scheduleNextWakeup()
 
-			jobSentToWorker := false
-			for !jobSentToWorker {
-				// Verificar s.ctx.Done() antes de tentar enviar para workerJobQueue para evitar bloqueio se o scheduler já parou.
-				select {
-				case <-s.ctx.Done():
-					if s.config.VerbosityLevel >= 1 {
-						s.logger.Infof("[JobFeeder] Scheduler context done. Job %s (from pending) not sent to workers. Decrementing active jobs. Exiting loop.", job.URLString)
-					}
-					s.decrementActiveJobs() // DECREMENTAR AQUI (Cenário B) - se o job não foi enviado
-					return // Termina o jobFeederLoop
-				default:
-					// Contexto não cancelado, tentar enviar para workerJobQueue
-				}
-
-				select {
-				case s.workerJobQueue <- job:
-					jobSentToWorker = true
-					if s.config.VerbosityLevel >= 2 { // -vv
-						s.logger.Debugf("[JobFeeder] Job %s sent to workerJobQueue.", job.URLString)
-					}
-				case <-s.ctx.Done(): // Dupla checagem, caso o contexto seja cancelado enquanto esperamos s.workerJobQueue
-					if s.config.VerbosityLevel >= 1 {
-						s.logger.Infof("[JobFeeder] Scheduler context done while attempting to send job %s to workerJobQueue. Decrementing active jobs. Exiting loop.", job.URLString)
-					}
-					s.decrementActiveJobs() // DECREMENTAR AQUI (Cenário B) - se o job não foi enviado
-					return // Termina o jobFeederLoop
-				// Não colocar 'default' aqui para que o send para workerJobQueue possa bloquear se estiver cheio (o que é o comportamento desejado pelo feeder)
-				// No entanto, o s.ctx.Done() acima deve capturar o cancelamento do scheduler.
-				// Se workerJobQueue está cheia e o scheduler não está parando, o feeder espera.
-				}
+		case <-timerChan:
+			if s.config.VerbosityLevel >= 2 {
+				s.logger.Debugf("[JobFeeder] Timer fired. Processing ready jobs from heap.")
 			}
+			for waitingJobsHeap.Len() > 0 && !(*waitingJobsHeap)[0].NextAttemptAt.After(time.Now()) {
+				item := heap.Pop(waitingJobsHeap).(*HeapItem)
+				s.trySendToWorkerOrRequeue(item.Job, waitingJobsHeap)
+			}
+			scheduleNextWakeup()
 
 		case <-s.ctx.Done():
 			if s.config.VerbosityLevel >= 1 {
 				s.logger.Infof("[JobFeeder] Scheduler context done. Exiting loop.")
 			}
-			return 
+			// Não precisa drenar o heap aqui, pois os jobs ativos já teriam sido decrementados
+			// ou os workers serão interrompidos. Os jobs no heap não foram "pegos" por um worker.
+			// No entanto, é preciso garantir que activeJobs seja decrementado para jobs que estavam no heap
+			// e não chegaram a ser processados.
+			// A lógica de decremento deve ser mais precisa, talvez no momento em que o job é *descartado*.
+			// Por agora, vamos confiar que o decremento ocorre em handleJobOutcome ou se o worker não pega.
+			// Se um job está no heap e o scheduler para, ele não foi realmente "ativo" no sentido de processamento.
+			// A contagem inicial de activeJobs é baseada nos jobs *iniciais totais*.
+			// Se o jobFeeder os descarta antes de ir para um worker, o activeJobs deve ser decrementado.
+
+			// Vamos limpar o heap e decrementar para cada job que estava lá.
+			for waitingJobsHeap.Len() > 0 {
+				item := heap.Pop(waitingJobsHeap).(*HeapItem)
+				s.logger.Infof("[JobFeeder] Context done. Discarding job %s from heap and decrementing active jobs.", item.Job.URLString)
+				s.decrementActiveJobs() // DECREMENTAR AQUI - Job estava no heap, nunca foi para worker
+			}
+			return
 		}
+	}
+}
+
+// trySendToWorkerOrRequeue é um helper para o jobFeederLoop.
+// Tenta obter permissão do DomainManager e enviar para workerJobQueue.
+// Se não for possível, recoloca no heap com um novo NextAttemptAt.
+func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQueue) {
+	can, waitTimeDM := s.domainManager.CanRequest(job.BaseDomain)
+	now := time.Now()
+
+	if can {
+		if s.config.VerbosityLevel >= 2 { // -vv
+			s.logger.Debugf("[JobFeeder] DomainManager allows job %s for %s. Attempting to send to workerJobQueue.", job.URLString, job.BaseDomain)
+		}
+		// Tentar enviar para o workerJobQueue, mas não bloquear indefinidamente.
+		// Usar um select com s.ctx.Done() para permitir cancelamento.
+		select {
+		case s.workerJobQueue <- job:
+			if s.config.VerbosityLevel >= 2 { // -vv
+				s.logger.Debugf("[JobFeeder] Job %s sent to workerJobQueue.", job.URLString)
+			}
+			return // Sucesso
+		case <-s.ctx.Done():
+			if s.config.VerbosityLevel >= 1 {
+				s.logger.Infof("[JobFeeder] Scheduler context done while trying to send job %s to workerJobQueue. Decrementing active jobs.", job.URLString)
+			}
+			s.decrementActiveJobs() // Job não foi enviado, e não será reenfileirado aqui pois o contexto acabou
+			return
+		// Se workerJobQueue estiver cheia, este select bloquearia.
+		// Para evitar bloqueio aqui e tornar o feeder mais responsivo a s.ctx.Done e novos jobs,
+		// podemos usar um send não-bloqueante ou um send com timeout curto.
+		// Se falhar, reenfileiramos no heap.
+		// Exemplo com envio não-bloqueante:
+		// default: 
+		//  s.logger.Warnf("[JobFeeder] workerJobQueue full when trying to send job %s. Re-queuing to heap.", job.URLString)
+		//  job.NextAttemptAt = now.Add(100 * time.Millisecond) // Pequeno delay para tentar novamente
+		//  heap.Push(pq, &HeapItem{Job: job, NextAttemptAt: job.NextAttemptAt})
+		//  return
+		// A abordagem atual de bloqueio no send para workerJobQueue é aceitável se o s.ctx.Done() o interromper.
+		}
+	} else {
+		job.NextAttemptAt = now.Add(waitTimeDM)
+		if s.config.VerbosityLevel >= 1 {
+			s.logger.Infof("[JobFeeder] DomainManager denied job %s for %s. Re-queuing to heap for %s (NextAttemptAt: %s).",
+				job.URLString, job.BaseDomain, waitTimeDM, job.NextAttemptAt.Format(time.RFC3339))
+		}
+		heap.Push(pq, &HeapItem{Job: job, NextAttemptAt: job.NextAttemptAt})
 	}
 }
 
@@ -420,13 +564,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers).", workerID, job.URLString, len(s.config.HeadersToTest))
 		}
 		
-		maxHeadersToTest := 5
-		headersToTest := s.config.HeadersToTest
-		if len(headersToTest) > maxHeadersToTest {
-			s.logger.Infof("[Worker %d] Limiting job %s to first %d headers (of %d total) to prevent blocking.",
-				workerID, job.URLString, maxHeadersToTest, len(headersToTest))
-			headersToTest = headersToTest[:maxHeadersToTest]
-		}
+		headersToTest := s.config.HeadersToTest // Usar todos os headers configurados
 		
 		for i, headerName := range headersToTest {
 			select {
@@ -543,16 +681,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param).", workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest))
 		}
 		
-		maxParamsToTest := 3 
 		paramsToTestKeys := make([]string, 0, len(job.OriginalParams))
 		for paramName := range job.OriginalParams {
 			paramsToTestKeys = append(paramsToTestKeys, paramName)
-		}
-		
-		if len(paramsToTestKeys) > maxParamsToTest {
-			s.logger.Infof("[Worker %d] Limiting job %s to first %d parameters (of %d total) to prevent blocking.",
-				workerID, job.URLString, maxParamsToTest, len(paramsToTestKeys))
-			paramsToTestKeys = paramsToTestKeys[:maxParamsToTest]
 		}
 		
 		for i, paramName := range paramsToTestKeys {

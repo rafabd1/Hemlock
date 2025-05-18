@@ -252,12 +252,3 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 	}
 	return finalRespData
 }
-
-// TODO: Implement GetJSContent(url string) ([]string, error)
-// - This method should fetch a URL, parse the HTML to find <script src="..."> tags
-// - For each src, if it's a relative path, resolve it to an absolute path based on the original URL.
-// - Download the content of each JS script.
-// - Return a list of strings, each string being the content of a JS file.
-// - This method should also use the retry logic.
-
-// Removed loggerIsDebugEnabled as it's better to use c.cfg.VerbosityLevel directly. 
