@@ -489,29 +489,24 @@ func (s *Scheduler) worker(workerID int) {
 // processURLJob is where individual URL processing, baseline requests, and probe tests happen.
 // Agora assume que CanRequest já foi chamado e foi bem-sucedido, e NextAttemptAt já foi verificado.
 func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
-	jobCtx, cancelJob := context.WithTimeout(context.Background(), s.config.RequestTimeout*5)
+	// jobCtx é derivado do contexto do scheduler (s.ctx).
+	// O job será cancelado se o scheduler parar ou se as retentativas se esgotarem.
+	jobCtx, cancelJob := context.WithCancel(s.ctx) // Usar WithCancel em vez de WithTimeout
 	defer cancelJob()
 
 	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d)", workerID, job.URLString, job.Retries+1)
+		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d). Job context linked to scheduler context.", workerID, job.URLString, job.Retries+1)
 	}
-
-	processingTimeout := time.AfterFunc(s.config.RequestTimeout*4, func() {
-		s.logger.Warnf("[Worker %d] HARD TIMEOUT for %s. Job has been running too long (over %s). Aborting via cancelJob().",
-			workerID, job.URLString, (s.config.RequestTimeout * 4).String())
-		cancelJob()
-	})
-	defer processingTimeout.Stop()
-
-	// Lógica de CanRequest será movida para a função worker ANTES desta chamada.
-	// Por enquanto, o performRequestWithDomainManagement ainda tem o RecordRequestSent/Result.
 
 	s.logger.Debugf("[Worker %d] Job %s: Performing baseline request...", workerID, job.URLString)
 	baselineStartTime := time.Now()
-	// s.domainManager.RecordRequestSent(job.BaseDomain) // Esta chamada está DENTRO de performRequestWithDomainManagement
-	baselineReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: jobCtx}
+
+	// Timeout para a requisição individual
+	reqCtxBaseline, cancelReqBaseline := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+	baselineReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxBaseline}
 	baselineRespData := s.performRequestWithDomainManagement(job.BaseDomain, baselineReqData)
-	// s.domainManager.RecordRequestResult(...) // Esta chamada está DENTRO de performRequestWithDomainManagement
+	cancelReqBaseline() // Cancelar contexto da requisição individual
+
 	baselineDuration := time.Since(baselineStartTime)
 	s.logger.Debugf("[Worker %d] Job %s: Baseline request completed in %s. Status: %s, Error: %v",
 		workerID, job.URLString, baselineDuration, getStatus(baselineRespData.Response), baselineRespData.Error)
@@ -519,7 +514,6 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	select {
 	case <-jobCtx.Done():
 		s.logger.Warnf("[Worker %d] Job for %s aborted (context done after baseline call, reason: %v).", workerID, job.URLString, jobCtx.Err())
-		// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted after baseline: %w", jobCtx.Err()), 0)
 		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted after baseline: %w", jobCtx.Err()), 0) // Nova função
 		return
 	default:
@@ -590,8 +584,13 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			probeAStartTime := time.Now()
 			injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + headerName)
 			probeAReqHeaders := http.Header{headerName: []string{injectedValue}}
-			probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders, Ctx: jobCtx}
+
+			// Timeout para a requisição individual
+			reqCtxProbeA, cancelReqProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+			probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders, Ctx: reqCtxProbeA}
 			probeARespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAReqData)
+			cancelReqProbeA() // Cancelar contexto da requisição individual
+
 			probeADuration := time.Since(probeAStartTime)
 			s.logger.Debugf("[Worker %d] Job %s: Probe A for Header '%s' completed in %s. Status: %s, Error: %v",
 				workerID, job.URLString, headerName, probeADuration, getStatus(probeARespData.Response), probeARespData.Error)
@@ -621,8 +620,13 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 
 			s.logger.Debugf("[Worker %d] Job %s: Performing Probe B for Header '%s'...", workerID, job.URLString, headerName)
 			probeBStartTime := time.Now()
-			probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: jobCtx} 
+
+			// Timeout para a requisição individual
+			reqCtxProbeB, cancelReqProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+			probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxProbeB}
 			probeBRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBReqData)
+			cancelReqProbeB() // Cancelar contexto da requisição individual
+
 			probeBDuration := time.Since(probeBStartTime)
 			s.logger.Debugf("[Worker %d] Job %s: Probe B for Header '%s' completed in %s. Status: %s, Error: %v",
 				workerID, job.URLString, headerName, probeBDuration, getStatus(probeBRespData.Response), probeBRespData.Error)
@@ -723,8 +727,12 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 					s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for param test ('%s=%s'): %v. Skipping this param test.", workerID, paramName, paramPayload, errProbeAURL)
 					continue 
 				}
-				probeAParamReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET", Ctx: jobCtx}
+				// Timeout para a requisição individual
+				reqCtxParamProbeA, cancelReqParamProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+				probeAParamReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET", Ctx: reqCtxParamProbeA}
 				probeAParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAParamReqData)
+				cancelReqParamProbeA() // Cancelar contexto da requisição individual
+
 				paramProbeADuration := time.Since(paramProbeAStartTime)
 				s.logger.Debugf("[Worker %d] Job %s: Probe A for Param '%s=%s' completed in %s. Status: %s, Error: %v",
 					workerID, job.URLString, paramName, paramPayload, paramProbeADuration, getStatus(probeAParamRespData.Response), probeAParamRespData.Error)
@@ -754,8 +762,13 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 
 				s.logger.Debugf("[Worker %d] Job %s: Performing Probe B for Param '%s=%s'...", workerID, job.URLString, paramName, paramPayload)
 				paramProbeBStartTime := time.Now()
-				probeBParamReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: jobCtx} 
+
+				// Timeout para a requisição individual
+				reqCtxParamProbeB, cancelReqParamProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+				probeBParamReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxParamProbeB}
 				probeBParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBParamReqData)
+				cancelReqParamProbeB() // Cancelar contexto da requisição individual
+
 				paramProbeBDuration := time.Since(paramProbeBStartTime)
 				s.logger.Debugf("[Worker %d] Job %s: Probe B for Param '%s=%s' completed in %s. Status: %s, Error: %v",
 					workerID, job.URLString, paramName, paramPayload, paramProbeBDuration, getStatus(probeBParamRespData.Response), probeBParamRespData.Error)
