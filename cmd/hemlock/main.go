@@ -49,25 +49,20 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
   # Scan with custom request headers, 5 retries and a 5s timeout:
   hemlock -i http://test.com -H "User-Agent: MyScanner/1.0" -H "Authorization: Bearer xyz" -r 5 -t 5s`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Initialize Viper to read configs, env vars, and flags
 		vp := viper.New()
 		vp.SetEnvPrefix("HEMLOCK")
 		vp.AutomaticEnv()
 		vp.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 
-		// Bind all persistent flags to Viper
 		if err := vp.BindPFlags(cmd.PersistentFlags()); err != nil {
 			return fmt.Errorf("error binding persistent flags to viper: %w", err)
 		}
-		// Bind all local flags (if there are child commands) to Viper
 		if err := vp.BindPFlags(cmd.Flags()); err != nil {
 			return fmt.Errorf("error binding local flags to viper: %w", err)
 		}
 
-		// Populate the cfg struct with values from Viper
-		cfg = *config.GetDefaultConfig() // Start with hardcoded defaults
+		cfg = *config.GetDefaultConfig()
 
-		// --- Populate config from Viper/Flags ---
 		cfg.Input = vp.GetString("input")
 		cfg.CustomHeaders = vp.GetStringSlice("header")
 		cfg.Concurrency = vp.GetInt("concurrency")
@@ -82,30 +77,34 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.Silent = vp.GetBool("silent")
 		cfg.InsecureSkipVerify = vp.GetBool("insecure")
 		cfg.MaxTargetRPS = vp.GetFloat64("rate-limit")
+		cfg.ProbeConcurrency = vp.GetInt("probes")
 
-		// Handle verbosity flags to set both Verbosity (string) and VerbosityLevel (int)
-		verboseFlag, _ := cmd.Flags().GetBool("verbose")       // -v
-		veryVerboseFlag, _ := cmd.Flags().GetBool("vverbose") // -vv (Note: standard is often just two v's for the flag name, e.g. cmd.Flags().Count("v"))
-		                                                    // Let's assume separate flags for now as defined in init()
+		// Lógica de verbosidade revisada
+		verbosityCount, _ := cmd.Flags().GetCount("verbose") // Usar GetCount diretamente do cmd.Flags()
 
 		if cfg.Silent {
-			cfg.VerbosityLevel = -1 // Special level for silent, logger will handle this
-			cfg.Verbosity = "fatal" // Or some equivalent concept for the logger
-		} else if veryVerboseFlag {
-			cfg.VerbosityLevel = 2
-			cfg.Verbosity = "debug"
-		} else if verboseFlag {
-			cfg.VerbosityLevel = 1
-			cfg.Verbosity = "debug" // -v can also map to debug, with level 1 filtering in app
+			cfg.VerbosityLevel = -1
+			cfg.Verbosity = "fatal"
 		} else {
-			cfg.VerbosityLevel = 0  // Default (info)
-			cfg.Verbosity = "info"
+			cfg.VerbosityLevel = verbosityCount
+			switch verbosityCount {
+			case 0:
+				cfg.Verbosity = "info"
+			case 1:
+				cfg.Verbosity = "debug"
+			default: // >= 2
+				cfg.Verbosity = "debug"
+				// Se VerbosityLevel for 2 ou mais, o logger usará isso para mostrar mais detalhes
+				// mantendo a string "debug" para o tipo de log.
+			}
 		}
 
 		// Initialize Logger (after verbosity, noColor and silent are set)
-		logLevel := utils.StringToLogLevel(cfg.Verbosity)
-		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent)
-		
+		logLevel := utils.StringToLogLevel(cfg.Verbosity) // cfg.Verbosity string ainda é usada aqui
+		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent) 
+		// No futuro, NewDefaultLogger poderia aceitar cfg.VerbosityLevel diretamente
+		// para um controle mais granular se "trace" etc., fossem adicionados.
+
 		// --- Process Input (-i, --input) ---
 		if cfg.Input != "" {
 			// Check if input is a file path
@@ -345,34 +344,34 @@ func init() {
 	rootCmd.PersistentFlags().String("output-format", defaults.OutputFormat, "Output format: json or text")
 
 	// Concurrency & Performance
-	rootCmd.PersistentFlags().IntP("concurrency", "c", defaults.Concurrency, "Number of concurrent workers")
+	rootCmd.PersistentFlags().IntP("concurrency", "c", defaults.Concurrency, "Number of concurrent workers (overall URL processing)")
+	rootCmd.PersistentFlags().IntP("probes", "p", defaults.ProbeConcurrency, "Number of concurrent probes (e.g., header/param tests) per URL")
 	rootCmd.PersistentFlags().IntP("timeout", "t", int(defaults.RequestTimeout.Seconds()), "HTTP request timeout in seconds")
 	rootCmd.PersistentFlags().IntP("max-retries", "r", defaults.MaxRetries, "Maximum number of retries per request")
 	rootCmd.PersistentFlags().Float64P("rate-limit", "l", 0.0, "Max requests per second per domain (0 for auto-adjustment)")
 
 	// Security & Verbosity
 	rootCmd.PersistentFlags().Bool("insecure", defaults.InsecureSkipVerify, "Disable TLS certificate verification")
-	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose (debug level 1) logging")
-	rootCmd.PersistentFlags().Bool("vverbose", false, "Enable very verbose (debug level 2) logging (use as -vv)") // Cobra typically handles -vv by Count("v"), this is an alternative
+	rootCmd.PersistentFlags().CountP("verbose", "v", "Verbosity level (-v for debug, -vv for more debug)")
 	rootCmd.PersistentFlags().Bool("no-color", defaults.NoColor, "Disable colors in text output")
 	rootCmd.PersistentFlags().Bool("silent", defaults.Silent, "Suppress all logs except fatal errors and final results (findings)")
 
 	// Proxy
 	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy to use (URL, CSV list, or file path)")
 
-	// Removed flags (placeholders for user information, not to be re-added without discussion):
-	// --targets, -t (replaced by --input, -i)
-	// --targets-file, -f (replaced by --input, -i)
-	// --verbosity, -V (replaced by -v, -vv, --silent)
-	// --payloads (internal logic now)
-	// --payload-prefix (internal logic now)
-	// --delay (internal logic now, part of RPS)
-	// --initial-rps (internal logic now)
-	// --min-rps (internal logic now)
-	// --max-rps (replaced by --rate-limit, -l)
-	// --initial-standby (internal logic now)
-	// --max-standby (internal logic now)
-	// --standby-increment (internal logic now) - This one was not explicitly removed by user, but falls into internal rate control logic
+	// Adicionar descrição para a nova flag de probes
+	if err := rootCmd.PersistentFlags().SetAnnotation("probes", "description", []string{"Number of concurrent probes (e.g., header/param tests) per URL"}); err != nil {
+		// Não usar logger aqui pois ele pode não estar inicializado ainda em init()
+		fmt.Fprintf(os.Stderr, "Warning: Failed to set description for probes flag: %v\n", err)
+	}
+	// Atualizar descrição para a flag de verbosidade (verbose count)
+	if err := rootCmd.PersistentFlags().SetAnnotation("verbose", "description", []string{"Verbosity level (-v for debug, -vv for more debug)"}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to set description for verbose flag: %v\n", err)
+	}
+
+	if err := viper.ReadInConfig(); err == nil {
+		// ... existing code ...
+	}
 }
 
 func main() {

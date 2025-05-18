@@ -53,6 +53,9 @@ type Config struct {
 	ConductorMinPositiveRetryDelayAfter429 time.Duration `mapstructure:"conductor-min-positive-retry-delay-after-429"`
 	ConductorInitialRetryDelay             time.Duration `mapstructure:"conductor-initial-retry-delay"`
 	ConductorMaxRetryBackoff               time.Duration `mapstructure:"conductor-max-retry-backoff"`
+
+	// New field for probe concurrency within a single URL job
+	ProbeConcurrency int `mapstructure:"probe-concurrency"`
 }
 
 // ProxyEntry holds the parsed information for a single proxy.
@@ -145,6 +148,9 @@ func GetDefaultConfig() *Config {
 		ConductorMinPositiveRetryDelayAfter429: 100 * time.Millisecond,
 		ConductorInitialRetryDelay:             1 * time.Second,
 		ConductorMaxRetryBackoff:               30 * time.Second,
+
+		// Default for probe concurrency
+		ProbeConcurrency: 4, // Default number of concurrent probes per URL
 	}
 }
 
@@ -278,6 +284,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("conductorMaxRetryBackoff must be greater than or equal to conductorInitialRetryDelay")
 	}
 
+	if c.ProbeConcurrency <= 0 {
+		return fmt.Errorf("probeConcurrency must be positive")
+	}
+
 	// Validate output format
 	validFormats := map[string]bool{"text": true, "json": true}
 	if _, ok := validFormats[strings.ToLower(c.OutputFormat)]; !ok {
@@ -289,6 +299,6 @@ func (c *Config) Validate() error {
 
 // String (Config method) remains useful for debugging.
 func (c *Config) String() string {
-	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s (Level: %d), MaxRetries: %d, InitialRPS: %.2f, MaxRPS: %.2f",
-		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.VerbosityLevel, c.MaxRetries, c.InitialTargetRPS, c.MaxTargetRPS)
+	return fmt.Sprintf("UserAgent: %s, Timeout: %s, Concurrency: %d, ProbeConcurrency: %d, Targets: %v, HeadersToTest (count): %d, ProxyInput: '%s', Verbosity: %s (Level: %d), MaxRetries: %d, InitialRPS: %.2f, MaxRPS: %.2f",
+		c.UserAgent, c.RequestTimeout.String(), c.Concurrency, c.ProbeConcurrency, c.Targets, len(c.HeadersToTest), c.ProxyInput, c.Verbosity, c.VerbosityLevel, c.MaxRetries, c.InitialTargetRPS, c.MaxTargetRPS)
 } 

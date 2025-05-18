@@ -489,13 +489,28 @@ func (s *Scheduler) worker(workerID int) {
 // processURLJob is where individual URL processing, baseline requests, and probe tests happen.
 // Agora assume que CanRequest já foi chamado e foi bem-sucedido, e NextAttemptAt já foi verificado.
 func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
-	// jobCtx é derivado do contexto do scheduler (s.ctx).
-	// O job será cancelado se o scheduler parar ou se as retentativas se esgotarem.
-	jobCtx, cancelJob := context.WithCancel(s.ctx) // Usar WithCancel em vez de WithTimeout
+	// DEBUG: Log inicial para verificar config dentro do scheduler para este job
+	s.logger.Debugf("[Worker %d] processURLJob START for %s. Scheduler's cfg.VerbosityLevel: %d, len(cfg.HeadersToTest): %d, cfg.ProbeConcurrency: %d", 
+		workerID, job.URLString, s.config.VerbosityLevel, len(s.config.HeadersToTest), s.config.ProbeConcurrency)
+
+	jobCtx, cancelJob := context.WithCancel(s.ctx)
 	defer cancelJob()
 
+	// Semáforo para controlar a concorrência de todas as probes (headers e params) para esta URL.
+	// Só criar se ProbeConcurrency > 0, o que é garantido pela validação da config.
+	var probeSemaphore chan struct{}
+	if s.config.ProbeConcurrency > 0 { // Embora validado, uma checagem extra não faz mal.
+		probeSemaphore = make(chan struct{}, s.config.ProbeConcurrency)
+	} else {
+		// Fallback para concorrência mínima de 1 se por algum motivo chegou aqui com valor inválido.
+		// Isso não deve acontecer devido à config.Validate().
+		s.logger.Warnf("[Worker %d] ProbeConcurrency é <= 0 (%d) para job %s, usando fallback de 1. Isso não deveria acontecer.", workerID, s.config.ProbeConcurrency, job.URLString)
+		probeSemaphore = make(chan struct{}, 1)
+	}
+
 	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d). Job context linked to scheduler context.", workerID, job.URLString, job.Retries+1)
+		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d). Job context linked to scheduler context. Probe concurrency for this job: %d",
+			workerID, job.URLString, job.Retries+1, s.config.ProbeConcurrency)
 	}
 
 	s.logger.Debugf("[Worker %d] Job %s: Performing baseline request...", workerID, job.URLString)
@@ -514,7 +529,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	select {
 	case <-jobCtx.Done():
 		s.logger.Warnf("[Worker %d] Job for %s aborted (context done after baseline call, reason: %v).", workerID, job.URLString, jobCtx.Err())
-		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted after baseline: %w", jobCtx.Err()), 0) // Nova função
+		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted after baseline: %w", jobCtx.Err()), 0)
 		return
 	default:
 	}
@@ -530,295 +545,260 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 		if statusCode == 429 {
 			logMsg += "Domain standby triggered by DM. "
 		}
-		// logMsg += "Handing over to DomainConductor for outcome processing." // Removido
 		
 		if s.config.VerbosityLevel >= 1 {
 			if statusCode == 429 { s.logger.Infof(logMsg) } else { s.logger.Warnf(logMsg) }
 		}
 
-		// s.domainConductor.HandleJobOutcome(job, false, baselineRespData.Error, statusCode)
-		s.handleJobOutcome(job, false, baselineRespData.Error, statusCode) // Nova função
+		s.handleJobOutcome(job, false, baselineRespData.Error, statusCode)
 		return
 	}
 
 	baselineProbe := buildProbeData(job.URLString, baselineReqData, baselineRespData)
 	if baselineProbe.Response == nil { 
 		s.logger.Errorf("[Worker %d] CRITICAL: Baseline Invalid (nil response) for %s. Discarding job.", workerID, job.URLString)
-		// s.domainConductor.DecrementActiveJobsAndSignalCompletion() // Substituído por handleJobOutcome
-		s.handleJobOutcome(job, false, fmt.Errorf("baseline response was nil"), 0) // Considerar como falha
+		s.handleJobOutcome(job, false, fmt.Errorf("baseline response was nil"), 0)
 		return
 	}
 	if s.config.VerbosityLevel >= 2 { 
 		s.logger.Debugf("[Worker %d] Baseline for %s successful. Proceeding to probes.", workerID, job.URLString)
 	}
 
-	// --- Test Headers ---
+	// --- Test Headers --- 
 	if len(s.config.HeadersToTest) > 0 {
-		if s.config.VerbosityLevel >= 2 { 
-			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers).", workerID, job.URLString, len(s.config.HeadersToTest))
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers, %d concurrent probes).", workerID, job.URLString, len(s.config.HeadersToTest), s.config.ProbeConcurrency)
 		}
-		
-		headersToTest := s.config.HeadersToTest // Usar todos os headers configurados
-		
-		for i, headerName := range headersToTest {
+
+		headersToTest := s.config.HeadersToTest
+		var headerWg sync.WaitGroup
+		headerFindingsChan := make(chan *report.Finding, len(headersToTest)) // Buffer para não bloquear envio
+
+		for _, headerName := range headersToTest {
 			select {
 			case <-jobCtx.Done():
-				s.logger.Warnf("[Worker %d] Job for %s aborted (context done before header test %s [%d/%d], reason: %v).",
-					workerID, job.URLString, headerName, i+1, len(headersToTest), jobCtx.Err())
-				// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before header %s: %w", headerName, jobCtx.Err()), 0)
-				s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before header %s: %w", headerName, jobCtx.Err()), 0)
-				return
-			default: 
-			}
-			
-			if s.isSchedulerStopping() { // Renomear para s.isContextDone(jobCtx) ou similar?
-				s.logger.Infof("[Worker %d] Scheduler stopping, aborting further probes for job %s.", workerID, job.URLString)
-				return 
-			}
-
-			if s.config.VerbosityLevel >= 2 { 
-				s.logger.Debugf("[Worker %d] Testing Header '%s' for %s", workerID, headerName, job.URLString)
-			}
-
-			s.logger.Debugf("[Worker %d] Job %s: Performing Probe A for Header '%s'...", workerID, job.URLString, headerName)
-			probeAStartTime := time.Now()
-			injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + headerName)
-			probeAReqHeaders := http.Header{headerName: []string{injectedValue}}
-
-			// Timeout para a requisição individual
-			reqCtxProbeA, cancelReqProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
-			probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders, Ctx: reqCtxProbeA}
-			probeARespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAReqData)
-			cancelReqProbeA() // Cancelar contexto da requisição individual
-
-			probeADuration := time.Since(probeAStartTime)
-			s.logger.Debugf("[Worker %d] Job %s: Probe A for Header '%s' completed in %s. Status: %s, Error: %v",
-				workerID, job.URLString, headerName, probeADuration, getStatus(probeARespData.Response), probeARespData.Error)
-
-			probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
-
-			select {
-			case <-jobCtx.Done():
-				s.logger.Warnf("[Worker %d] Job for %s aborted (context done after header test %s).", 
-					workerID, job.URLString, headerName)
-				// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-				s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-				return
+				s.logger.Warnf("[Worker %d] Job for %s aborted (context done before launching all header tests, reason: %v).",
+					workerID, job.URLString, jobCtx.Err())
+				goto endHeaderTests // Pular para o final dos testes de header
 			default:
 			}
 
-			if probeARespData.Error != nil || statusCodeFromResponse(probeARespData.Response) == 429 {
-				statusCodeProbeA := statusCodeFromResponse(probeARespData.Response)
-				if s.config.VerbosityLevel >= 1 { 
-					s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Handing to outcome processor.", workerID, headerName, job.URLString, statusCodeProbeA, probeARespData.Error)
+			headerWg.Add(1)
+			probeSemaphore <- struct{}{} // Adquire slot no semáforo
+
+			go func(hn string) {
+				defer headerWg.Done()
+				defer func() { <-probeSemaphore }() // Libera slot no semáforo
+
+				if s.isJobContextDone(jobCtx) {
+					s.logger.Debugf("[Worker %d] Job context done before starting header test %s for %s. Skipping.", workerID, hn, job.URLString)
+					return
 				}
-				// s.domainConductor.HandleJobOutcome(job, false, probeARespData.Error, statusCodeProbeA)
-				s.handleJobOutcome(job, false, probeARespData.Error, statusCodeProbeA)
-				return
-			}
 
-
-			s.logger.Debugf("[Worker %d] Job %s: Performing Probe B for Header '%s'...", workerID, job.URLString, headerName)
-			probeBStartTime := time.Now()
-
-			// Timeout para a requisição individual
-			reqCtxProbeB, cancelReqProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
-			probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxProbeB}
-			probeBRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBReqData)
-			cancelReqProbeB() // Cancelar contexto da requisição individual
-
-			probeBDuration := time.Since(probeBStartTime)
-			s.logger.Debugf("[Worker %d] Job %s: Probe B for Header '%s' completed in %s. Status: %s, Error: %v",
-				workerID, job.URLString, headerName, probeBDuration, getStatus(probeBRespData.Response), probeBRespData.Error)
-			probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
-
-			if s.config.VerbosityLevel >= 2 { 
-				s.logger.Debugf("[Worker %d] Probe B (Header: '%s') for %s - Status: %s, Error: %v", workerID, headerName, job.URLString, getStatus(probeBProbe.Response), probeBProbe.Error)
-			}
-
-			if probeBRespData.Error != nil || statusCodeFromResponse(probeBRespData.Response) == 429 {
-				statusCodeProbeB := statusCodeFromResponse(probeBRespData.Response)
-				if s.config.VerbosityLevel >= 1 { 
-					s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Handing to outcome processor.", workerID, headerName, job.URLString, statusCodeProbeB, probeBRespData.Error)
+				injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + hn)
+				if s.config.VerbosityLevel >= 2 {
+					s.logger.Debugf("[Worker %d] Testing Header '%s' with value '%s' for %s", workerID, hn, injectedValue, job.URLString)
 				}
-				// s.domainConductor.HandleJobOutcome(job, false, probeBRespData.Error, statusCodeProbeB)
-				s.handleJobOutcome(job, false, probeBRespData.Error, statusCodeProbeB)
-				return
-			}
 
-			if probeAProbe.Response != nil && probeBProbe.Response != nil { 
-				finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", headerName, injectedValue, baselineProbe, probeAProbe, probeBProbe)
-				if errAnalyse != nil {
-					s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, headerName, job.URLString, errAnalyse)
+				// Probe A
+				reqCtxProbeA, cancelReqProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+				probeAReqHeaders := http.Header{hn: []string{injectedValue}}
+				probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders, Ctx: reqCtxProbeA}
+				probeARespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAReqData)
+				cancelReqProbeA()
+
+				if s.isJobContextDone(jobCtx) { return }
+				if probeARespData.Error != nil || statusCodeFromResponse(probeARespData.Response) == 429 {
+					// Não reenfileirar o job inteiro aqui, apenas registrar e pular este header específico.
+					// A falha de um subset de probes não deve necessariamente matar o job inteiro, a menos que seja 429.
+					if statusCodeFromResponse(probeARespData.Response) == 429 {
+						s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, hn, job.URLString, job.BaseDomain)
+						cancelJob() // Cancelar o contexto do job inteiro em caso de 429
+						return
+					}
+					s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+					return // Pular para o próximo header
 				}
-				if finding != nil {
-					s.mu.Lock()
-					s.findings = append(s.findings, finding)
-					s.mu.Unlock()
-					s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
-						workerID, finding.Vulnerability, job.URLString, headerName, injectedValue, finding.Description)
+				probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
+
+				// Probe B
+				reqCtxProbeB, cancelReqProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+				probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxProbeB}
+				probeBRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBReqData)
+				cancelReqProbeB()
+
+				if s.isJobContextDone(jobCtx) { return }
+				if probeBRespData.Error != nil || statusCodeFromResponse(probeBRespData.Response) == 429 {
+					if statusCodeFromResponse(probeBRespData.Response) == 429 {
+						s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, hn, job.URLString, job.BaseDomain)
+						cancelJob()
+						return
+					}
+					s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+					return
 				}
-			} else if s.config.VerbosityLevel >= 2 { 
-				s.logger.Debugf("[Worker %d] Skipping analysis for header '%s' on %s due to earlier probe issues not causing job retry/return for this test cycle.", workerID, headerName, job.URLString)
-			}
-			
-			select {
-			case <-jobCtx.Done():
-				s.logger.Warnf("[Worker %d] Job for %s aborted (context done after header test %s).", 
-					workerID, job.URLString, headerName)
-				// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-				s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-				return
-			default:
-			}
-		} 
+				probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
+
+				if probeAProbe.Response != nil && probeBProbe.Response != nil {
+					finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", hn, injectedValue, baselineProbe, probeAProbe, probeBProbe)
+					if errAnalyse != nil {
+						s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, hn, job.URLString, errAnalyse)
+					}
+					if finding != nil {
+						headerFindingsChan <- finding
+					}
+				}
+			}(headerName)
+		}
+
+		// Goroutine para esperar todos os testes de header e fechar o canal de findings
+		go func() {
+			headerWg.Wait()
+			close(headerFindingsChan)
+		}()
+
+		// Coletar findings dos testes de header
+		for finding := range headerFindingsChan {
+			s.mu.Lock()
+			s.findings = append(s.findings, finding)
+			s.mu.Unlock()
+			s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
+				workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+		}
 	}
+endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 
 	// --- Test URL Parameters ---
 	payloadsToTest := s.config.BasePayloads
-	if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" { 
+	if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" {
 		payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval"))
 	}
 
 	if len(payloadsToTest) > 0 && len(job.OriginalParams) > 0 {
-		if s.config.VerbosityLevel >= 2 { 
-			s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param).", workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest))
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param, %d concurrent probes).",
+				workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest), s.config.ProbeConcurrency)
 		}
-		
+
 		paramsToTestKeys := make([]string, 0, len(job.OriginalParams))
 		for paramName := range job.OriginalParams {
 			paramsToTestKeys = append(paramsToTestKeys, paramName)
 		}
-		
-		for i, paramName := range paramsToTestKeys {
-			select {
-			case <-jobCtx.Done():
-				s.logger.Warnf("[Worker %d] Job for %s aborted (context done before parameter test %s [%d/%d], reason: %v).",
-					workerID, job.URLString, paramName, i+1, len(paramsToTestKeys), jobCtx.Err())
-				// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before param %s: %w", paramName, jobCtx.Err()), 0)
-				s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before param %s: %w", paramName, jobCtx.Err()), 0)
-				return
-			default:
-			}
-			
-			if s.isSchedulerStopping() { 
-				s.logger.Infof("[Worker %d] Scheduler stopping, aborting further param probes for job %s.", workerID, job.URLString)
-				return
-			}
+
+		var paramWg sync.WaitGroup
+		paramFindingsChan := make(chan *report.Finding, len(paramsToTestKeys)*len(payloadsToTest)) // Buffer para todos os possíveis findings
+
+		for _, paramName := range paramsToTestKeys {
 			for _, paramPayload := range payloadsToTest {
 				select {
 				case <-jobCtx.Done():
-					s.logger.Warnf("[Worker %d] Job for %s aborted (context done during parameter tests).", 
-						workerID, job.URLString)
-					// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-					s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-					return
-				default:
-				}
-				
-				if s.config.VerbosityLevel >= 2 { 
-					s.logger.Debugf("[Worker %d] Testing Param '%s=%s' for %s", workerID, paramName, paramPayload, job.URLString)
-				}
-
-				s.logger.Debugf("[Worker %d] Job %s: Performing Probe A for Param '%s=%s'...", workerID, job.URLString, paramName, paramPayload)
-				paramProbeAStartTime := time.Now()
-				probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, paramName, paramPayload)
-				if errProbeAURL != nil {
-					s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for param test ('%s=%s'): %v. Skipping this param test.", workerID, paramName, paramPayload, errProbeAURL)
-					continue 
-				}
-				// Timeout para a requisição individual
-				reqCtxParamProbeA, cancelReqParamProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
-				probeAParamReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET", Ctx: reqCtxParamProbeA}
-				probeAParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAParamReqData)
-				cancelReqParamProbeA() // Cancelar contexto da requisição individual
-
-				paramProbeADuration := time.Since(paramProbeAStartTime)
-				s.logger.Debugf("[Worker %d] Job %s: Probe A for Param '%s=%s' completed in %s. Status: %s, Error: %v",
-					workerID, job.URLString, paramName, paramPayload, paramProbeADuration, getStatus(probeAParamRespData.Response), probeAParamRespData.Error)
-
-				probeAParamProbe := buildProbeData(probeAURL, probeAParamReqData, probeAParamRespData)
-
-				select {
-				case <-jobCtx.Done():
-					s.logger.Warnf("[Worker %d] Job for %s aborted (context done during parameter tests).", 
-						workerID, job.URLString)
-					// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-					s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted"), 0)
-					return
+					s.logger.Warnf("[Worker %d] Job for %s aborted (context done before launching all param tests, reason: %v).",
+						workerID, job.URLString, jobCtx.Err())
+					goto endParamTests // Pular para o final dos testes de parâmetro
 				default:
 				}
 
-				if probeAParamRespData.Error != nil || statusCodeFromResponse(probeAParamRespData.Response) == 429 {
-					statusCodeParamA := statusCodeFromResponse(probeAParamRespData.Response)
-					if s.config.VerbosityLevel >= 1 { 
-						s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s failed (Status: %d, Error: %v). Handing to outcome processor.", workerID, paramName, paramPayload, probeAURL, statusCodeParamA, probeAParamRespData.Error)
+				paramWg.Add(1)
+				probeSemaphore <- struct{}{} // Adquire slot no semáforo
+
+				go func(pn, pp string) {
+					defer paramWg.Done()
+					defer func() { <-probeSemaphore }() // Libera slot no semáforo
+
+					if s.isJobContextDone(jobCtx) {
+						s.logger.Debugf("[Worker %d] Job context done before starting param test %s=%s for %s. Skipping.", workerID, pn, pp, job.URLString)
+						return
 					}
-					// s.domainConductor.HandleJobOutcome(job, false, probeAParamRespData.Error, statusCodeParamA)
-					s.handleJobOutcome(job, false, probeAParamRespData.Error, statusCodeParamA)
-					return 
-				}
 
-
-				s.logger.Debugf("[Worker %d] Job %s: Performing Probe B for Param '%s=%s'...", workerID, job.URLString, paramName, paramPayload)
-				paramProbeBStartTime := time.Now()
-
-				// Timeout para a requisição individual
-				reqCtxParamProbeB, cancelReqParamProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
-				probeBParamReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxParamProbeB}
-				probeBParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBParamReqData)
-				cancelReqParamProbeB() // Cancelar contexto da requisição individual
-
-				paramProbeBDuration := time.Since(paramProbeBStartTime)
-				s.logger.Debugf("[Worker %d] Job %s: Probe B for Param '%s=%s' completed in %s. Status: %s, Error: %v",
-					workerID, job.URLString, paramName, paramPayload, paramProbeBDuration, getStatus(probeBParamRespData.Response), probeBParamRespData.Error)
-				probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
-
-				if s.config.VerbosityLevel >= 2 { 
-					s.logger.Debugf("[Worker %d] Probe B (Param '%s=%s') for %s - Status: %s, Error: %v", workerID, paramName, paramPayload, job.URLString, getStatus(probeBParamProbe.Response), probeBParamProbe.Error)
-				}
-
-				if probeBParamRespData.Error != nil || statusCodeFromResponse(probeBParamRespData.Response) == 429 {
-					statusCodeParamB := statusCodeFromResponse(probeBParamRespData.Response)
-					if s.config.VerbosityLevel >= 1 { 
-						s.logger.Warnf("[Worker %d] Probe B (Param '%s=%s') for %s failed (Status: %d, Error: %v). Handing to outcome processor.", workerID, paramName, paramPayload, job.URLString, statusCodeParamB, probeBParamRespData.Error)
+					if s.config.VerbosityLevel >= 2 {
+						s.logger.Debugf("[Worker %d] Testing Param '%s=%s' for %s", workerID, pn, pp, job.URLString)
 					}
-					// s.domainConductor.HandleJobOutcome(job, false, probeBParamRespData.Error, statusCodeParamB)
-					s.handleJobOutcome(job, false, probeBParamRespData.Error, statusCodeParamB)
-					return 
-				}
 
+					probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, pn, pp)
+					if errProbeAURL != nil {
+						s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for param test ('%s=%s'): %v. Skipping this param test.", workerID, pn, pp, errProbeAURL)
+						return
+					}
 
-				if probeAParamProbe.Response != nil && probeBParamProbe.Response != nil { 
-					finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", paramName, paramPayload, baselineProbe, probeAParamProbe, probeBParamProbe)
-					if errAnalyseParam != nil {
-						s.logger.Errorf("[Worker %d] Processor Error (Param '%s=%s') for URL %s: %v", workerID, paramName, paramPayload, probeAURL, errAnalyseParam)
+					// Probe A
+					reqCtxParamProbeA, cancelReqParamProbeA := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+					probeAParamReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET", Ctx: reqCtxParamProbeA}
+					probeAParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAParamReqData)
+					cancelReqParamProbeA()
+
+					if s.isJobContextDone(jobCtx) { return }
+					if probeAParamRespData.Error != nil || statusCodeFromResponse(probeAParamRespData.Response) == 429 {
+						if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
+							s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, pn, pp, probeAURL, job.BaseDomain)
+							cancelJob() // Cancelar o contexto do job inteiro em caso de 429
+							return
+						}
+						s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, probeAURL, statusCodeFromResponse(probeAParamRespData.Response), probeAParamRespData.Error)
+						return
 					}
-					if finding != nil {
-						s.mu.Lock()
-						s.findings = append(s.findings, finding)
-						s.mu.Unlock()
-						s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
-							workerID, finding.Vulnerability, probeAURL, paramName, paramPayload, finding.Description)
+					probeAParamProbe := buildProbeData(probeAURL, probeAParamReqData, probeAParamRespData)
+
+					// Probe B (usa a URL original do job, não a probeAURL)
+					reqCtxParamProbeB, cancelReqParamProbeB := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+					probeBParamReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxParamProbeB}
+					probeBParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBParamReqData)
+					cancelReqParamProbeB()
+
+					if s.isJobContextDone(jobCtx) { return }
+					if probeBParamRespData.Error != nil || statusCodeFromResponse(probeBParamRespData.Response) == 429 {
+						if statusCodeFromResponse(probeBParamRespData.Response) == 429 {
+							s.logger.Warnf("[Worker %d] Probe B (Param '%s=%s', original URL %s) for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, pn, pp, job.URLString, job.BaseDomain)
+							cancelJob()
+							return
+						}
+						s.logger.Warnf("[Worker %d] Probe B (Param '%s=%s', original URL %s) for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, job.URLString, job.BaseDomain, statusCodeFromResponse(probeBParamRespData.Response), probeBParamRespData.Error)
+						return
 					}
-				} else if s.config.VerbosityLevel >= 2 { 
-					s.logger.Debugf("[Worker %d] Skipping analysis for param '%s=%s' on %s due to earlier probe errors/status.", workerID, paramName, paramPayload, job.URLString)
-				}
-			} 
-		} 
+					probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
+
+					if probeAParamProbe.Response != nil && probeBParamProbe.Response != nil {
+						// Para AnalyzeProbes com parâmetros, a URL da Probe A (modificada) é mais relevante que a job.URLString original
+						// se a vulnerabilidade se manifesta através da URL modificada.
+						finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", pn, pp, baselineProbe, probeAParamProbe, probeBParamProbe)
+						if errAnalyseParam != nil {
+							s.logger.Errorf("[Worker %d] Processor Error (Param '%s=%s') for URL %s: %v", workerID, pn, pp, probeAURL, errAnalyseParam)
+						}
+						if finding != nil {
+							paramFindingsChan <- finding
+						}
+					}
+				}(paramName, paramPayload) // Passar cópias para a goroutine
+			}
+		}
+
+		// Goroutine para esperar todos os testes de parâmetro e fechar o canal de findings
+		go func() {
+			paramWg.Wait()
+			close(paramFindingsChan)
+		}()
+
+		// Coletar findings dos testes de parâmetro
+		for finding := range paramFindingsChan {
+			s.mu.Lock()
+			s.findings = append(s.findings, finding)
+			s.mu.Unlock()
+			// Usar os campos corretos da struct Finding: finding.URL, finding.Vulnerability, finding.InputName, finding.Payload
+			// finding.URL aqui virá de AnalyzeProbes, que deve ser a probeAURL se for relevante para o finding.
+			s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
+				workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+		}
 	}
+endParamTests: // Rótulo para goto em caso de cancelamento do jobCtx
 
 	select {
 	case <-jobCtx.Done():
 		s.logger.Warnf("[Worker %d] Job for %s aborted (context done just before completion, reason: %v).", workerID, job.URLString, jobCtx.Err())
-		// s.domainConductor.HandleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before completion: %w", jobCtx.Err()), 0)
 		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before completion: %w", jobCtx.Err()), 0)
 		return
 		default:
 		if s.config.VerbosityLevel >= 1 {
 			s.logger.Infof("[Worker %d] Successfully COMPLETED all tests for job: %s (Total Scheduler Attempts: %d)", workerID, job.URLString, job.Retries+1)
 		}
-		// s.domainConductor.HandleJobOutcome(job, true, nil, 0)
 		s.handleJobOutcome(job, true, nil, 0) // Nova função
 	}
 }
@@ -906,6 +886,16 @@ func (s *Scheduler) isSchedulerStopping() bool {
 	}
 }
 
+// Novo helper para verificar se o contexto específico do job foi cancelado
+func (s *Scheduler) isJobContextDone(jobCtx context.Context) bool {
+	select {
+	case <-jobCtx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
 // handleJobOutcome é a nova função no Scheduler para lidar com o resultado de um job.
 func (s *Scheduler) handleJobOutcome(job TargetURLJob, wasSuccessful bool, failureError error, statusCode int) {
 	if wasSuccessful {
@@ -932,7 +922,7 @@ func (s *Scheduler) handleJobOutcome(job TargetURLJob, wasSuccessful bool, failu
 		case s.pendingJobsQueue <- job:
 			// Job enviado para o feeder para gerenciamento.
 		case <-s.ctx.Done():
-		    s.logger.Warnf("[Scheduler] Context done while trying to re-queue job %s to pendingJobsQueue. Job may be lost.", job.URLString)
+			s.logger.Warnf("[Scheduler] Context done while trying to re-queue job %s to pendingJobsQueue. Job may be lost.", job.URLString)
 		    s.decrementActiveJobs() // Se o contexto acabou, decrementar pois o job não será mais processado pelo feeder.
 		default:
 			// Se pendingJobsQueue estiver cheia (improvável com buffer grande, mas possível).
