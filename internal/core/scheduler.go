@@ -508,7 +508,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 		probeSemaphore = make(chan struct{}, 1)
 	}
 
-	if s.config.VerbosityLevel >= 2 { // -vv
+	if s.config.VerbosityLevel >= 1 { // -v ou superior para estes logs
 		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d). Job context linked to scheduler context. Probe concurrency for this job: %d",
 			workerID, job.URLString, job.Retries+1, s.config.ProbeConcurrency)
 	}
@@ -566,7 +566,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 
 	// --- Test Headers --- 
 	if len(s.config.HeadersToTest) > 0 {
-		if s.config.VerbosityLevel >= 2 {
+		if s.config.VerbosityLevel >= 1 { // -v ou superior
 			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers, %d concurrent probes).", workerID, job.URLString, len(s.config.HeadersToTest), s.config.ProbeConcurrency)
 		}
 
@@ -596,7 +596,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 				}
 
 				injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + hn)
-				if s.config.VerbosityLevel >= 2 {
+				if s.config.VerbosityLevel >= 1 { // -v ou superior
 					s.logger.Debugf("[Worker %d] Testing Header '%s' with value '%s' for %s", workerID, hn, injectedValue, job.URLString)
 				}
 
@@ -616,7 +616,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						cancelJob() // Cancelar o contexto do job inteiro em caso de 429
 						return
 					}
-					s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+					if s.config.VerbosityLevel >= 1 { // MOVER LOG PARA NÍVEL -v
+					    s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+				    }
 					return // Pular para o próximo header
 				}
 				probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
@@ -634,7 +636,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						cancelJob()
 						return
 					}
-					s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+					if s.config.VerbosityLevel >= 1 { // MOVER LOG PARA NÍVEL -v
+					    s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+				    }
 					return
 				}
 				probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
@@ -645,7 +649,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, hn, job.URLString, errAnalyse)
 					}
 					if finding != nil {
-						headerFindingsChan <- finding
+						headerFindingsChan <- finding // Envia o finding (Confirmed ou Potential)
 					}
 				}
 			}(headerName)
@@ -657,13 +661,18 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			close(headerFindingsChan)
 		}()
 
-		// Coletar findings dos testes de header
+		// Coletar findings dos testes de header e logar de acordo com o Status
 		for finding := range headerFindingsChan {
 			s.mu.Lock()
 			s.findings = append(s.findings, finding)
 			s.mu.Unlock()
-			s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
-				workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			if finding.Status == report.StatusConfirmed {
+				s.logger.Infof("🎯 CONFIRMED VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
+					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			} else if finding.Status == report.StatusPotential {
+				s.logger.Warnf("⚠️ POTENTIALLY VULNERABLE [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
+					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			}
 		}
 	}
 endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
@@ -675,7 +684,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 	}
 
 	if len(payloadsToTest) > 0 && len(job.OriginalParams) > 0 {
-		if s.config.VerbosityLevel >= 2 {
+		if s.config.VerbosityLevel >= 1 { // -v ou superior
 			s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param, %d concurrent probes).",
 				workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest), s.config.ProbeConcurrency)
 		}
@@ -710,7 +719,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 						return
 					}
 
-					if s.config.VerbosityLevel >= 2 {
+					if s.config.VerbosityLevel >= 1 { // -v ou superior
 						s.logger.Debugf("[Worker %d] Testing Param '%s=%s' for %s", workerID, pn, pp, job.URLString)
 					}
 
@@ -733,7 +742,9 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 							cancelJob() // Cancelar o contexto do job inteiro em caso de 429
 							return
 						}
-						s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, probeAURL, statusCodeFromResponse(probeAParamRespData.Response), probeAParamRespData.Error)
+						if s.config.VerbosityLevel >= 1 { // MOVER LOG PARA NÍVEL -v
+						    s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, probeAURL, statusCodeFromResponse(probeAParamRespData.Response), probeAParamRespData.Error)
+					    }
 						return
 					}
 					probeAParamProbe := buildProbeData(probeAURL, probeAParamReqData, probeAParamRespData)
@@ -751,7 +762,9 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 							cancelJob()
 							return
 						}
-						s.logger.Warnf("[Worker %d] Probe B (Param '%s=%s', original URL %s) for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, job.URLString, job.BaseDomain, statusCodeFromResponse(probeBParamRespData.Response), probeBParamRespData.Error)
+						if s.config.VerbosityLevel >= 1 { // MOVER LOG PARA NÍVEL -v
+						    s.logger.Warnf("[Worker %d] Probe B (Param '%s=%s', original URL %s) for %s failed (Status: %d, Error: %v). Skipping this param test.", workerID, pn, pp, job.URLString, job.BaseDomain, statusCodeFromResponse(probeBParamRespData.Response), probeBParamRespData.Error)
+					    }
 						return
 					}
 					probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
@@ -764,7 +777,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 							s.logger.Errorf("[Worker %d] Processor Error (Param '%s=%s') for URL %s: %v", workerID, pn, pp, probeAURL, errAnalyseParam)
 						}
 						if finding != nil {
-							paramFindingsChan <- finding
+							paramFindingsChan <- finding // Envia o finding (Confirmed ou Potential)
 						}
 					}
 				}(paramName, paramPayload) // Passar cópias para a goroutine
@@ -777,15 +790,18 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 			close(paramFindingsChan)
 		}()
 
-		// Coletar findings dos testes de parâmetro
+		// Coletar findings dos testes de parâmetro e logar de acordo com o Status
 		for finding := range paramFindingsChan {
 			s.mu.Lock()
 			s.findings = append(s.findings, finding)
 			s.mu.Unlock()
-			// Usar os campos corretos da struct Finding: finding.URL, finding.Vulnerability, finding.InputName, finding.Payload
-			// finding.URL aqui virá de AnalyzeProbes, que deve ser a probeAURL se for relevante para o finding.
-			s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
-				workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			if finding.Status == report.StatusConfirmed {
+				s.logger.Infof("🎯 CONFIRMED VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
+					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			} else if finding.Status == report.StatusPotential {
+				s.logger.Warnf("⚠️ POTENTIALLY VULNERABLE [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
+					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+			}
 		}
 	}
 endParamTests: // Rótulo para goto em caso de cancelamento do jobCtx

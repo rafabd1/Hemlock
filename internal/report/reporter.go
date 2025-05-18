@@ -7,15 +7,23 @@ import (
 	"strings"
 )
 
+// Status constants for Findings
+const (
+	StatusConfirmed = "Confirmed"
+	StatusPotential = "Potential"
+)
+
 // Finding represents a detected potential cache poisoning vulnerability.
+// Nota: Os campos json refletem o estilo snake_case comum em muitas APIs/ferramentas.
 type Finding struct {
 	URL             string `json:"url"`
 	Vulnerability   string `json:"vulnerability_type"` // e.g., "Unkeyed Header Input", "Reflected Payload in Cache"
 	Description     string `json:"description"`
-	InputType       string `json:"inputType,omitempty"`     // "header" or "parameter"
-	InputName       string `json:"inputName,omitempty"`       // e.g., "X-Forwarded-Host" or "param_name"
+	InputType       string `json:"input_type,omitempty"`    // "header" or "parameter"
+	InputName       string `json:"input_name,omitempty"`      // e.g., "X-Forwarded-Host" or "param_name"
 	Payload         string `json:"payload,omitempty"`
-	Evidence        string `json:"evidence,omitempty"`       // Could be a snippet of the response or specific headers
+	Evidence        string `json:"evidence,omitempty"`      // Could be a snippet of the response or specific headers
+	Status          string `json:"status"`                 // "Confirmed", "Potential"
 	// TODO: Add more fields as needed, e.g., Severity, Request/Response diffs
 }
 
@@ -31,13 +39,13 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 			return fmt.Errorf("failed to create report file '%s': %w", outputPath, err)
 		}
 		defer outputWriter.Close()
-		fmt.Printf("Report will be saved to: %s\n", outputPath) // Inform user
+		// Não logar aqui sobre onde será salvo, o main.go já faz isso.
 	} else {
-		fmt.Println("Report will be printed to standard output.") // Inform user
+		// Não logar aqui sobre stdout, o main.go já faz isso.
 	}
 
 	if len(findings) == 0 {
-		fmt.Fprintln(outputWriter, "No vulnerabilities found.")
+		fmt.Fprintln(outputWriter, "No vulnerabilities or potential issues found.")
 		return nil
 	}
 
@@ -50,29 +58,25 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 			return fmt.Errorf("failed to encode findings to JSON: %w", err)
 		}
 	case "text":
-		for i, finding := range findings {
-			_, err := fmt.Fprintf(outputWriter, "Finding %d:\n", i+1)
-			if err != nil { return err }
-			_, err = fmt.Fprintf(outputWriter, "  URL:             %s\n", finding.URL)
-			if err != nil { return err }
-			_, err = fmt.Fprintf(outputWriter, "  Vulnerability:   %s\n", finding.Vulnerability)
-			if err != nil { return err }
-			_, err = fmt.Fprintf(outputWriter, "  Description:     %s\n", finding.Description)
-			if err != nil { return err }
-			if finding.InputType != "" && finding.InputName != "" {
-				_, err = fmt.Fprintf(outputWriter, "  Input:           %s (%s)\n", finding.InputName, finding.InputType)
-				if err != nil { return err }
+		foundConfirmed := false
+		foundPotential := false
+		for _, finding := range findings {
+			if finding.Status == StatusConfirmed {
+				foundConfirmed = true
+				_, err := fmt.Fprintf(outputWriter, "%s -> Vulnerable (Type: %s, Via: %s '%s', Payload: '%s')\n", 
+					finding.URL, finding.Vulnerability, finding.InputType, finding.InputName, finding.Payload)
+				if err != nil { return fmt.Errorf("error writing confirmed finding to report: %w", err) }
+			} else if finding.Status == StatusPotential {
+				foundPotential = true
+				// Para 'Potential', a Description e Evidence podem ser mais úteis que o tipo de Vulnerability genérico.
+				// A evidência já contém "Probe A cacheable: %t. Probe B cache HIT indicated: %t..."
+				_, err := fmt.Fprintf(outputWriter, "%s -> Potentially Vulnerable (Input: %s '%s', Payload: '%s', Reason: %s, Evidence: %s)\n", 
+					finding.URL, finding.InputType, finding.InputName, finding.Payload, finding.Description, finding.Evidence)
+				if err != nil { return fmt.Errorf("error writing potential finding to report: %w", err) }
 			}
-			if finding.Payload != "" {
-				_, err = fmt.Fprintf(outputWriter, "  Payload:         %s\n", finding.Payload)
-				if err != nil { return err }
-			}
-			if finding.Evidence != "" {
-				_, err = fmt.Fprintf(outputWriter, "  Evidence:        %s\n", finding.Evidence)
-				if err != nil { return err }
-			}
-			_, err = fmt.Fprintf(outputWriter, "--------------------------------------------------\n")
-			if err != nil { return err }
+		}
+		if !foundConfirmed && !foundPotential { // Caso todos os findings fossem de um status desconhecido (improvável)
+		    fmt.Fprintln(outputWriter, "No recognized vulnerabilities or potential issues found.")
 		}
 	default:
 		return fmt.Errorf("unsupported report format: %s. Supported formats are 'json' and 'text'", format)

@@ -204,7 +204,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
   | |  | |  __/ | | | | | | (_) | (__|   < 
   |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
 `
-			version := "v0.1.2" // Atualizar conforme necessário
+			version := "v0.1.0" // Atualizar conforme necessário
 			author := "github.com/rafabd1"
 
 			// Apply color to the banner string
