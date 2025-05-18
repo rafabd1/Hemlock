@@ -137,7 +137,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// --- Load HeadersToTest ---
 		if cfg.HeadersFile == "" { 
 			exePath, err := os.Executable()
-			if err != nil {
+	if err != nil {
 				logger.Warnf("Could not get executable path to find default headers: %v", err) 
 			}
 			potentialPaths := []string{
@@ -276,7 +276,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 				u, errParseURL := url.Parse(baseURL)
 				if errParseURL == nil {
 					domainSet[u.Hostname()] = struct{}{}
-				} else {
+	} else {
 					// Log a warning if a base URL cannot be parsed, though this should be rare
 					// if PreprocessAndGroupURLs produced it.
 					logger.Warnf("Could not parse base URL '%s' from preprocessed list to count domain: %v", baseURL, errParseURL)
@@ -298,34 +298,34 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		logger.Infof("Hemlock Cache Scanner initializing scan...")
 
 		httpClient, errClient := networking.NewClient(&cfg, logger)
-		if errClient != nil {
-			logger.Fatalf("Failed to create HTTP client: %v", errClient)
-		}
+	if errClient != nil {
+		logger.Fatalf("Failed to create HTTP client: %v", errClient)
+	}
 
 		processor := core.NewProcessor(&cfg, logger)
 		domainManager := networking.NewDomainManager(&cfg, logger)
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
 
-		findings := scheduler.StartScan() 
+	findings := scheduler.StartScan() 
 
 		logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(findings))
-		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
-		if errReport != nil {
-			logger.Errorf("Failed to generate report: %v", errReport)
-			if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
-				logger.Warnf("Attempting to print report to stdout as fallback...")
-				fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
-				if fbErr != nil {
-					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
-				}
+	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+	if errReport != nil {
+		logger.Errorf("Failed to generate report: %v", errReport)
+		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+			logger.Warnf("Attempting to print report to stdout as fallback...")
+			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+			if fbErr != nil {
+				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
 			}
+		}
 		} else if len(findings) > 0 {
 			logger.Infof("Report generated successfully.")
-		} else {
+	} else {
 		    logger.Infof("No vulnerabilities found or report not generated due to no findings.")
-		}
+	}
 
-		logger.Infof("Hemlock Cache Scanner finished.")
+	logger.Infof("Hemlock Cache Scanner finished.")
 		return nil
 	},
 }
