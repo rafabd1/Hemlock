@@ -101,8 +101,6 @@ func PreprocessURLs(rawURLs []string, ignoredExtensions []string, stripWWW bool,
 		if _, exists := processedURLs[normalizedURL]; !exists {
 			processedURLs[normalizedURL] = true
 			resultURLs = append(resultURLs, rawURL) // Add the original URL that passed filters
-		} else {
-			logger.Debugf("Duplicate URL (after normalization) filtered out: %s (normalized to %s)", rawURL, normalizedURL)
 		}
 	}
 
@@ -181,7 +179,6 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 				}
 			}
 			if isIgnored {
-				logger.Debugf("Filtering out URL %s due to ignored extension: %s", rawURL, currentExtension)
 				continue
 			}
 		}
@@ -262,10 +259,6 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 	logger.Debugf("Preprocessed URLs. Found %d unique base URLs after filtering.", len(uniqueBaseURLs)) // Updated log to Debugf
 	logger.Debugf("Total query parameters found across all unique sets: %d", totalQueryParametersFound)
 	logger.Debugf("Number of base URLs with parameters: %d", baseURLsWithParamsCount)
-
-	for _, base := range uniqueBaseURLs {
-		logger.Debugf("Base URL: %s, has %d unique parameter sets.", base, len(groupedParams[base]))
-	}
 
 	return groupedParams, uniqueBaseURLs, totalQueryParametersFound, baseURLsWithParamsCount
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"container/list"
 	"fmt"
 	"math"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/rafabd1/Hemlock/internal/config"
 	"github.com/rafabd1/Hemlock/internal/networking"
+	"github.com/rafabd1/Hemlock/internal/output"
 	"github.com/rafabd1/Hemlock/internal/report"
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
@@ -46,24 +48,38 @@ type Scheduler struct {
 	wg            sync.WaitGroup
 	mu            sync.Mutex // For thread-safe access to findings slice
 
-	jobQueue      chan TargetURLJob // Primary queue for new jobs
-	retryQueue    chan TargetURLJob // Queue for jobs that need retrying
-	activeJobs    int32             // Counter for all active jobs (main + retry)
-	maxRetries    int               // From config
-	doneChan      chan struct{}       // Signals all processing is complete
+	// Novas filas e estruturas de gerenciamento
+	masterJobQueue    chan TargetURLJob
+	dispatchQueue     chan TargetURLJob             // Workers consomem daqui
+	domainWaitQueues  map[string]*list.List       // Chave: BaseDomain, Valor: Lista de TargetURLJob
+	domainWaitQueuesMu sync.Mutex                  // Mutex para proteger domainWaitQueues
+	schedulerRetryPQ  *JobPriorityQueue         // Fila de prioridade para jobs em backoff do scheduler
+
+	activeJobs    int32
+	maxRetries    int
+	doneChan      chan struct{} // Sinaliza que todos os jobs foram processados e queues estão vazias
+	
+	// Canais para gerenciar o ciclo de vida das goroutines do scheduler
+	managerStopChan chan struct{} // Sinal para parar domainQueueManager e schedulerRetryManager
+
+	progressBar             *output.ProgressBar
+	totalJobsForProgressBar int
 }
 
 // NewScheduler creates a new Scheduler instance.
 func NewScheduler(cfg *config.Config, client *networking.Client, processor *Processor, dm *networking.DomainManager, logger utils.Logger) *Scheduler {
 	return &Scheduler{
-		config:        cfg,
-		client:        client,
-		processor:     processor,
-		domainManager: dm,
-		logger:        logger,
-		findings:      make([]*report.Finding, 0),
-		maxRetries:    cfg.MaxRetries, // Store maxRetries from config
-		doneChan:      make(chan struct{}),
+		config:           cfg,
+		client:           client,
+		processor:        processor,
+		domainManager:    dm,
+		logger:           logger,
+		findings:         make([]*report.Finding, 0),
+		maxRetries:       cfg.MaxRetries,
+		domainWaitQueues: make(map[string]*list.List),
+		// schedulerRetryPQ será inicializado em StartScan
+		doneChan:         make(chan struct{}),
+		managerStopChan:  make(chan struct{}),
 	}
 }
 
@@ -115,7 +131,7 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 // StartScan begins the scanning process based on the scheduler's configuration.
 // It now returns only the list of findings. Counts for summary are handled in main.go.
 func (s *Scheduler) StartScan() []*report.Finding {
-	s.logger.Debugf("Scheduler: Initializing scan...")
+	s.logger.Debugf("Scheduler V2: Initializing scan...")
 	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
 	if len(uniqueBaseURLs) == 0 {
@@ -125,11 +141,11 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 	var initialJobs []TargetURLJob
 	for _, baseURL := range uniqueBaseURLs {
-		parsedBase, _ := url.Parse(baseURL) // Error already handled by PreprocessAndGroupURLs
+		parsedBase, _ := url.Parse(baseURL)
 		baseDomain := parsedBase.Hostname()
 		paramSets := groupedBaseURLsAndParams[baseURL]
 		for _, paramSet := range paramSets {
-			actualTargetURL, _ := constructURLWithParams(baseURL, paramSet) // Error unlikely if Preprocess worked
+			actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
 			initialJobs = append(initialJobs, TargetURLJob{URLString: actualTargetURL, BaseDomain: baseDomain, OriginalParams: paramSet})
 		}
 	}
@@ -139,92 +155,59 @@ func (s *Scheduler) StartScan() []*report.Finding {
 		return s.findings
 	}
 
+	s.totalJobsForProgressBar = len(initialJobs)
+	atomic.StoreInt32(&s.activeJobs, int32(s.totalJobsForProgressBar))
+
+	if s.totalJobsForProgressBar > 0 {
+		s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40)
+		s.progressBar.SetPrefix("Scanning V2: ")
+		s.progressBar.Start()
+		defer func() {
+			s.progressBar.Finalize()
+			output.SetActiveProgressBar(nil)
+		}()
+	}
+
 	concurrencyLimit := s.config.Concurrency
 	if concurrencyLimit <= 0 { concurrencyLimit = 1 }
 
-	s.jobQueue = make(chan TargetURLJob, len(initialJobs))
-	s.retryQueue = make(chan TargetURLJob, len(initialJobs)*2) // Allow more space for retries
-	atomic.StoreInt32(&s.activeJobs, int32(len(initialJobs)))
+	// Inicializar filas com buffer apropriado
+	s.masterJobQueue = make(chan TargetURLJob, len(initialJobs))
+	s.dispatchQueue = make(chan TargetURLJob, concurrencyLimit*2) // Buffer para workers
+	s.schedulerRetryPQ = NewJobPriorityQueue(len(initialJobs)) // Capacidade inicial
 
-	// Start the retry manager as a method of scheduler
-	go s.manageRetries()
+	// Iniciar goroutines gerenciadoras
+	s.wg.Add(2) // Para domainQueueManager e schedulerRetryManager
+	go s.domainQueueManager()
+	go s.schedulerRetryManager()
 
-	// Populate the initial job queue
-	for _, job := range initialJobs {
-		s.jobQueue <- job
-	}
-
-	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("Scheduler: Starting %d workers for %d initial jobs.", concurrencyLimit, len(initialJobs))
-	}
-
+	// Iniciar workers
 	for i := 0; i < concurrencyLimit; i++ {
 		s.wg.Add(1)
-		go func(workerID int) {
-			defer s.wg.Done()
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[Worker %d] Started.", workerID)
-			}
-			for job := range s.jobQueue {
-				s.processURLJob(workerID, job)
-			}
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[Worker %d] Exiting (jobQueue closed).", workerID)
-			}
-		}(i)
+		go s.worker(i)
 	}
 
-	<-s.doneChan // Wait for all active jobs (including retries managed by manageRetries) to complete
+	// Popular masterJobQueue com jobs iniciais
+	for _, job := range initialJobs {
+		s.masterJobQueue <- job
+	}
+	// Fechar masterJobQueue APÓS todos os jobs iniciais serem enfileirados E 
+	// APÓS a schedulerRetryManager ter uma chance de reenfileirar jobs.
+	// Isso será gerenciado pelo doneChan e managerStopChan.
 
-	s.wg.Wait() // Ensure all worker goroutines have finished
-	s.logger.Infof("Scheduler: All scan tasks and workers completed.")
+	<-s.doneChan // Esperar que todos os jobs sejam processados
+
+	s.logger.Infof("Scheduler: All jobs processed. Signalling managers to stop...")
+	close(s.managerStopChan) // Sinalizar para as goroutines gerenciadoras pararem
+
+	s.wg.Wait() // Esperar que todas as goroutines (workers e managers) terminem
+	s.logger.Infof("Scheduler: All scan tasks, workers, and managers completed.")
 	return s.findings
 }
 
-// manageRetries is a goroutine that monitors the retryQueue.
-// It waits for a job's NextAttemptAt, then checks with DomainManager before re-queueing to the main jobQueue.
-func (s *Scheduler) manageRetries() {
-	for job := range s.retryQueue { // Loop until retryQueue is closed by decrementActiveJobs
-		waitDuration := time.Until(job.NextAttemptAt)
-		if waitDuration > 0 {
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[RetryManager] Job for %s (attempt %d) waiting for %v before re-evaluation.", job.URLString, job.Retries+1, waitDuration)
-			}
-			time.Sleep(waitDuration)
-		}
-
-		if s.config.VerbosityLevel >= 2 { // -vv
-			s.logger.Debugf("[RetryManager] Re-evaluating job for %s (attempt %d) for domain %s.", job.URLString, job.Retries+1, job.BaseDomain)
-		}
-		canProceedNow, furtherDelay := s.domainManager.CanRequest(job.BaseDomain)
-
-		if canProceedNow {
-			// Log based on verbosity level
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[RetryManager] Domain %s clear. Re-queueing job for %s to main queue.", job.BaseDomain, job.URLString)
-			} else if s.config.VerbosityLevel >= 1 { // -v
-				s.logger.Infof("[RetryManager] Domain %s clear. Re-queueing job for %s to main queue.", job.BaseDomain, job.URLString)
-			}
-			s.jobQueue <- job // Send to main job queue for workers
-		} else {
-			job.NextAttemptAt = time.Now().Add(furtherDelay)
-			// Log based on verbosity level
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[RetryManager] Domain %s still busy/RPS limited. Job for %s to retry after %v (NextAttemptAt: %s). Returning to retry queue.",
-					job.BaseDomain, job.URLString, furtherDelay, job.NextAttemptAt.Format(time.RFC3339))
-			} else if s.config.VerbosityLevel >= 1 { // -v
-				s.logger.Infof("[RetryManager] Domain %s still busy/RPS limited. Job for %s to retry after %v (NextAttemptAt: %s). Returning to retry queue.",
-					job.BaseDomain, job.URLString, furtherDelay, job.NextAttemptAt.Format(time.RFC3339))
-			}
-			s.retryQueue <- job
-		}
-	}
-	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("[RetryManager] Exiting (retryQueue closed).")
-	}
-}
-
 // processURLJob is where individual URL processing, baseline requests, and probe tests happen.
+// THIS ENTIRE FUNCTION (processURLJob) WILL BE REMOVED as its logic is being integrated into the new worker method.
+/*
 func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	if s.config.VerbosityLevel >= 2 { // -vv
 		s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d)", workerID, job.URLString, job.Retries+1)
@@ -239,7 +222,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 		job.Retries++
 		if job.Retries < s.maxRetries {
 			job.NextAttemptAt = time.Now().Add(domainWaitTime)
-			s.retryQueue <- job
+			s.retryQueue <- job // ERROR: s.retryQueue is V1
 		} else {
 			if s.config.VerbosityLevel >= 1 { // -v
 				s.logger.Warnf("[Worker %d] Job for %s DISCARDED for domain %s after %d retries (DM limit).", workerID, job.URLString, job.BaseDomain, job.Retries)
@@ -271,400 +254,167 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			errMsg = baselineRespData.Error.Error()
 		}
 
-		if statusCode == 429 {
-			if s.config.VerbosityLevel >= 1 { // -v
-				s.logger.Infof("[Worker %d] Baseline for %s received 429 (Too Many Requests). Domain %s standby triggered by DomainManager. Re-queueing to retry.", workerID, job.URLString, job.BaseDomain)
+		if statusCode == 429 { // Specific handling for 429
+			s.logger.Warnf("[Worker %d] Job for %s (baseline) got 429. Error: %s. Domain %s put on standby by DM.", workerID, job.URLString, errMsg, job.BaseDomain)
+			// DomainManager already handles standby. Re-queue the job for a later attempt via retryQueue.
+			job.Retries++
+			if job.Retries < s.maxRetries {
+				job.NextAttemptAt = time.Now().Add(s.domainManager.GetRetryAfter(job.BaseDomain)) // Use retry-after from DM
+				s.logger.Infof("[Worker %d] Job for %s will be retried for 429 after %v.", workerID, job.URLString, time.Until(job.NextAttemptAt))
+				s.retryQueue <- job // ERROR: s.retryQueue is V1
+			} else {
+				s.logger.Warnf("[Worker %d] Job for %s DISCARDED after %d retries (last was 429).", workerID, job.URLString, job.Retries)
+				s.decrementActiveJobs()
 			}
-		} else { // Other errors
-			if s.config.VerbosityLevel >= 1 { // -v
-				s.logger.Warnf("[Worker %d] Baseline for %s failed (Status: %d, Err: %s). Re-queueing to retry.",
-					workerID, job.URLString, statusCode, errMsg)
-			}
+			return // Stop processing this job further in this attempt
 		}
 
+		// General error handling for baseline (non-429)
 		job.Retries++
 		if job.Retries < s.maxRetries {
-			var retryDelayDuration time.Duration
-			var nextAttemptAbsoluteTime time.Time
-
-			if statusCode == 429 {
-				_, standbyEndTime := s.domainManager.IsStandby(job.BaseDomain) // IsStandby returns (bool, time.Time)
-				nextAttemptAbsoluteTime = standbyEndTime
-				retryDelayDuration = time.Until(standbyEndTime)
-				if retryDelayDuration < 0 { // Fallback if somehow standbyEndTime is in the past
-					retryDelayDuration = s.config.InitialStandbyDuration
-					nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-					if s.config.VerbosityLevel >= 2 { // -vv
-						s.logger.Debugf("[Worker %d] Fallback retry delay for %s due to negative duration from IsStandby. Using: %v", workerID, job.URLString, retryDelayDuration)
-					}
-				}
-			} else {
-				// For non-429 errors, use standard backoff
-				retryDelayDuration = calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement)
-				nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-			}
-			job.NextAttemptAt = nextAttemptAbsoluteTime
-
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[Worker %d] Baseline for %s will retry after %v (NextAttemptAt: %s)", workerID, job.URLString, retryDelayDuration, job.NextAttemptAt.Format(time.RFC3339))
-			}
-			s.retryQueue <- job
+			backoffDuration := calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement)
+			job.NextAttemptAt = time.Now().Add(backoffDuration)
+			s.logger.Infof("[Worker %d] Baseline for %s failed (Status: %d, Err: %s). Attempt %d/%d. Re-queueing after %v.",
+				workerID, job.URLString, statusCode, errMsg, job.Retries, s.maxRetries, backoffDuration)
+			s.retryQueue <- job // ERROR: s.retryQueue is V1
 		} else {
-			if s.config.VerbosityLevel >= 1 { // -v
-				s.logger.Warnf("[Worker %d] Baseline for %s DISCARDED after %d retries.", workerID, job.URLString, job.Retries)
-			}
+			s.logger.Warnf("[Worker %d] Baseline for %s DISCARDED after %d retries. Last Error: %s", workerID, job.URLString, job.Retries, errMsg)
 			s.decrementActiveJobs()
 		}
-		return // Critical: return here to avoid processing with a failed baseline
+		return // Stop processing this job further
 	}
 
-	// Baseline was successful (not an error, not a 429 that led to a return)
+	// Baseline request successful
 	baselineProbe := buildProbeData(job.URLString, baselineReqData, baselineRespData)
-	if baselineProbe.Response == nil { // Should not happen if error check above is thorough
-		s.logger.Errorf("[Worker %d] CRITICAL: Baseline Invalid (nil response) for %s after successful HTTP req. Discarding job.", workerID, job.URLString)
-		s.decrementActiveJobs()
-		return
-	}
-	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("[Worker %d] Baseline for %s successful. Proceeding to probes.", workerID, job.URLString)
-	}
 
-	// --- Test Headers ---
-	if len(s.config.HeadersToTest) > 0 {
-		if s.config.VerbosityLevel >= 2 { // -vv
-			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers).", workerID, job.URLString, len(s.config.HeadersToTest))
+	// Test with modified headers (Probe A)
+	for _, header := range s.config.HeadersToTest {
+		// Check domain readiness before each probe request
+		canProceedProbe, probeWaitTime := s.domainManager.CanRequest(job.BaseDomain)
+		for !canProceedProbe {
+			if s.config.VerbosityLevel >= 1 { // -v
+				s.logger.Infof("[Worker %d] Job %s, Header Probe '%s': Domain %s busy. Waiting %v.", workerID, job.URLString, header.Name, job.BaseDomain, probeWaitTime)
+			}
+			time.Sleep(probeWaitTime)
+			canProceedProbe, probeWaitTime = s.domainManager.CanRequest(job.BaseDomain)
 		}
-		for _, headerName := range s.config.HeadersToTest {
-			if s.config.VerbosityLevel >= 2 { // -vv
-				s.logger.Debugf("[Worker %d] Testing Header '%s' for %s", workerID, headerName, job.URLString)
-			}
+		s.domainManager.RecordRequestSent(job.BaseDomain)
 
-			// Probe A (with injected header)
-			canProbeA, probeADelay := s.domainManager.CanRequest(job.BaseDomain)
-			if !canProbeA {
-				if s.config.VerbosityLevel >= 1 { // -v
-					s.logger.Infof("[Worker %d] Header Test (Probe A for '%s') for %s re-queued (domain %s busy). Will retry after %v.", workerID, headerName, job.URLString, job.BaseDomain, probeADelay)
-				}
-				job.Retries++
-				if job.Retries < s.maxRetries {
-					job.NextAttemptAt = time.Now().Add(probeADelay)
-					s.retryQueue <- job
-				} else {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Warnf("[Worker %d] Job for %s DISCARDED during header test (Probe A for '%s') after %d retries (DM limit).", workerID, job.URLString, headerName, job.Retries)
-					}
-					s.decrementActiveJobs()
-				}
-				return // Return from processURLJob for this job, it's re-queued or discarded
-			}
-			s.domainManager.RecordRequestSent(job.BaseDomain)
-			injectedValue := utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix + "-header-" + headerName)
-			probeAReqHeaders := http.Header{headerName: []string{injectedValue}}
-			probeAReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", CustomHeaders: probeAReqHeaders}
-				probeARespData := s.client.PerformRequest(probeAReqData)
-			s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
-			probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
-
-			if s.config.VerbosityLevel >= 2 { // -vv, log *after* attempt
-				s.logger.Debugf("[Worker %d] Probe A (Header: '%s') for %s - Status: %s, Error: %v", workerID, headerName, job.URLString, getStatus(probeAProbe.Response), probeAProbe.Error)
-			}
-
-			if statusCodeFromResponse(probeARespData.Response) == 429 {
-				if s.config.VerbosityLevel >= 1 { // -v
-					s.logger.Infof("[Worker %d] Probe A (Header: '%s') for %s got 429. Domain %s standby by DM. Re-queueing to retry.", workerID, headerName, job.URLString, job.BaseDomain)
-				}
-				job.Retries++
-				if job.Retries < s.maxRetries {
-					var retryDelayDuration time.Duration
-					var nextAttemptAbsoluteTime time.Time
-					_, standbyEndTime := s.domainManager.IsStandby(job.BaseDomain)
-					nextAttemptAbsoluteTime = standbyEndTime
-					retryDelayDuration = time.Until(standbyEndTime)
-					if retryDelayDuration < 0 {
-						retryDelayDuration = s.config.InitialStandbyDuration
-						nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-						if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Fallback retry delay for Probe A Header %s on %s due to negative duration. Using: %v", workerID, headerName, job.URLString, retryDelayDuration)
-						}
-					}
-					job.NextAttemptAt = nextAttemptAbsoluteTime
-					if s.config.VerbosityLevel >= 2 { // -vv
-						s.logger.Debugf("[Worker %d] Probe A for %s (Header: '%s') got 429. Will retry after %v (NextAttemptAt: %s)", workerID, job.URLString, headerName, retryDelayDuration, job.NextAttemptAt.Format(time.RFC3339))
-					}
-					s.retryQueue <- job
-				} else {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Warnf("[Worker %d] Job for %s DISCARDED during Probe A (Header: '%s') after %d retries (429).", workerID, job.URLString, headerName, job.Retries)
-					}
-					s.decrementActiveJobs()
-				}
-				return // Return from processURLJob
-			}
-
-			// Probe B (original request, no injected header, for comparison)
-			canProbeB, probeBDelay := s.domainManager.CanRequest(job.BaseDomain)
-			if !canProbeB {
-				if s.config.VerbosityLevel >= 1 { // -v
-					s.logger.Infof("[Worker %d] Header Test (Probe B for '%s') for %s re-queued (domain %s busy). Will retry after %v.", workerID, headerName, job.URLString, job.BaseDomain, probeBDelay)
-				}
-				job.Retries++
-				if job.Retries < s.maxRetries {
-					job.NextAttemptAt = time.Now().Add(probeBDelay)
-					s.retryQueue <- job
-				} else {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Warnf("[Worker %d] Job for %s DISCARDED during header test (Probe B for '%s') after %d retries (DM delay).", workerID, job.URLString, headerName, job.Retries)
-					}
-					s.decrementActiveJobs()
-				}
-				return // Return from processURLJob
-			}
-			s.domainManager.RecordRequestSent(job.BaseDomain)
-			probeBReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"} // Original request
-				probeBRespData := s.client.PerformRequest(probeBReqData)
-			s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
-			probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
-
-			if s.config.VerbosityLevel >= 2 { // -vv, log *after* attempt
-				s.logger.Debugf("[Worker %d] Probe B (Header: '%s') for %s - Status: %s, Error: %v", workerID, headerName, job.URLString, getStatus(probeBProbe.Response), probeBProbe.Error)
-			}
-
-			if statusCodeFromResponse(probeBRespData.Response) == 429 {
-				if s.config.VerbosityLevel >= 1 { // -v
-					s.logger.Infof("[Worker %d] Probe B (Header: '%s') for %s got 429. Domain %s standby by DM. Re-queueing to retry.", workerID, headerName, job.URLString, job.BaseDomain)
-				}
-				job.Retries++
-				if job.Retries < s.maxRetries {
-					var retryDelayDuration time.Duration
-					var nextAttemptAbsoluteTime time.Time
-					_, standbyEndTime := s.domainManager.IsStandby(job.BaseDomain)
-					nextAttemptAbsoluteTime = standbyEndTime
-					retryDelayDuration = time.Until(standbyEndTime)
-					if retryDelayDuration < 0 {
-						retryDelayDuration = s.config.InitialStandbyDuration
-						nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-						if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Fallback retry delay for Probe B Header %s on %s due to negative duration. Using: %v", workerID, headerName, job.URLString, retryDelayDuration)
-						}
-					}
-					job.NextAttemptAt = nextAttemptAbsoluteTime
-					if s.config.VerbosityLevel >= 2 { // -vv
-						s.logger.Debugf("[Worker %d] Probe B for %s (Header: '%s') got 429. Will retry after %v (NextAttemptAt: %s)", workerID, job.URLString, headerName, retryDelayDuration, job.NextAttemptAt.Format(time.RFC3339))
-					}
-					s.retryQueue <- job
-				} else {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Warnf("[Worker %d] Job for %s DISCARDED during Probe B (Header: '%s') after %d retries (429).", workerID, job.URLString, headerName, job.Retries)
-					}
-					s.decrementActiveJobs()
-				}
-				return // Return from processURLJob
-			}
-
-			// Analyze probes only if both were successful (no error and not a 429 that caused a return for *this specific test cycle*)
-			if probeAProbe.Error == nil && probeBProbe.Error == nil &&
-				(probeAProbe.Response != nil && probeAProbe.Response.StatusCode != 429) &&
-				(probeBProbe.Response != nil && probeBProbe.Response.StatusCode != 429) {
-				finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", headerName, injectedValue, baselineProbe, probeAProbe, probeBProbe)
-				if errAnalyse != nil {
-					// Log internal processor errors, but not as a "vulnerability"
-					s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, headerName, job.URLString, errAnalyse)
-				}
-				if finding != nil {
-					s.mu.Lock()
-					s.findings = append(s.findings, finding)
-					s.mu.Unlock()
-					// Log vulnerability finding (normal mode)
-					s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
-						workerID, finding.Vulnerability, job.URLString, headerName, injectedValue, finding.Description)
-				}
-			} else if s.config.VerbosityLevel >= 2 { // -vv , log if skipping due to earlier probe issues not leading to retry/return
-				s.logger.Debugf("[Worker %d] Skipping analysis for header '%s' on %s due to earlier probe errors/status not causing job retry/return for this test cycle.", workerID, headerName, job.URLString)
-			}
-		} // End loop over headersToTest
-	}
-
-	// --- Test URL Parameters ---
-	payloadsToTest := s.config.BasePayloads
-	if len(payloadsToTest) == 0 && s.config.DefaultPayloadPrefix != "" { // Ensure there's at least one payload if a prefix is set
-		payloadsToTest = append(payloadsToTest, utils.GenerateUniquePayload(s.config.DefaultPayloadPrefix+"-paramval"))
-	}
-
-	if len(payloadsToTest) > 0 && len(job.OriginalParams) > 0 {
-		if s.config.VerbosityLevel >= 2 { // -vv
-			s.logger.Debugf("[Worker %d] Starting Parameter Tests for %s (%d params, %d payloads per param).", workerID, job.URLString, len(job.OriginalParams), len(payloadsToTest))
+		headerProbeReqData := networking.ClientRequestData{
+			URL:           job.URLString,
+			Method:        "GET", // Or from config if method varies
+			CustomHeaders: map[string]string{header.Name: header.Value},
 		}
-		for paramName := range job.OriginalParams { // Iterate over a copy or keys of original params
-			for _, paramPayload := range payloadsToTest {
-				if s.config.VerbosityLevel >= 2 { // -vv
-					s.logger.Debugf("[Worker %d] Testing Param '%s=%s' for %s", workerID, paramName, paramPayload, job.URLString)
+		headerProbeRespData := s.client.PerformRequest(headerProbeReqData)
+		s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(headerProbeRespData.Response), headerProbeRespData.Error)
+		
+		if headerProbeRespData.Error != nil || statusCodeFromResponse(headerProbeRespData.Response) == 429 {
+			statusCode := statusCodeFromResponse(headerProbeRespData.Response)
+			errMsg := "request failed"
+			if headerProbeRespData.Error != nil {
+				errMsg = headerProbeRespData.Error.Error()
+			}
+			s.logger.Warnf("[Worker %d] Header probe '%s:%s' for %s failed (Status: %d, Err: %s). Re-queueing job.", 
+				workerID, header.Name, header.Value, job.URLString, statusCode, errMsg)
+			job.Retries++
+			if job.Retries < s.maxRetries {
+				nextAttemptDelay := calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement)
+				if statusCode == 429 {
+					nextAttemptDelay = s.domainManager.GetRetryAfter(job.BaseDomain)
 				}
-
-				// Probe A (with modified parameter)
-				canProbeParamA, paramProbeADelay := s.domainManager.CanRequest(job.BaseDomain)
-				if !canProbeParamA {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Infof("[Worker %d] Param Test (Probe A for '%s=%s') for %s re-queued (domain %s busy). Will retry after %v.", workerID, paramName, paramPayload, job.URLString, job.BaseDomain, paramProbeADelay)
-					}
-					job.Retries++
-					if job.Retries < s.maxRetries {
-						job.NextAttemptAt = time.Now().Add(paramProbeADelay)
-						s.retryQueue <- job
-					} else {
-						if s.config.VerbosityLevel >= 1 { // -v
-							s.logger.Warnf("[Worker %d] Job for %s DISCARDED (param '%s=%s' retry limit - DM).", workerID, job.URLString, paramName, paramPayload)
-						}
-						s.decrementActiveJobs()
-					}
-					return // Return from processURLJob
-				}
-				s.domainManager.RecordRequestSent(job.BaseDomain)
-				probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, paramName, paramPayload)
-				if errProbeAURL != nil {
-					s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for param test ('%s=%s'): %v. Skipping this param test.", workerID, paramName, paramPayload, errProbeAURL)
-					continue // Skip this specific payload test
-				}
-				probeAParamReqData := networking.ClientRequestData{URL: probeAURL, Method: "GET"}
-				probeAParamRespData := s.client.PerformRequest(probeAParamReqData)
-				s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeAParamRespData.Response), probeAParamRespData.Error)
-				probeAParamProbe := buildProbeData(probeAURL, probeAParamReqData, probeAParamRespData)
-
-				if s.config.VerbosityLevel >= 2 { // -vv, log *after* attempt
-					s.logger.Debugf("[Worker %d] Probe A (Param '%s=%s') for %s - Status: %s, Error: %v", workerID, paramName, paramPayload, probeAURL, getStatus(probeAParamProbe.Response), probeAParamProbe.Error)
-				}
-
-				if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Infof("[Worker %d] Probe A (Param '%s=%s') for %s got 429. Domain %s standby by DM. Re-queueing to retry.", workerID, paramName, paramPayload, probeAURL, job.BaseDomain)
-					}
-					job.Retries++
-					if job.Retries < s.maxRetries {
-						var retryDelayDuration time.Duration
-						var nextAttemptAbsoluteTime time.Time
-						_, standbyEndTime := s.domainManager.IsStandby(job.BaseDomain)
-						nextAttemptAbsoluteTime = standbyEndTime
-						retryDelayDuration = time.Until(standbyEndTime)
-						if retryDelayDuration < 0 {
-							retryDelayDuration = s.config.InitialStandbyDuration
-							nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-							if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Fallback retry delay for Probe A Param %s=%s on %s due to negative duration. Using: %v", workerID, paramName, paramPayload, probeAURL, retryDelayDuration)
-							}
-						}
-						job.NextAttemptAt = nextAttemptAbsoluteTime
-						if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Probe A for %s (Param '%s=%s') got 429. Will retry after %v (NextAttemptAt: %s)", workerID, probeAURL, paramName, paramPayload, retryDelayDuration, job.NextAttemptAt.Format(time.RFC3339))
-						}
-						s.retryQueue <- job
-					} else {
-						if s.config.VerbosityLevel >= 1 { // -v
-							s.logger.Warnf("[Worker %d] Job for %s DISCARDED (Param '%s=%s' Probe A 429 retry limit).", workerID, probeAURL, paramName, paramPayload)
-						}
-						s.decrementActiveJobs()
-					}
-					return // Return from processURLJob
-				}
-
-				// Probe B for param test (original URL, for comparison)
-				canProbeParamB, paramProbeBDelay := s.domainManager.CanRequest(job.BaseDomain)
-				if !canProbeParamB {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Infof("[Worker %d] Param Test (Probe B for '%s=%s') for %s re-queued (domain %s busy). Will retry after %v.", workerID, paramName, paramPayload, job.URLString, job.BaseDomain, paramProbeBDelay)
-					}
-					job.Retries++
-					if job.Retries < s.maxRetries {
-						job.NextAttemptAt = time.Now().Add(paramProbeBDelay)
-						s.retryQueue <- job
-					} else {
-						if s.config.VerbosityLevel >= 1 { // -v
-							s.logger.Warnf("[Worker %d] Job for %s DISCARDED (param '%s=%s' Probe B retry limit - DM).", workerID, job.URLString, paramName, paramPayload)
-						}
-						s.decrementActiveJobs()
-					}
-					return // Return from processURLJob
-				}
-				s.domainManager.RecordRequestSent(job.BaseDomain)
-				probeBParamReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"} // Original URL
-				probeBParamRespData := s.client.PerformRequest(probeBParamReqData)
-				s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(probeBParamRespData.Response), probeBParamRespData.Error)
-				probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
-
-				if s.config.VerbosityLevel >= 2 { // -vv, log *after* attempt
-					s.logger.Debugf("[Worker %d] Probe B (Param '%s=%s') for %s - Status: %s, Error: %v", workerID, paramName, paramPayload, job.URLString, getStatus(probeBParamProbe.Response), probeBParamProbe.Error)
-				}
-
-				if statusCodeFromResponse(probeBParamRespData.Response) == 429 {
-					if s.config.VerbosityLevel >= 1 { // -v
-						s.logger.Infof("[Worker %d] Probe B (Param '%s=%s') for %s got 429. Domain %s standby by DM. Re-queueing to retry.", workerID, paramName, paramPayload, job.URLString, job.BaseDomain)
-					}
-					job.Retries++
-					if job.Retries < s.maxRetries {
-						var retryDelayDuration time.Duration
-						var nextAttemptAbsoluteTime time.Time
-						_, standbyEndTime := s.domainManager.IsStandby(job.BaseDomain)
-						nextAttemptAbsoluteTime = standbyEndTime
-						retryDelayDuration = time.Until(standbyEndTime)
-						if retryDelayDuration < 0 {
-							retryDelayDuration = s.config.InitialStandbyDuration
-							nextAttemptAbsoluteTime = time.Now().Add(retryDelayDuration)
-							if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Fallback retry delay for Probe B Param %s=%s on %s due to negative duration. Using: %v", workerID, paramName, paramPayload, job.URLString, retryDelayDuration)
-							}
-						}
-						job.NextAttemptAt = nextAttemptAbsoluteTime
-						if s.config.VerbosityLevel >= 2 { // -vv
-							s.logger.Debugf("[Worker %d] Probe B for %s (Param '%s=%s') got 429. Will retry after %v (NextAttemptAt: %s)", workerID, job.URLString, paramName, paramPayload, retryDelayDuration, job.NextAttemptAt.Format(time.RFC3339))
-						}
-						s.retryQueue <- job
-					} else {
-						if s.config.VerbosityLevel >= 1 { // -v
-							s.logger.Warnf("[Worker %d] Job for %s DISCARDED (Param '%s=%s' Probe B 429 retry limit).", workerID, job.URLString, paramName, paramPayload)
-						}
-						s.decrementActiveJobs()
-					}
-					return // Return from processURLJob
-				}
-
-				// Analyze probes only if both were successful
-				if probeAParamProbe.Error == nil && probeBParamProbe.Error == nil &&
-					(probeAParamProbe.Response != nil && probeAParamProbe.Response.StatusCode != 429) &&
-					(probeBParamProbe.Response != nil && probeBParamProbe.Response.StatusCode != 429) {
-					finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", paramName, paramPayload, baselineProbe, probeAParamProbe, probeBParamProbe)
-					if errAnalyseParam != nil {
-						s.logger.Errorf("[Worker %d] Processor Error (Param '%s=%s') for URL %s: %v", workerID, paramName, paramPayload, probeAURL, errAnalyseParam)
-					}
-					if finding != nil {
-						s.mu.Lock()
-						s.findings = append(s.findings, finding)
-						s.mu.Unlock()
-						// Log vulnerability finding (normal mode)
-						s.logger.Infof("🎯 VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
-							workerID, finding.Vulnerability, probeAURL, paramName, paramPayload, finding.Description)
-					}
-				} else if s.config.VerbosityLevel >= 2 { // -vv
-					s.logger.Debugf("[Worker %d] Skipping analysis for param '%s=%s' on %s due to earlier probe errors/status.", workerID, paramName, paramPayload, job.URLString)
-				}
-			} // End loop over payloadsToTest
-		} // End loop over OriginalParams
+				job.NextAttemptAt = time.Now().Add(nextAttemptDelay)
+				s.retryQueue <- job // ERROR: s.retryQueue is V1
+			} else {
+				s.logger.Warnf("[Worker %d] Job for %s DISCARDED after %d retries (header probe failed).", workerID, job.URLString, job.Retries)
+				s.decrementActiveJobs()
+			}
+			return // Stop processing this job further
+		}
+		headerProbeData := buildProbeData(job.URLString, headerProbeReqData, headerProbeRespData)
+		if finding := s.processor.ProcessHeaderProbe(job.URLString, header, baselineProbe, headerProbeData); finding != nil {
+			s.addFinding(finding)
+		}
 	}
 
-	// If we reach here, all tests for the current job (baseline, headers, params) that didn't cause a 'return' have been attempted.
-	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("[Worker %d] Successfully COMPLETED all tests for job: %s (Total Attempts: %d)", workerID, job.URLString, job.Retries+1)
+	// Test with modified parameters (Probe B)
+	for _, param := range s.config.ParametersToTest { // Assuming ParametersToTest is a list of {Name, Value} structs
+		modifiedURL, err := modifyURLQueryParam(job.URLString, param.Name, param.Value)
+		if err != nil {
+			s.logger.Errorf("[Worker %d] Error modifying URL %s for param testing %s=%s: %v. Skipping param test.", workerID, job.URLString, param.Name, param.Value, err)
+			continue
+		}
+
+		// Check domain readiness before each probe request
+		canProceedProbe, probeWaitTime := s.domainManager.CanRequest(job.BaseDomain)
+		for !canProceedProbe {
+			if s.config.VerbosityLevel >= 1 { // -v
+				s.logger.Infof("[Worker %d] Job %s, Param Probe '%s=%s': Domain %s busy. Waiting %v.", workerID, modifiedURL, param.Name, param.Value, job.BaseDomain, probeWaitTime)
+			}
+			time.Sleep(probeWaitTime)
+			canProceedProbe, probeWaitTime = s.domainManager.CanRequest(job.BaseDomain)
+		}
+		s.domainManager.RecordRequestSent(job.BaseDomain)
+
+		paramProbeReqData := networking.ClientRequestData{URL: modifiedURL, Method: "GET"}
+		paramProbeRespData := s.client.PerformRequest(paramProbeReqData)
+		s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(paramProbeRespData.Response), paramProbeRespData.Error)
+
+		if paramProbeRespData.Error != nil || statusCodeFromResponse(paramProbeRespData.Response) == 429 {
+			statusCode := statusCodeFromResponse(paramProbeRespData.Response)
+			errMsg := "request failed"
+			if paramProbeRespData.Error != nil {
+				errMsg = paramProbeRespData.Error.Error()
+			}
+			s.logger.Warnf("[Worker %d] Param probe '%s=%s' for %s (URL: %s) failed (Status: %d, Err: %s). Re-queueing job.", 
+				workerID, param.Name, param.Value, job.URLString, modifiedURL, statusCode, errMsg)
+			job.Retries++
+			if job.Retries < s.maxRetries {
+				nextAttemptDelay := calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement)
+				if statusCode == 429 {
+					nextAttemptDelay = s.domainManager.GetRetryAfter(job.BaseDomain)
+				}
+				job.NextAttemptAt = time.Now().Add(nextAttemptDelay)
+				s.retryQueue <- job // ERROR: s.retryQueue is V1
+			} else {
+				s.logger.Warnf("[Worker %d] Job for %s DISCARDED after %d retries (param probe failed).", workerID, job.URLString, job.Retries)
+				s.decrementActiveJobs()
+			}
+			return // Stop processing this job further
+		}
+		paramProbeData := buildProbeData(modifiedURL, paramProbeReqData, paramProbeRespData)
+		if finding := s.processor.ProcessParamProbe(job.URLString, param, baselineProbe, paramProbeData); finding != nil {
+			s.addFinding(finding)
+		}
 	}
-	s.decrementActiveJobs() // Mark this job as fully processed
+
+	s.decrementActiveJobs()
+	if s.config.VerbosityLevel >= 1 { // -v
+		s.logger.Infof("[Worker %d] Completed processing for job: %s. Remaining: %d", workerID, job.URLString, atomic.LoadInt32(&s.activeJobs))
+	}
 }
+*/
 
+// Lógica de decrementActiveJobs (ajustada se necessário)
 func (s *Scheduler) decrementActiveJobs() {
-	if atomic.AddInt32(&s.activeJobs, -1) == 0 {
-		if s.config.VerbosityLevel >= 1 { // -v or -vv
-			s.logger.Infof("All active jobs completed. Closing job queues.")
-		} else { // Normal mode
-			s.logger.Debugf("All active jobs completed. Closing job queues.") // Debug for normal, Info for verbose+
+	remainingJobs := atomic.AddInt32(&s.activeJobs, -1)
+	if s.progressBar != nil {
+		completedJobs := s.totalJobsForProgressBar - int(remainingJobs)
+		s.progressBar.Update(completedJobs)
+	}
+
+	if remainingJobs == 0 {
+		if s.config.VerbosityLevel >= 1 {
+			s.logger.Infof("All active jobs completed. Closing doneChan.")
+		} else {
+			s.logger.Debugf("All active jobs completed. Closing doneChan.")
 		}
-		close(s.jobQueue)
-		close(s.retryQueue)
-		close(s.doneChan) // Signal StartScan to complete
+		// Verifica se doneChan já está fechado para evitar pânico
+		select {
+		case <-s.doneChan:
+			// Já fechado
+		default:
+			close(s.doneChan)
+		}
 	}
 }
 
@@ -734,4 +484,318 @@ func modifyURLQueryParam(originalURL string, paramNameToModify string, newParamV
 	queryValues.Set(paramNameToModify, newParamValue)
 	u.RawQuery = queryValues.Encode()
 	return u.String(), nil
+}
+
+// Esqueletos para as novas goroutines gerenciadoras e worker
+
+func (s *Scheduler) domainQueueManager() {
+	defer s.wg.Done()
+	defer s.logger.Debugf("[DomainQueueManager] Exiting.")
+	s.logger.Debugf("[DomainQueueManager] Started.")
+
+	ticker := time.NewTicker(100 * time.Millisecond) 
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.managerStopChan:
+			s.logger.Infof("[DomainQueueManager] Received stop signal. Processing remaining jobs in domainWaitQueues...")
+			// Tentar despachar o que resta nas filas de espera do domínio uma última vez
+			s.processDomainWaitQueues(true) // true para indicar que é uma tentativa final de drenagem
+			// TODO: Considerar o que fazer com jobs que não puderam ser despachados aqui.
+			// Poderiam ser explicitamente "descartados" e activeJobs decrementado se não forem mais ser processados.
+			// Por ora, a lógica de decrementActiveJobs depende dos workers ou do schedulerRetryManager descartando.
+			
+			// Fechar dispatchQueue apenas se este manager for o único produtor restante para ela
+			// e não houver mais jobs que possam ser adicionados por ele.
+			// Isso é complexo se schedulerRetryManager também pode adicionar indiretamente.
+			// O fechamento de dispatchQueue pode ser melhor gerenciado quando todos os workers terminam
+			// e não há mais fontes de jobs.
+			// Por agora, vamos deixar o fechamento da dispatchQueue para quando os workers terminarem (se o range sobre ela terminar).
+			return
+		case job, ok := <-s.masterJobQueue: // CORRIGIDO: espaço após case
+			if !ok {
+				s.logger.Debugf("[DomainQueueManager] masterJobQueue closed.")
+				s.masterJobQueue = nil 
+				// Se masterJobQueue está fechada, este manager ainda precisa processar domainWaitQueues
+				// e eventualmente parar quando managerStopChan for fechado e não houver mais trabalho.
+				continue
+			}
+			s.dispatchOrWait(job)
+
+		case <-ticker.C:
+			s.processDomainWaitQueues(false) // false para processamento normal
+			// Verificar se não há mais fontes de jobs e as filas estão vazias para potencialmente parar antes
+			// if s.masterJobQueue == nil && s.areAllDomainWaitQueuesEmpty() && s.schedulerRetryPQ.Len() == 0 {
+			// 	s.logger.Infof("[DomainQueueManager] No more jobs from master, domain queues empty, and retry PQ empty. Requesting stop.")
+			// 	// Este é um ponto onde poderíamos sinalizar para fechar doneChan se activeJobs também for 0.
+			// 	// No entanto, o doneChan é fechado por decrementActiveJobs. Aqui só pararíamos este manager.
+			// 	// close(s.managerStopChan) // Não, isso é muito cedo, pode haver retries.
+			// }
+		}
+	}
+}
+
+func (s *Scheduler) dispatchOrWait(job TargetURLJob) {
+	nextAvailableTime := s.domainManager.GetNextAvailableTime(job.BaseDomain)
+
+	if time.Now().After(nextAvailableTime) || time.Now().Equal(nextAvailableTime) {
+		// Tentar enviar para dispatchQueue sem bloquear
+		select {
+		case s.dispatchQueue <- job:
+			if s.config.VerbosityLevel >= 2 {
+				s.logger.Debugf("[DomainQueueManager] Job for %s dispatched immediately to worker queue.", job.URLString)
+			}
+		default:
+			// dispatchQueue está cheia, colocar na fila de espera do domínio
+			if s.config.VerbosityLevel >= 1 {
+				s.logger.Infof("[DomainQueueManager] dispatchQueue full. Job for %s for domain %s sent to wait queue.", job.URLString, job.BaseDomain)
+			}
+			s.addToDomainWaitQueue(job)
+		}
+	} else {
+		// Precisa esperar, colocar na fila de espera do domínio
+		if s.config.VerbosityLevel >= 1 {
+			delay := time.Until(nextAvailableTime)
+			s.logger.Infof("[DomainQueueManager] Domain %s not ready for %s. Waiting for %v. Job sent to wait queue.", job.BaseDomain, job.URLString, delay)
+		}
+		s.addToDomainWaitQueue(job)
+	}
+}
+
+func (s *Scheduler) addToDomainWaitQueue(job TargetURLJob) {
+	s.domainWaitQueuesMu.Lock()
+	defer s.domainWaitQueuesMu.Unlock()
+
+	domainList, exists := s.domainWaitQueues[job.BaseDomain]
+	if !exists {
+		domainList = list.New()
+		s.domainWaitQueues[job.BaseDomain] = domainList
+	}
+	domainList.PushBack(job)
+	if s.config.VerbosityLevel >= 2 {
+		s.logger.Debugf("[DomainQueueManager] Job for %s added to wait queue for domain %s (queue size: %d).", job.URLString, job.BaseDomain, domainList.Len())
+	}
+}
+
+func (s *Scheduler) processDomainWaitQueues(draining bool) { // draining indica se estamos tentando limpar as filas antes de sair
+	s.domainWaitQueuesMu.Lock()
+	defer s.domainWaitQueuesMu.Unlock()
+
+	for domain, domainList := range s.domainWaitQueues {
+		if domainList.Len() == 0 {
+			continue
+		}
+
+		// Verificar disponibilidade do domínio repetidamente enquanto houver jobs e o domínio estiver pronto
+		for domainList.Len() > 0 {
+			nextAvailableTime := s.domainManager.GetNextAvailableTime(domain) // Re-checar a cada job
+			if !(time.Now().After(nextAvailableTime) || time.Now().Equal(nextAvailableTime)) {
+				// Domínio não está pronto para o próximo job desta fila de espera
+				if s.config.VerbosityLevel >= 2 && !draining { // Log menos frequente se estiver drenando
+					delay := time.Until(nextAvailableTime)
+					s.logger.Debugf("[DomainQueueManager] processDomainWaitQueues: Domain %s for job %s (wait queue) not ready. Needs %v.", domain, domainList.Front().Value.(TargetURLJob).URLString, delay)
+				}
+				break // Passa para o próximo domínio
+			}
+
+			// Domínio está pronto, tentar despachar o primeiro job da fila
+			element := domainList.Front()
+			job := element.Value.(TargetURLJob)
+
+			select {
+			case s.dispatchQueue <- job:
+				domainList.Remove(element) // Remove da fila de espera APENAS se enviado com sucesso
+				if s.config.VerbosityLevel >= 1 {
+					s.logger.Infof("[DomainQueueManager] Job for %s (from %s wait queue) dispatched to worker. Remaining in wait queue: %d.", job.URLString, domain, domainList.Len())
+				}
+				// Após despachar um job, o lastRequestTime do domínio será atualizado pelo worker.
+				// A próxima chamada a GetNextAvailableTime para este domínio refletirá isso.
+				// Continuar no loop interno para ver se mais jobs deste domínio podem ser despachados AGORA
+				// (se o RPS for alto e o tempo de processamento do worker for rápido).
+			default:
+				// dispatchQueue está cheia, não podemos despachar agora.
+				if s.config.VerbosityLevel >= 1 && !draining {
+					s.logger.Infof("[DomainQueueManager] dispatchQueue full while processing wait queue for domain %s. Will retry later.", domain)
+				}
+				break // Passa para o próximo domínio (ou sai do loop interno se este era o único job)
+			}
+		}
+	}
+}
+
+// func (s *Scheduler) areAllDomainWaitQueuesEmpty() bool { ... } // (Implementar se necessário para shutdown gracioso)
+
+// ... (schedulerRetryManager, worker - ainda precisam da lógica completa) ...
+// ... (buildProbeData, etc.) ...
+
+// Implementação esqueleto para schedulerRetryManager
+func (s *Scheduler) schedulerRetryManager() {
+	defer s.wg.Done()
+	defer s.logger.Debugf("[SchedulerRetryManager] Exiting.")
+	s.logger.Debugf("[SchedulerRetryManager] Started.")
+
+	// Ticker para verificar a schedulerRetryPQ
+	// A frequência pode ser dinâmica baseada no PeekNextTime()
+	// ou um ticker fixo se PeekNextTime() for muito custoso para checar frequentemente.
+	ticker := time.NewTicker(200 * time.Millisecond) // Ex: verificar a cada 200ms
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.managerStopChan:
+			s.logger.Infof("[SchedulerRetryManager] Received stop signal. Processing remaining jobs in retry PQ...")
+			// TODO: Decidir o que fazer com jobs restantes na PQ.
+			//       Por agora, se não puderem ser reenfileirados imediatamente, serão perdidos.
+			//       Uma opção é tentar reenfileirá-los uma última vez.
+			for s.schedulerRetryPQ.Len() > 0 {
+				job, ready := s.schedulerRetryPQ.GetNextJobIfReady()
+				if !ready {
+					break // Nenhum job pronto
+				}
+				s.logger.Debugf("[SchedulerRetryManager] Draining: Job for %s (retry %d) ready. Re-queueing to masterJobQueue.", job.URLString, job.Retries)
+				// Tentar enviar para masterJobQueue sem bloquear. Se falhar, o job é perdido neste ponto do shutdown.
+				// Isso é aceitável se o masterJobQueue não estiver sendo mais consumido ou estiver cheio.
+				select {
+				case s.masterJobQueue <- *job:
+					// Job reenfileirado
+				default:
+					s.logger.Warnf("[SchedulerRetryManager] Draining: Failed to re-queue job for %s to masterJobQueue (full or closed). Job lost.", job.URLString)
+					s.decrementActiveJobs() // Decrementar pois o job não será mais processado
+				}
+			}
+			return
+		case <-ticker.C:
+			for {
+				job, ready := s.schedulerRetryPQ.GetNextJobIfReady()
+				if !ready {
+					break // Nenhum job pronto agora
+				}
+				s.logger.Debugf("[SchedulerRetryManager] Job for %s (retry %d) ready. Re-queueing to masterJobQueue.", job.URLString, job.Retries)
+				
+				// Se masterJobQueue estiver nil (foi fechada e não está mais aceitando jobs),
+				// então não podemos reenfileirar. Isso não deveria acontecer se managerStopChan
+				// ainda não foi fechado e os workers ainda estão processando.
+				// A masterJobQueue é fechada pelo chamador de StartScan APÓS doneChan e APÓS managerStopChan.
+				// No entanto, se os workers pararem de consumir dispatchQueue, e domainQueueManager parar de produzir para dispatchQueue,
+				// e masterJobQueue estiver cheia, isso pode bloquear.
+				// Usar um select para evitar bloqueio indefinido se masterJobQueue estiver cheia.
+				select {
+				case s.masterJobQueue <- *job:
+					// Job reenfileirado com sucesso
+					if s.config.VerbosityLevel >= 1 {
+						s.logger.Infof("[SchedulerRetryManager] Job for %s (retry %d) re-queued to masterJobQueue.", job.URLString, job.Retries)
+					}
+				default:
+					// Não conseguiu reenfileirar (masterJobQueue cheia ou fechada).
+					// Devolver para a retry PQ para tentar mais tarde.
+					// Isso pode acontecer se a masterJobQueue estiver temporariamente cheia.
+					// Adicionar um pequeno delay ou re-adicionar com o mesmo NextAttemptAt pode ser uma opção,
+					// mas para evitar complexidade, vamos apenas logar e assumir que o próximo tick tentará novamente.
+					// Se a masterJobQueue estiver consistentemente cheia, indica um problema de fluxo.
+					s.logger.Warnf("[SchedulerRetryManager] Failed to re-queue job for %s to masterJobQueue. Will retry later.", job.URLString)
+					s.schedulerRetryPQ.AddJob(*job) // Readicionar para tentar mais tarde
+					// Para evitar um loop apertado se a masterJobQueue estiver sempre cheia, sair do loop interno
+					// e esperar pelo próximo tick.
+					goto nextTickerIteration
+				}
+			}
+		nextTickerIteration:
+		}
+	}
+}
+
+// Implementação esqueleto para worker
+func (s *Scheduler) worker(workerID int) {
+	defer s.wg.Done()
+	s.logger.Debugf("[Worker %d] Started.", workerID)
+
+	for job := range s.dispatchQueue { // Consome da nova fila de despacho
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[Worker %d] Processing URL: %s (Attempt %d, Total Active: %d)",
+				workerID, job.URLString, job.Retries+1, atomic.LoadInt32(&s.activeJobs))
+		}
+		
+		// Worker NÃO chama mais CanRequest diretamente para controle de taxa de domínio.
+		// Assume que o job na dispatchQueue está pronto do ponto de vista do domínio (RPS).
+		// O worker precisa, no entanto, registrar que o domínio foi usado.
+		s.domainManager.RecordRequestSent(job.BaseDomain)
+
+		// ----- INÍCIO DA LÓGICA DE PROCESSAMENTO DO JOB (SIMPLIFICADO) -----
+		// Esta parte precisa ser completamente reimplementada com a lógica de baseline, probes A e B.
+		// A lógica de retry abaixo é um exemplo e precisa ser integrada corretamente
+		// com o resultado de cada etapa (baseline, probe header, probe param).
+
+		// Exemplo: Realizar a requisição baseline
+		baselineReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET"}
+		// NOTA: performRequestWithDomainManagement NÃO deve ser usado aqui, pois o controle de taxa já foi feito.
+		// Usar client.PerformRequest diretamente.
+		baselineRespData := s.client.PerformRequest(baselineReqData)
+		
+		// Notificar DomainManager sobre o resultado (especialmente para 429)
+		s.domainManager.RecordRequestResult(job.BaseDomain, statusCodeFromResponse(baselineRespData.Response), baselineRespData.Error)
+
+		var currentErr error = baselineRespData.Error
+		var currentStatusCode int = statusCodeFromResponse(baselineRespData.Response)
+		
+		// Lógica de Retry (Simplificada - precisa de integração com a máquina de estados de probes)
+		// Se um erro que requer retry do SCHEDULER (ex: 429, ou erro de rede persistente)
+		if currentErr != nil || currentStatusCode == 429 || currentStatusCode >= 500 {
+			errMsg := "request failed"
+			if currentErr != nil {
+				errMsg = currentErr.Error()
+			}
+
+			if currentStatusCode == 429 {
+				// DomainManager já foi notificado. O job deve ser reenfileirado via schedulerRetryPQ
+				// para respeitar o novo standby do domínio.
+				s.logger.Warnf("[Worker %d] Job for %s (baseline) got 429. Error: %s. Re-queueing for scheduler retry.", workerID, job.URLString, errMsg)
+				job.Retries++ // Incrementar retries globais do job
+				job.NextAttemptAt = s.domainManager.GetNextAvailableTime(job.BaseDomain) // CORRIGIDO: Usar GetNextAvailableTime
+				if job.Retries < s.maxRetries {
+					s.schedulerRetryPQ.AddJob(job)
+				} else {
+					s.logger.Warnf("[Worker %d] Job for %s DISCARDED after %d retries (last was 429).", workerID, job.URLString, job.Retries)
+					s.decrementActiveJobs()
+				}
+				continue // Próximo job da dispatchQueue
+			}
+
+			// Outros erros (rede, 5xx)
+			job.Retries++
+			if job.Retries < s.maxRetries {
+				job.NextAttemptAt = time.Now().Add(calculateBackoff(job.Retries, s.config.InitialStandbyDuration, s.config.MaxStandbyDuration, s.config.StandbyDurationIncrement))
+				s.logger.Infof("[Worker %d] Baseline for %s failed (Status: %d, Err: %s). Attempt %d/%d. Re-queueing to schedulerRetryPQ after %v.",
+					workerID, job.URLString, currentStatusCode, errMsg, job.Retries, s.maxRetries, time.Until(job.NextAttemptAt))
+				s.schedulerRetryPQ.AddJob(job)
+			} else {
+				s.logger.Warnf("[Worker %d] Baseline for %s DISCARDED after %d retries. Last Status: %d, Error: %s", workerID, job.URLString, job.Retries, currentStatusCode, errMsg)
+				s.decrementActiveJobs()
+			}
+			continue // Próximo job da dispatchQueue
+		}
+
+		// Se baseline foi bem-sucedido:
+		// Aqui viria a lógica de processar o baselineRespData, construir ProbeData,
+		// e então realizar as probes A (headers) e B (params).
+		// Cada probe pode falhar e levar a uma lógica de retry similar à acima.
+		// Se um probe específico falhar (ex: um header específico causa um erro),
+		// e essa falha não for um 429 ou 5xx que afeta o domínio inteiro,
+		// pode-se considerar um retry "local" do worker (ainda não implementado)
+		// ou reenfileirar o job inteiro para o schedulerRetryPQ.
+		// Por simplicidade agora, qualquer falha de probe que necessite retry
+		// reenfileirará o job inteiro para schedulerRetryPQ.
+
+		s.logger.Infof("[Worker %d] Baseline for %s successful (Status: %d). TODO: Implement probe logic.", workerID, job.URLString, currentStatusCode)
+
+		// Placeholder para indicar que o job foi processado (mesmo que só o baseline)
+		// A lógica real de decrementActiveJobs ocorreria após todas as probes e análises.
+		// Se uma probe falhar e for para retry, NÃO decrementar aqui.
+		
+		// Por ora, se chegou aqui sem ir para retry, decrementamos.
+		// ISSO PRECISA MUDAR: decrementActiveJobs só no final do processamento completo do job.
+		s.decrementActiveJobs() 
+		// ----- FIM DA LÓGICA DE PROCESSAMENTO DO JOB (SIMPLIFICADO) -----
+	}
+	s.logger.Debugf("[Worker %d] Exiting (dispatchQueue closed).", workerID)
 }

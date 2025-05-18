@@ -7,7 +7,27 @@ import (
 	"os"
 	"strings"
 	"time"
+	// "github.com/rafabd1/Hemlock/internal/output" // Removido para quebrar ciclo
 )
+
+// Callbacks para interagir com a ProgressBar (ou qualquer coordenador de output)
+var (
+	moveForLogFunc func()
+	showAfterLogFunc func()
+)
+
+// RegisterLogCallbacks permite que um componente externo (como a ProgressBar)
+// registre funções a serem chamadas antes e depois de um log ser escrito.
+func RegisterLogCallbacks(moveFunc func(), showFunc func()) {
+	moveForLogFunc = moveFunc
+	showAfterLogFunc = showFunc
+}
+
+// UnregisterLogCallbacks limpa as callbacks.
+func UnregisterLogCallbacks() {
+	moveForLogFunc = nil
+	showAfterLogFunc = nil
+}
 
 // Logger defines a simple interface for logging.
 // This allows for easy replacement with a more sophisticated logger if needed.
@@ -93,6 +113,13 @@ func NewDefaultLogger(level LogLevel, noColor bool, silent bool) Logger {
 }
 
 func (l *defaultLogger) logInternal(logger *log.Logger, levelStr string, levelColor string, format string, v ...interface{}) {
+	if moveForLogFunc != nil {
+		moveForLogFunc()
+	}
+	if showAfterLogFunc != nil {
+		defer showAfterLogFunc()
+	}
+
 	currentTime := time.Now().Format("15:04:05")
 	prefix := fmt.Sprintf("%s [%s] ",
 		colorize(fmt.Sprintf("[%s]", currentTime), colorDim, l.noColor),
@@ -103,6 +130,11 @@ func (l *defaultLogger) logInternal(logger *log.Logger, levelStr string, levelCo
 }
 
 func (l *defaultLogger) logFatalfInternal(logger *log.Logger, levelStr string, levelColor string, format string, v ...interface{}) {
+	if moveForLogFunc != nil {
+		moveForLogFunc()
+	}
+	// Não chamamos showAfterLogFunc aqui, pois Fatalf sairá.
+
 	currentTime := time.Now().Format("15:04:05")
 	prefix := fmt.Sprintf("%s [%s] ",
 		colorize(fmt.Sprintf("[%s]", currentTime), colorDim, l.noColor),
@@ -126,7 +158,7 @@ func (l *defaultLogger) Infof(format string, v ...interface{}) {
 		return
 	}
 	if l.logLevel <= LevelInfo {
-		l.logInternal(l.infoLogger, "INFO", colorGreen, format, v...)
+		l.logInternal(l.infoLogger, "INFO ", colorGreen, format, v...)
 	}
 }
 
@@ -135,7 +167,7 @@ func (l *defaultLogger) Warnf(format string, v ...interface{}) {
 		return
 	}
 	if l.logLevel <= LevelWarn {
-		l.logInternal(l.warnLogger, "WARN", colorYellow, format, v...)
+		l.logInternal(l.warnLogger, "WARN ", colorYellow, format, v...)
 	}
 }
 
