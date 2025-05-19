@@ -114,6 +114,8 @@ type Scheduler struct {
 	progressBar             *output.ProgressBar
 	totalJobsForProgressBar int
 
+	totalProbesExecuted atomic.Uint64 // NOVO: Contador para probes executadas
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -190,7 +192,10 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	s.totalJobsForProgressBar = len(initialJobs)
 	if s.totalJobsForProgressBar > 0 && !s.config.Silent {
 		s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40)
-		s.progressBar.SetPrefix("Scanning: ")
+		
+		// Definir o prefixo da barra de progresso - AGORA APENAS COM INDICADOR DE SCANNING
+		s.progressBar.SetPrefix("Scanning: ") // Será preenchido dinamicamente com Probes/s
+		
 		s.progressBar.Start()
 		defer func() {
 			s.progressBar.Finalize()
@@ -225,25 +230,59 @@ func (s *Scheduler) StartScan() []*report.Finding {
 		s.logger.Debugf("Scheduler: Starting %d workers. %d initial jobs sent to pendingJobsQueue. JobFeederLoop started.", concurrencyLimit, s.totalJobsForProgressBar)
 	}
 
-	// Goroutine para atualizar barra de progresso (simplificada)
+	// Goroutine para atualizar barra de progresso
 	if s.progressBar != nil {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			ticker := time.NewTicker(500 * time.Millisecond) 
+			ticker := time.NewTicker(500 * time.Millisecond) // Intervalo de atualização da barra
 			defer ticker.Stop()
+
+			var lastProbes uint64 = 0
+			lastTickTime := time.Now() // Tempo da última atualização do PPS
+			currentPPS := 0.0          // PPS atual
+
+			// Formato base do prefixo - Simplificado
+			const basePrefix = "Scanning" // Removido Concurrency e RateLimitString
+
 			for {
 				select {
 				case <-ticker.C:
-					currentActive := atomic.LoadInt32(&s.activeJobs)
-					completedJobs := s.totalJobsForProgressBar - int(currentActive)
+					now := time.Now()
+					currentTotalProbes := s.totalProbesExecuted.Load()
+					
+					deltaProbes := currentTotalProbes - lastProbes
+					deltaTime := now.Sub(lastTickTime).Seconds()
+
+					if deltaTime > 0 {
+						currentPPS = float64(deltaProbes) / deltaTime
+					} else {
+						currentPPS = 0 // Evita divisão por zero se o tick for muito rápido ou o tempo não avançar
+					}
+
+					lastProbes = currentTotalProbes
+					lastTickTime = now
+
+					currentActiveJobs := atomic.LoadInt32(&s.activeJobs)
+					completedJobs := s.totalJobsForProgressBar - int(currentActiveJobs)
+					
+					// Atualiza o prefixo com o Probes/s calculado
+					s.progressBar.SetPrefix(fmt.Sprintf("%s (Probes/s: %.1f): ", basePrefix, currentPPS))
 					s.progressBar.Update(completedJobs)
+
 				case <-s.doneChan: 
 					currentActive := atomic.LoadInt32(&s.activeJobs)
 					completedJobs := s.totalJobsForProgressBar - int(currentActive)
+					// Última atualização do prefixo e da barra
+					finalPPS := 0.0
+					deltaTimeOnDone := time.Since(lastTickTime).Seconds() // Usa o lastTickTime original do loop
+					if deltaTimeOnDone > 0 {
+						finalPPS = float64(s.totalProbesExecuted.Load()-lastProbes) / deltaTimeOnDone
+					}
+					s.progressBar.SetPrefix(fmt.Sprintf("%s (Final Probes/s: %.1f): ", basePrefix, finalPPS))
 					s.progressBar.Update(completedJobs) 
 					return
-				case <-s.ctx.Done(): // Se o contexto principal for cancelado, pare também
+				case <-s.ctx.Done(): 
 				    s.logger.Debugf("[ProgressBar] Scheduler context done, stopping progress bar updater.")
 				    return
 				}
@@ -644,6 +683,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 				probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
 
 				if probeAProbe.Response != nil && probeBProbe.Response != nil {
+					s.totalProbesExecuted.Add(1)
 					finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", hn, injectedValue, baselineProbe, probeAProbe, probeBProbe)
 					if errAnalyse != nil {
 						s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, hn, job.URLString, errAnalyse)
@@ -666,12 +706,30 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			s.mu.Lock()
 			s.findings = append(s.findings, finding)
 			s.mu.Unlock()
+		
+			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
+				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+
 			if finding.Status == report.StatusConfirmed {
-				s.logger.Infof("🎯 CONFIRMED VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
-					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+				prefix := "🎯 CONFIRMED VULNERABILITY [Worker %d] "
+				formattedMessage := fmt.Sprintf(prefix+logMessage, workerID)
+				if !s.config.NoColor {
+					// Constantes de cor de internal/utils/logger.go
+					const colorGreen = "\033[32m"
+					const colorReset = "\033[0m"
+					formattedMessage = colorGreen + formattedMessage + colorReset
+				}
+				s.logger.Infof(formattedMessage) // Logger.Infof já adiciona seu próprio prefixo [INFO] colorido
 			} else if finding.Status == report.StatusPotential {
-				s.logger.Warnf("⚠️ POTENTIALLY VULNERABLE [Worker %d] Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
-					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+				prefix := "⚠️ POTENTIALLY VULNERABLE [Worker %d] "
+				formattedMessage := fmt.Sprintf(prefix+logMessage, workerID)
+				if !s.config.NoColor {
+					// Constantes de cor de internal/utils/logger.go
+					const colorYellow = "\033[33m"
+					const colorReset = "\033[0m"
+					formattedMessage = colorYellow + formattedMessage + colorReset
+				}
+				s.logger.Warnf(formattedMessage) // Logger.Warnf já adiciona seu próprio prefixo [WARN] colorido
 			}
 		}
 	}
@@ -770,6 +828,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 					probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
 
 					if probeAParamProbe.Response != nil && probeBParamProbe.Response != nil {
+						s.totalProbesExecuted.Add(1)
 						// Para AnalyzeProbes com parâmetros, a URL da Probe A (modificada) é mais relevante que a job.URLString original
 						// se a vulnerabilidade se manifesta através da URL modificada.
 						finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", pn, pp, baselineProbe, probeAParamProbe, probeBParamProbe)
@@ -795,12 +854,28 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 			s.mu.Lock()
 			s.findings = append(s.findings, finding)
 			s.mu.Unlock()
+
+			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
+				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+
 			if finding.Status == report.StatusConfirmed {
-				s.logger.Infof("🎯 CONFIRMED VULNERABILITY [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
-					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+				prefix := "🎯 CONFIRMED VULNERABILITY [Worker %d] "
+				formattedMessage := fmt.Sprintf(prefix+logMessage, workerID)
+				if !s.config.NoColor {
+					const colorGreen = "\033[32m"
+					const colorReset = "\033[0m"
+					formattedMessage = colorGreen + formattedMessage + colorReset
+				}
+				s.logger.Infof(formattedMessage)
 			} else if finding.Status == report.StatusPotential {
-				s.logger.Warnf("⚠️ POTENTIALLY VULNERABLE [Worker %d] Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
-					workerID, finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
+				prefix := "⚠️ POTENTIALLY VULNERABLE [Worker %d] "
+				formattedMessage := fmt.Sprintf(prefix+logMessage, workerID)
+				if !s.config.NoColor {
+					const colorYellow = "\033[33m"
+					const colorReset = "\033[0m"
+					formattedMessage = colorYellow + formattedMessage + colorReset
+				}
+				s.logger.Warnf(formattedMessage)
 			}
 		}
 	}

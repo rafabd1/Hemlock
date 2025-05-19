@@ -77,9 +77,17 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 			if reflectionLocationA != "" { reflectionLocationA += " and " }
 			reflectionLocationA += "headers"
 		}
-		// Usar uma cor diferente para este log, por exemplo, ciano
-		p.logger.Infof("    REFLECTED: Input '%s: %s' (type: %s) reflected in Probe A's %s for %s. Cacheable: %t", 
-			inputName, injectedValue, inputType, reflectionLocationA, targetURL, probeA_wasCacheable)
+
+		logMessageFormat := "REFLECTED: Input '%s: %s' (type: %s) reflected in Probe A's %s for %s. Cacheable: %t"
+		formattedMessage := fmt.Sprintf(logMessageFormat, inputName, injectedValue, inputType, reflectionLocationA, targetURL, probeA_wasCacheable)
+
+		if !p.config.NoColor {
+			// Constantes de cor de internal/utils/logger.go
+			const colorBlue = "\033[34m"
+			const colorReset = "\033[0m"
+			formattedMessage = colorBlue + formattedMessage + colorReset
+		}
+		p.logger.Infof(formattedMessage) // Logger.Infof já adiciona seu próprio prefixo [INFO] colorido
 	}
 
 	// --- Heuristic 1: Unkeyed Header Input Leads to Content Reflection in Cache (Classic Poisoning) ---
@@ -175,7 +183,7 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 	if headerChanged || bodyChanged {
 		// Log de influência indireta em Probe A
 		if p.config.VerbosityLevel >= 0 && !p.config.Silent {
-			p.logger.Infof("    INFLUENCE: Input '%s: %s' (type: %s) indirectly influenced Probe A for %s. Cacheable: %t. HdrChg: %t, BodyChg: %t", 
+			p.logger.Infof("INFLUENCE: Input '%s: %s' (type: %s) indirectly influenced Probe A for %s. Cacheable: %t. HdrChg: %t, BodyChg: %t", 
 				inputName, injectedValue, inputType, targetURL, probeA_wasCacheable, headerChanged, bodyChanged)
 		}
 		if p.config.VerbosityLevel >= 1 { // -v
