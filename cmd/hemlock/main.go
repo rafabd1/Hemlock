@@ -66,8 +66,8 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.Input = vp.GetString("input")
 		cfg.CustomHeaders = vp.GetStringSlice("header")
 		cfg.Concurrency = vp.GetInt("concurrency")
-		timeoutSeconds := vp.GetInt("timeout")
-		cfg.RequestTimeout = time.Duration(timeoutSeconds) * time.Second
+		cfg.RequestTimeoutSeconds = vp.GetInt("timeout")
+		cfg.RequestTimeout = time.Duration(cfg.RequestTimeoutSeconds) * time.Second
 		cfg.OutputFile = vp.GetString("output-file")
 		cfg.OutputFormat = vp.GetString("output-format")
 		cfg.ProxyInput = vp.GetString("proxy")
@@ -79,6 +79,25 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.MaxTargetRPS = vp.GetFloat64("rate-limit")
 		cfg.ProbeConcurrency = vp.GetInt("probes")
 
+		// Carregar e converter os novos campos de duração
+		cfg.InitialStandbyDurationSeconds = vp.GetInt("initial-standby-duration")
+		cfg.InitialStandbyDuration = time.Duration(cfg.InitialStandbyDurationSeconds) * time.Second
+
+		cfg.MaxStandbyDurationSeconds = vp.GetInt("max-standby-duration")
+		cfg.MaxStandbyDuration = time.Duration(cfg.MaxStandbyDurationSeconds) * time.Second
+
+		cfg.StandbyDurationIncrementSeconds = vp.GetInt("standby-duration-increment")
+		cfg.StandbyDurationIncrement = time.Duration(cfg.StandbyDurationIncrementSeconds) * time.Second
+
+		cfg.ConductorMinPositiveRetryDelayAfter429Ms = vp.GetInt("conductor-min-positive-retry-delay-after-429")
+		cfg.ConductorMinPositiveRetryDelayAfter429 = time.Duration(cfg.ConductorMinPositiveRetryDelayAfter429Ms) * time.Millisecond
+
+		cfg.ConductorInitialRetryDelaySeconds = vp.GetInt("conductor-initial-retry-delay")
+		cfg.ConductorInitialRetryDelay = time.Duration(cfg.ConductorInitialRetryDelaySeconds) * time.Second
+
+		cfg.ConductorMaxRetryBackoffSeconds = vp.GetInt("conductor-max-retry-backoff")
+		cfg.ConductorMaxRetryBackoff = time.Duration(cfg.ConductorMaxRetryBackoffSeconds) * time.Second
+
 		// Lógica de verbosidade revisada
 		verbosityCount, _ := cmd.Flags().GetCount("verbose") // Usar GetCount diretamente do cmd.Flags()
 
@@ -89,7 +108,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			cfg.VerbosityLevel = verbosityCount
 			switch verbosityCount {
 			case 0:
-				cfg.Verbosity = "info"
+			cfg.Verbosity = "info"
 			case 1:
 				cfg.Verbosity = "debug"
 			default: // >= 2
@@ -101,10 +120,10 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 
 		// Initialize Logger (after verbosity, noColor and silent are set)
 		logLevel := utils.StringToLogLevel(cfg.Verbosity) // cfg.Verbosity string ainda é usada aqui
-		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent) 
+		logger = utils.NewDefaultLogger(logLevel, cfg.NoColor, cfg.Silent)
 		// No futuro, NewDefaultLogger poderia aceitar cfg.VerbosityLevel diretamente
 		// para um controle mais granular se "trace" etc., fossem adicionados.
-
+		
 		// --- Process Input (-i, --input) ---
 		if cfg.Input != "" {
 			// Check if input is a file path
@@ -368,6 +387,18 @@ func init() {
 	if err := rootCmd.PersistentFlags().SetAnnotation("verbose", "description", []string{"Verbosity level (-v for debug, -vv for more debug)"}); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: Failed to set description for verbose flag: %v\n", err)
 	}
+
+	// Novas flags de duração como IntP
+	rootCmd.PersistentFlags().Int("initial-standby-duration", defaults.InitialStandbyDurationSeconds, "Initial standby duration in seconds after a 429 response")
+	rootCmd.PersistentFlags().Int("max-standby-duration", defaults.MaxStandbyDurationSeconds, "Maximum standby duration in seconds for repeated 429s")
+	rootCmd.PersistentFlags().Int("standby-duration-increment", defaults.StandbyDurationIncrementSeconds, "Increment to standby duration in seconds on subsequent 429s")
+	
+	// Para ConductorMinPositiveRetryDelayAfter429, o padrão em config.go é 100ms.
+	// A flag será Int, representando milissegundos.
+	rootCmd.PersistentFlags().Int("conductor-min-positive-retry-delay-after-429", defaults.ConductorMinPositiveRetryDelayAfter429Ms, "Minimum positive retry delay in milliseconds after a 429 (DomainManager)")
+	
+	rootCmd.PersistentFlags().Int("conductor-initial-retry-delay", defaults.ConductorInitialRetryDelaySeconds, "Initial retry delay in seconds for job retries (Scheduler)")
+	rootCmd.PersistentFlags().Int("conductor-max-retry-backoff", defaults.ConductorMaxRetryBackoffSeconds, "Maximum retry backoff in seconds for job retries (Scheduler)")
 
 	if err := viper.ReadInConfig(); err == nil {
 		// ... existing code ...

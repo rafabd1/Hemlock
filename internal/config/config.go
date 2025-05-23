@@ -21,6 +21,7 @@ type Config struct {
 	DefaultPayloadPrefix string
 	Concurrency          int
 	RequestTimeout       time.Duration
+	RequestTimeoutSeconds int           `mapstructure:"request-timeout-seconds"`
 	OutputFile           string
 	OutputFormat         string
 	Verbosity            string // String representation from CLI/Viper (e.g., "debug", "info")
@@ -36,12 +37,15 @@ type Config struct {
 	Silent               bool     // To suppress non-critical logs
 
 	// New fields for dynamic rate limiting and standby
-	InitialTargetRPS         float64       `mapstructure:"initial-target-rps"`
-	MinTargetRPS             float64       `mapstructure:"min-target-rps"`
-	MaxTargetRPS             float64       `mapstructure:"max-target-rps"`
-	InitialStandbyDuration   time.Duration `mapstructure:"initial-standby-duration"`
-	MaxStandbyDuration       time.Duration `mapstructure:"max-standby-duration"`
-	StandbyDurationIncrement time.Duration `mapstructure:"standby-duration-increment"`
+	InitialTargetRPS         float64        `mapstructure:"initial-target-rps"`
+	MinTargetRPS             float64        `mapstructure:"min-target-rps"`
+	MaxTargetRPS             float64        `mapstructure:"max-target-rps"`
+	InitialStandbyDuration        time.Duration // Populado a partir de InitialStandbyDurationSeconds
+	InitialStandbyDurationSeconds int           `mapstructure:"initial-standby-duration-seconds"`
+	MaxStandbyDuration        time.Duration // Populado a partir de MaxStandbyDurationSeconds
+	MaxStandbyDurationSeconds int           `mapstructure:"max-standby-duration-seconds"`
+	StandbyDurationIncrement        time.Duration // Populado a partir de StandbyDurationIncrementSeconds
+	StandbyDurationIncrementSeconds int           `mapstructure:"standby-duration-increment-seconds"`
 
 	// New fields for unified input
 	Input string // New: For unified input -i, --input
@@ -50,9 +54,12 @@ type Config struct {
 	InsecureSkipVerify bool // New: For --insecure flag
 
 	// New fields for DomainConductor specific delays
-	ConductorMinPositiveRetryDelayAfter429 time.Duration `mapstructure:"conductor-min-positive-retry-delay-after-429"`
-	ConductorInitialRetryDelay             time.Duration `mapstructure:"conductor-initial-retry-delay"`
-	ConductorMaxRetryBackoff               time.Duration `mapstructure:"conductor-max-retry-backoff"`
+	ConductorMinPositiveRetryDelayAfter429        time.Duration // Populado a partir de ...Ms
+	ConductorMinPositiveRetryDelayAfter429Ms int           `mapstructure:"conductor-min-positive-retry-delay-after-429-ms"`
+	ConductorInitialRetryDelay        time.Duration // Populado a partir de ...Seconds
+	ConductorInitialRetryDelaySeconds int           `mapstructure:"conductor-initial-retry-delay-seconds"`
+	ConductorMaxRetryBackoff        time.Duration // Populado a partir de ...Seconds
+	ConductorMaxRetryBackoffSeconds int           `mapstructure:"conductor-max-retry-backoff-seconds"`
 
 	// New field for probe concurrency within a single URL job
 	ProbeConcurrency int `mapstructure:"probe-concurrency"`
@@ -116,6 +123,7 @@ func GetDefaultConfig() *Config {
 		DefaultPayloadPrefix: "hemlock",
 		Concurrency:          10,
 		RequestTimeout:       10 * time.Second,
+		RequestTimeoutSeconds:       10, // Default 10 segundos
 		OutputFile:           "",       // No output file by default
 		OutputFormat:         "json",   // Default to JSON
 		Verbosity:            "info",   // Default string verbosity
@@ -134,9 +142,12 @@ func GetDefaultConfig() *Config {
 		InitialTargetRPS:         1.0,
 		MinTargetRPS:             0.5,
 		MaxTargetRPS:             10.0,
-		InitialStandbyDuration:   1 * time.Minute,
-		MaxStandbyDuration:       5 * time.Minute,
-		StandbyDurationIncrement: 1 * time.Minute,
+		InitialStandbyDurationSeconds:   60,    // Default 60 segundos (1 minuto)
+		InitialStandbyDuration:        1 * time.Minute,
+		MaxStandbyDurationSeconds:     300,   // Default 300 segundos (5 minutos)
+		MaxStandbyDuration:          5 * time.Minute,
+		StandbyDurationIncrementSeconds: 60,    // Default 60 segundos (1 minuto)
+		StandbyDurationIncrement:      1 * time.Minute,
 
 		// Defaults for new fields for unified input
 		Input: "", // Default for new input flag
@@ -145,8 +156,11 @@ func GetDefaultConfig() *Config {
 		InsecureSkipVerify: false, // Default for new --insecure flag
 
 		// Defaults for DomainConductor delays
+		ConductorMinPositiveRetryDelayAfter429Ms: 100, // Default 100 ms
 		ConductorMinPositiveRetryDelayAfter429: 100 * time.Millisecond,
+		ConductorInitialRetryDelaySeconds:             1,    // Default 1 segundo
 		ConductorInitialRetryDelay:             1 * time.Second,
+		ConductorMaxRetryBackoffSeconds:               30,   // Default 30 segundos
 		ConductorMaxRetryBackoff:               30 * time.Second,
 
 		// Default for probe concurrency
@@ -218,6 +232,10 @@ func GetUserHomeDir() (string, error) {
 
 // Validate is still useful for validating the Config struct after being populated by Viper.
 func (c *Config) Validate() error {
+	if c.MaxTargetRPS == 0.0 {
+		c.MaxTargetRPS = DefaultMaxInternalRPS
+	}
+
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("requestTimeout must be positive")
 	}

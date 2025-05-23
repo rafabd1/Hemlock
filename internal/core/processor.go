@@ -203,7 +203,7 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 		}
 		
 		evidence := fmt.Sprintf("Probe A cacheable: true. Probe B cache HIT indicated: %t. Probe A and B bodies similar: %t (threshold 0.98). Header change: %s. Body change: %s.", 
-		    probeB_isCacheHit, bodiesSimilar_AB, headerChangeDesc, bodyChangeDesc)
+			probeB_isCacheHit, bodiesSimilar_AB, headerChangeDesc, bodyChangeDesc)
 
 		if probeB_isCacheHit || (probeA_wasCacheable && bodiesSimilar_AB) { // Se Probe A era cacheável (já checado) e B é hit ou similar
 			return &report.Finding{

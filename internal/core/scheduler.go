@@ -394,16 +394,16 @@ func (s *Scheduler) jobFeederLoop() {
 						case <-time.After(time.Until(item.NextAttemptAt)):
 						case <-s.ctx.Done():
 							s.logger.Infof("[JobFeeder] Context done while draining heap (job %s). Discarding.", item.Job.URLString)
-							s.decrementActiveJobs()
+			s.decrementActiveJobs()
 							continue
-						}
-					}
+		}
+	}
 					s.trySendToWorkerOrRequeue(item.Job, waitingJobsHeap)
-				}
+	}
 				return // Sai do jobFeederLoop
 			}
 
-			if s.config.VerbosityLevel >= 2 { // -vv
+	if s.config.VerbosityLevel >= 2 { // -vv
 				s.logger.Debugf("[JobFeeder] Received job %s (for %s, next attempt at %s) from pendingJobsQueue. Adding to heap.",
 					job.URLString, job.BaseDomain, job.NextAttemptAt.Format(time.RFC3339))
 			}
@@ -453,7 +453,7 @@ func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQu
 	now := time.Now()
 
 	if can {
-		if s.config.VerbosityLevel >= 2 { // -vv
+					if s.config.VerbosityLevel >= 2 { // -vv
 			s.logger.Debugf("[JobFeeder] DomainManager allows job %s for %s. Attempting to send to workerJobQueue.", job.URLString, job.BaseDomain)
 		}
 		// Tentar enviar para o workerJobQueue, mas não bloquear indefinidamente.
@@ -482,7 +482,7 @@ func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQu
 		//  return
 		// A abordagem atual de bloqueio no send para workerJobQueue é aceitável se o s.ctx.Done() o interromper.
 		}
-	} else {
+		} else {
 		job.NextAttemptAt = now.Add(waitTimeDM)
 		if s.config.VerbosityLevel >= 1 {
 			s.logger.Infof("[JobFeeder] DomainManager denied job %s for %s. Re-queuing to heap for %s (NextAttemptAt: %s).",
@@ -509,8 +509,8 @@ func (s *Scheduler) worker(workerID int) {
 			// No entanto, se o scheduler está parando, é melhor sair do loop do worker para liberar recursos mais rapidamente.
 			// Se isSchedulerStopping() for true, o jobFeederLoop também deve parar e fechar workerJobQueue, o que terminará este loop.
 			// A ação mais segura é retornar aqui para garantir que o worker pare se o contexto for cancelado.
-			return 
-		}
+		return
+	}
 
 		if s.config.VerbosityLevel >= 2 { // -vv
 			s.logger.Debugf("[Worker %d] Received job %s (for %s) from jobFeeder. Proceeding to processURLJob.", 
@@ -540,7 +540,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	var probeSemaphore chan struct{}
 	if s.config.ProbeConcurrency > 0 { // Embora validado, uma checagem extra não faz mal.
 		probeSemaphore = make(chan struct{}, s.config.ProbeConcurrency)
-	} else {
+				} else {
 		// Fallback para concorrência mínima de 1 se por algum motivo chegou aqui com valor inválido.
 		// Isso não deve acontecer devido à config.Validate().
 		s.logger.Warnf("[Worker %d] ProbeConcurrency é <= 0 (%d) para job %s, usando fallback de 1. Isso não deveria acontecer.", workerID, s.config.ProbeConcurrency, job.URLString)
@@ -670,7 +670,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 
 				if s.isJobContextDone(jobCtx) { return }
 				if probeBRespData.Error != nil || statusCodeFromResponse(probeBRespData.Response) == 429 {
-					if statusCodeFromResponse(probeBRespData.Response) == 429 {
+			if statusCodeFromResponse(probeBRespData.Response) == 429 {
 						s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, hn, job.URLString, job.BaseDomain)
 						cancelJob()
 						return
@@ -703,9 +703,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 
 		// Coletar findings dos testes de header e logar de acordo com o Status
 		for finding := range headerFindingsChan {
-			s.mu.Lock()
-			s.findings = append(s.findings, finding)
-			s.mu.Unlock()
+					s.mu.Lock()
+					s.findings = append(s.findings, finding)
+					s.mu.Unlock()
 		
 			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
 				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
@@ -782,7 +782,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 					}
 
 					probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, pn, pp)
-					if errProbeAURL != nil {
+				if errProbeAURL != nil {
 						s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for param test ('%s=%s'): %v. Skipping this param test.", workerID, pn, pp, errProbeAURL)
 						return
 					}
@@ -795,7 +795,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 
 					if s.isJobContextDone(jobCtx) { return }
 					if probeAParamRespData.Error != nil || statusCodeFromResponse(probeAParamRespData.Response) == 429 {
-						if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
+				if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
 							s.logger.Warnf("[Worker %d] Probe A (Param '%s=%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, pn, pp, probeAURL, job.BaseDomain)
 							cancelJob() // Cancelar o contexto do job inteiro em caso de 429
 							return
@@ -825,7 +825,7 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 					    }
 						return
 					}
-					probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
+				probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
 
 					if probeAParamProbe.Response != nil && probeBParamProbe.Response != nil {
 						s.totalProbesExecuted.Add(1)
@@ -851,9 +851,9 @@ endHeaderTests: // Rótulo para goto em caso de cancelamento do jobCtx
 
 		// Coletar findings dos testes de parâmetro e logar de acordo com o Status
 		for finding := range paramFindingsChan {
-			s.mu.Lock()
-			s.findings = append(s.findings, finding)
-			s.mu.Unlock()
+						s.mu.Lock()
+						s.findings = append(s.findings, finding)
+						s.mu.Unlock()
 
 			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
 				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
@@ -887,7 +887,7 @@ endParamTests: // Rótulo para goto em caso de cancelamento do jobCtx
 		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before completion: %w", jobCtx.Err()), 0)
 		return
 		default:
-		if s.config.VerbosityLevel >= 1 {
+		if s.config.VerbosityLevel >= 1 { 
 			s.logger.Infof("[Worker %d] Successfully COMPLETED all tests for job: %s (Total Scheduler Attempts: %d)", workerID, job.URLString, job.Retries+1)
 		}
 		s.handleJobOutcome(job, true, nil, 0) // Nova função

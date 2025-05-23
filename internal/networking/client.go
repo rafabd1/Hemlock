@@ -68,12 +68,13 @@ func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
 		DialContext: (&net.Dialer{
 			Timeout:   cfg.RequestTimeout,
-			KeepAlive: 30 * time.Second,
+			KeepAlive: 30 * time.Second, // Este KeepAlive é para o dialer, não para as conexões HTTP persistentes
 		}).DialContext,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		DisableKeepAlives:     true,
 	}
 
 	if len(cfg.ParsedProxies) > 0 {
