@@ -48,7 +48,6 @@ type ProgressBar struct {
     mu               sync.Mutex
     done             chan struct{}
     writer           io.Writer
-    lastPrintedChars int
     autoRefresh      bool
     isActive         bool
     spinner          int
@@ -68,7 +67,7 @@ func NewProgressBar(total int, width int) *ProgressBar {
         total:         total,
         current:       0,
         width:         width,
-        refresh:       100 * time.Millisecond,
+        refresh:       250 * time.Millisecond,
         // startTime será setado em Start()
         done:          make(chan struct{}),
         writer:        os.Stderr, // Logs para Stderr por padrão
@@ -278,6 +277,21 @@ func (pb *ProgressBar) SetSuffix(suffix string) {
     pb.mu.Unlock()
 }
 
+// SetTotalAndReset permite redefinir o total da barra de progresso,
+// zerar a contagem atual e reiniciar o tempo para cálculo do ETA.
+// Útil para barras de progresso multifásicas.
+func (pb *ProgressBar) SetTotalAndReset(newTotal int) {
+	pb.mu.Lock()
+	pb.total = newTotal
+	pb.current = 0
+	pb.startTime = time.Now() // Reinicia o tempo para o cálculo do ETA da nova fase
+	pb.mu.Unlock()
+	// Força um render para mostrar a barra resetada se estiver ativa
+	if pb.isTerminal && pb.isActive && !pb.renderPaused {
+		pb.requestRender()
+	}
+}
+
 // PauseRender impede temporariamente que a barra seja redesenhada.
 func (pb *ProgressBar) PauseRender() {
     pb.mu.Lock()
@@ -361,6 +375,9 @@ func (pb *ProgressBar) actualRender() {
     // pb.lastPrintedChars = len(status) 
     pb.mu.Unlock()
     
+    // DEBUG: Temporarily log to understand flickering
+    // fmt.Fprintf(os.Stderr, "[DEBUG PB RENDER] Instance: %p, Prefix: '%s', Current: %d, Total: %d, IsActive: %t, Paused: %t, Spinner: %s\n", pb, pb.prefix, currentProgress, currentTotal, pb.isActive, pb.renderPaused, pb.spinnerChars[pb.spinner])
+
     tc := GetTerminalController()
     tc.BeginOutput() // Bloqueia outros logs
     fmt.Fprint(pb.writer, "\033[2K\r"+status) // Limpa linha, volta ao início, imprime status
@@ -439,4 +456,10 @@ func formatDuration(d time.Duration) string {
     }
     
     return fmt.Sprintf("%dh%02dm%02ds", h, m, sRemaining)
+}
+
+func (pb *ProgressBar) GetPrefixForDebug() string {
+    pb.mu.Lock()
+    defer pb.mu.Unlock()
+    return pb.prefix
 } 

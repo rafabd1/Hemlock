@@ -19,14 +19,25 @@ import (
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
 
+// JobType defines the type of work a TargetURLJob represents.
+type JobType string
+
+const (
+	// JobTypeCacheabilityCheck indicates a job to check if a base URL is cacheable.
+	JobTypeCacheabilityCheck JobType = "CacheabilityCheck"
+	// JobTypeFullProbe indicates a job to perform full header/parameter probes on a cacheable URL.
+	JobTypeFullProbe JobType = "FullProbe"
+)
+
 // TargetURLJob struct defines a unit of work for a worker.
 // It contains the specific URL (with parameters) to be tested and its base domain.
 type TargetURLJob struct {
-	URLString      string            // The full URL with specific parameters for this job
+	URLString      string            // For CacheabilityCheck: base URL. For FullProbe: full URL with params.
 	BaseDomain     string
-	OriginalParams map[string]string // The params that formed this specific URLString
+	OriginalParams map[string]string // Relevant for FullProbe type, empty/nil for CacheabilityCheck.
 	Retries        int               // Number of times this job has been attempted
 	NextAttemptAt  time.Time         // Time after which this job can be retried
+	JobType        JobType           // Type of job
 }
 
 // ScanTaskResult holds the outcome of scanning a single URL.
@@ -110,14 +121,20 @@ type Scheduler struct {
 	activeJobs    int32         // Counter for all active jobs (main + retry)
 	maxRetries    int           // From config
 	doneChan      chan struct{}   // Signals all processing is complete
+	closeDoneChanOnce sync.Once // Garante que doneChan seja fechado apenas uma vez
 
 	progressBar             *output.ProgressBar
-	totalJobsForProgressBar int
+	totalJobsForProgressBar int // This will now represent the total for the *current phase* being displayed
+	completedJobsInPhaseForBar int // Counter for jobs completed in the current phase for progress bar
 
 	totalProbesExecuted atomic.Uint64 // NOVO: Contador para probes executadas
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Fields for two-phase scanning
+	confirmedCacheableBaseURLs map[string]bool // Stores base URLs confirmed as cacheable
+	phase1CompletionWg         sync.WaitGroup    // WaitGroup for cacheability check phase
 }
 
 // NewScheduler creates a new Scheduler instance.
@@ -166,154 +183,176 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	s.logger.Debugf("Scheduler: Initializing scan...")
 	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
-	defer s.cancel()
+	// Defer para limpeza finalíssima da última instância da barra e contexto do scheduler
+	defer func() {
+		if s.progressBar != nil { // Se alguma barra foi criada em algum momento
+			s.progressBar.Finalize()
+		}
+		output.SetActiveProgressBar(nil) // Garante que nenhuma barra fique como global no final
+		s.cancel()                       // Cancela o contexto principal do scheduler
+	}()
 
 	if len(uniqueBaseURLs) == 0 {
 		s.logger.Warnf("Scheduler: No processable targets. Aborting scan.")
 		return s.findings
 	}
 
-	var initialJobs []TargetURLJob
-	for _, baseURL := range uniqueBaseURLs {
-		parsedBase, _ := url.Parse(baseURL)
-		baseDomain := parsedBase.Hostname()
-		paramSets := groupedBaseURLsAndParams[baseURL]
-		for _, paramSet := range paramSets {
-			actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
-			initialJobs = append(initialJobs, TargetURLJob{URLString: actualTargetURL, BaseDomain: baseDomain, OriginalParams: paramSet, NextAttemptAt: time.Now()})
-		}
-	}
-
-	if len(initialJobs) == 0 {
-		s.logger.Warnf("Scheduler: No testable URL jobs created. Aborting scan.")
-		return s.findings
-	}
-
-	s.totalJobsForProgressBar = len(initialJobs)
-	if s.totalJobsForProgressBar > 0 && !s.config.Silent {
-		s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40)
-		
-		// Definir o prefixo da barra de progresso - AGORA APENAS COM INDICADOR DE SCANNING
-		s.progressBar.SetPrefix("Scanning: ") // Será preenchido dinamicamente com Probes/s
-		
-		s.progressBar.Start()
-		defer func() {
-			s.progressBar.Finalize()
-			output.SetActiveProgressBar(nil)
-		}()
-	}
-
+	// Inicializar canais ANTES de iniciar jobFeederLoop
+	// A capacidade exata de pendingQueueBufferSize será definida mais tarde, quando soubermos o total da Fase 1.
+	// Por enquanto, um buffer razoável para workerJobQueue.
 	concurrencyLimit := s.config.Concurrency
 	if concurrencyLimit <= 0 { concurrencyLimit = 1 }
+	s.workerJobQueue = make(chan TargetURLJob, concurrencyLimit)
+	// pendingJobsQueue será inicializado após calcularmos os jobs da Fase 1 ou um total preliminar.
 
-	// Define um buffer grande para pendingJobsQueue, pois ela pode acumular jobs temporariamente.
-	// O tamanho pode ser igual ao total de jobs + workers para segurança, ou um múltiplo.
-	pendingQueueBufferSize := s.totalJobsForProgressBar + concurrencyLimit
-	if pendingQueueBufferSize < 100 { // Garante um buffer mínimo razoável
-	    pendingQueueBufferSize = 100
-	}
-	s.pendingJobsQueue = make(chan TargetURLJob, pendingQueueBufferSize) 
-	s.workerJobQueue = make(chan TargetURLJob, concurrencyLimit) // workerJobQueue pode ter buffer menor, pois o feeder controla o fluxo
-	atomic.StoreInt32(&s.activeJobs, int32(s.totalJobsForProgressBar))
-
-	// Inicia o jobFeederLoop
-	s.wg.Add(1)
-	go s.jobFeederLoop()
-
-	// Popula a PENDING job queue com os jobs iniciais.
-	// O jobFeederLoop irá então pegá-los e enviá-los para workerJobQueue quando apropriado.
-	for _, job := range initialJobs {
-		s.pendingJobsQueue <- job 
-	}
-
-	if s.config.VerbosityLevel >= 2 { // -vv
-		s.logger.Debugf("Scheduler: Starting %d workers. %d initial jobs sent to pendingJobsQueue. JobFeederLoop started.", concurrencyLimit, s.totalJobsForProgressBar)
+	// --- PHASE 1: Cacheability Checks ---
+	s.logger.Infof("Scheduler: Starting Phase 1 - Cacheability Checks for %d unique base URLs.", len(uniqueBaseURLs))
+	s.confirmedCacheableBaseURLs = make(map[string]bool)
+	
+	var phase1Jobs []TargetURLJob
+	for _, baseURL := range uniqueBaseURLs {
+		parsedBase, err := url.Parse(baseURL)
+		if err != nil {
+			s.logger.Warnf("Scheduler: Failed to parse base URL '%s' for cacheability check: %v. Skipping.", baseURL, err)
+			continue
+		}
+		phase1Jobs = append(phase1Jobs, TargetURLJob{
+			URLString:  baseURL,
+			BaseDomain: parsedBase.Hostname(),
+			JobType:    JobTypeCacheabilityCheck,
+			NextAttemptAt: time.Now(),
+		})
 	}
 
-	// Goroutine para atualizar barra de progresso
-	if s.progressBar != nil {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			ticker := time.NewTicker(500 * time.Millisecond) // Intervalo de atualização da barra
-			defer ticker.Stop()
+	s.phase1CompletionWg.Add(len(phase1Jobs)) // Adiciona ao WaitGroup ANTES de iniciar workers ou enfileirar
 
-			var lastProbes uint64 = 0
-			lastTickTime := time.Now() // Tempo da última atualização do PPS
-			currentPPS := 0.0          // PPS atual
-
-			// Formato base do prefixo - Simplificado
-			const basePrefix = "Scanning" // Removido Concurrency e RateLimitString
-
-			for {
-				select {
-				case <-ticker.C:
-					now := time.Now()
-					currentTotalProbes := s.totalProbesExecuted.Load()
-					
-					deltaProbes := currentTotalProbes - lastProbes
-					deltaTime := now.Sub(lastTickTime).Seconds()
-
-					if deltaTime > 0 {
-						currentPPS = float64(deltaProbes) / deltaTime
-					} else {
-						currentPPS = 0 // Evita divisão por zero se o tick for muito rápido ou o tempo não avançar
-					}
-
-					lastProbes = currentTotalProbes
-					lastTickTime = now
-
-					currentActiveJobs := atomic.LoadInt32(&s.activeJobs)
-					completedJobs := s.totalJobsForProgressBar - int(currentActiveJobs)
-					
-					// Atualiza o prefixo com o Probes/s calculado
-					s.progressBar.SetPrefix(fmt.Sprintf("%s (Probes/s: %.1f): ", basePrefix, currentPPS))
-					s.progressBar.Update(completedJobs)
-
-				case <-s.doneChan: 
-					currentActive := atomic.LoadInt32(&s.activeJobs)
-					completedJobs := s.totalJobsForProgressBar - int(currentActive)
-					// Última atualização do prefixo e da barra
-					finalPPS := 0.0
-					deltaTimeOnDone := time.Since(lastTickTime).Seconds() // Usa o lastTickTime original do loop
-					if deltaTimeOnDone > 0 {
-						finalPPS = float64(s.totalProbesExecuted.Load()-lastProbes) / deltaTimeOnDone
-					}
-					s.progressBar.SetPrefix(fmt.Sprintf("%s (Final Probes/s: %.1f): ", basePrefix, finalPPS))
-					s.progressBar.Update(completedJobs) 
-					return
-				case <-s.ctx.Done(): 
-				    s.logger.Debugf("[ProgressBar] Scheduler context done, stopping progress bar updater.")
-				    return
-				}
-			}
-		}()
-	}
+	// Inicializa pendingJobsQueue e workers DEPOIS de saber len(phase1Jobs)
+	pendingQueueBufferSizePhase1 := len(phase1Jobs) + concurrencyLimit // concurrencyLimit já definido
+	if pendingQueueBufferSizePhase1 < 100 {pendingQueueBufferSizePhase1 = 100}
+	s.pendingJobsQueue = make(chan TargetURLJob, pendingQueueBufferSizePhase1)
 
 	for i := 0; i < concurrencyLimit; i++ {
 		s.wg.Add(1)
 		go s.worker(i) 
 	}
+	
+	if len(phase1Jobs) > 0 {
+		atomic.AddInt32(&s.activeJobs, int32(len(phase1Jobs))) // INCREMENTA activeJobs para Fase 1
+		for _, job := range phase1Jobs {
+			s.pendingJobsQueue <- job
+		}
+	} else {
+		s.logger.Warnf("Scheduler: No jobs created for Phase 1 (Cacheability Check).")
+		// Se não houver jobs na Fase 1, a goroutine orquestradora (que espera phase1CompletionWg)
+		// será liberada imediatamente se len(phase1Jobs) for 0 e Add(0) foi chamado.
+		// Ela então procederá para a Fase 2 ou finalizará.
+	}
+	
+	// Configuração da barra da Fase 1
+	s.totalJobsForProgressBar = len(phase1Jobs) // Total for Phase 1 progress bar
+	s.completedJobsInPhaseForBar = 0            // Reset for Phase 1
 
+	if s.totalJobsForProgressBar > 0 && !s.config.Silent { // Initialize progress bar here for Phase 1
+		s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40)
+		s.progressBar.SetPrefix("Phase 1/2 (Cache Checks): ")
+		s.progressBar.Start()
+	} else if !s.config.Silent { // Handle case where Phase 1 has 0 jobs but we still might want a bar for Phase 2
+		s.progressBar = output.NewProgressBar(0, 40) // Start with 0, will be reset
+		s.progressBar.SetPrefix("Phase 1/2 (Cache Checks): ")
+		s.progressBar.Start()
+	}
+	
+	// Start jobFeederLoop and workers
+	s.wg.Add(1) // For feeder
+	go s.jobFeederLoop()
+	
+	// Goroutine to manage transition to Phase 2
+	s.wg.Add(1) // For this orchestrating goroutine
+	go func() {
+		defer s.wg.Done()
+
+		s.phase1CompletionWg.Wait() // Wait for all Phase 1 jobs to complete
+
+		// Captura a instância da barra da Fase 1 ANTES de qualquer coisa da Fase 2
+		progressBarPhase1 := s.progressBar
+
+		// Parar e limpar a barra da Fase 1
+		if progressBarPhase1 != nil {
+			// fmt.Fprintf(os.Stderr, "\n[DEBUG SCHED] About to Stop Phase 1 bar. Instance: %p, Prefix: '%s'\n", progressBarPhase1, progressBarPhase1.GetPrefixForDebug())
+			progressBarPhase1.Stop()
+			// fmt.Fprintf(os.Stderr, "[DEBUG SCHED] Done Stopping Phase 1 bar. Instance: %p\n", progressBarPhase1)
+		}
+
+		s.mu.Lock()
+		numCacheable := len(s.confirmedCacheableBaseURLs)
+		s.mu.Unlock()
+		s.logger.Infof("Scheduler: Phase 1 (Cacheability Check) COMPLETED. Found %d cacheable base URLs.", numCacheable)
+
+		var phase2Jobs []TargetURLJob
+		if numCacheable > 0 {
+			for _, baseURL := range uniqueBaseURLs { 
+				s.mu.Lock()
+				isBaseCacheable := s.confirmedCacheableBaseURLs[baseURL]
+				s.mu.Unlock()
+
+				if isBaseCacheable {
+					paramSets := groupedBaseURLsAndParams[baseURL]
+					parsedBase, _ := url.Parse(baseURL) 
+					baseDomain := parsedBase.Hostname()
+					for _, paramSet := range paramSets {
+						actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
+						phase2Jobs = append(phase2Jobs, TargetURLJob{
+							URLString:      actualTargetURL,
+							BaseDomain:     baseDomain,
+							OriginalParams: paramSet,
+							JobType:        JobTypeFullProbe,
+							NextAttemptAt:  time.Now(),
+						})
+					}
+				}
+			}
+		}
+		
+		// Incrementar activeJobs para Fase 2 ANTES de enfileirar e ANTES que doneChan possa ser fechado
+		if len(phase2Jobs) > 0 {
+			atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs)))
+		}
+
+		s.logger.Infof("Scheduler: Starting Phase 2 - Full Probing with %d jobs.", len(phase2Jobs))
+		
+		// Configuração da barra da Fase 2
+		if len(phase2Jobs) > 0 && !s.config.Silent {
+			s.progressBar = output.NewProgressBar(len(phase2Jobs), 40) // s.progressBar é agora a da Fase 2
+			s.progressBar.SetPrefix("Phase 2 - Probing: ")
+			s.completedJobsInPhaseForBar = 0
+			s.progressBar.Start()
+		} else if progressBarPhase1 != nil { 
+			// Se não há jobs na Fase 2, mas havia uma barra na Fase 1 (que já foi parada),
+			// garante que nenhuma barra esteja como global.
+			output.SetActiveProgressBar(nil)
+		} else {
+			// Se não havia barra na Fase 1 e não há jobs na Fase 2
+			output.SetActiveProgressBar(nil)
+		}
+
+		if len(phase2Jobs) > 0 {
+			atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs)))
+			for _, job := range phase2Jobs {
+				s.pendingJobsQueue <- job
+			}
+		} else {
+			// Se não há jobs na fase 2, e fase 1 também já terminou (activeJobs seria 0 se fase 1 não teve jobs ou todos acabaram)
+			if atomic.LoadInt32(&s.activeJobs) == 0 {
+				s.logger.Infof("Scheduler: No Phase 1 or Phase 2 jobs to run. Signaling completion via orchestrator.")
+				s.closeDoneChanOnce.Do(func() {
+					close(s.doneChan)
+				})
+			}
+		}
+	}() // End of orchestrator goroutine
+
+	// Main wait for all jobs (Phase 1 + Phase 2) to complete
 	<-s.doneChan
-
-	// 3. Fechar pendingJobsQueue PRIMEIRO.
-	// Isso sinaliza ao jobFeederLoop que não haverá mais jobs novos ou reenfileirados.
-	// O jobFeederLoop irá então processar o que resta em pendingJobsQueue, depois fechará
-	// workerJobQueue e terminará sua própria goroutine (chamando s.wg.Done()).
-	if s.config.VerbosityLevel >= 1 {
-	    s.logger.Infof("[Scheduler] All jobs processed according to activeJobs. Closing pendingJobsQueue to signal jobFeeder to complete.")
-	}
-	close(s.pendingJobsQueue)
-
-	// 4. Espera por todas as goroutines (workers, jobFeederLoop, progressBar updater) terminarem.
-	//    - Workers terminarão quando workerJobQueue for fechada pelo jobFeederLoop.
-	//    - JobFeederLoop terminará após pendingJobsQueue ser fechada e ele processar o restante.
-	//    - ProgressBar updater terminará quando s.doneChan ou s.ctx.Done() ocorrer.
-	if s.config.VerbosityLevel >= 1 {
-	    s.logger.Infof("[Scheduler] Waiting for all goroutines to complete (Wait Group)...")
-	}
-	s.wg.Wait() 
 
 	s.logger.Infof("Scheduler: All scan tasks, workers, and job feeder completed.")
 	return s.findings
@@ -502,21 +541,37 @@ func (s *Scheduler) worker(workerID int) {
 
 	for job := range s.workerJobQueue { 
 		if s.isSchedulerStopping() { 
-			s.logger.Infof("[Worker %d] Scheduler context done. Job %s (read from queue) will not be processed. Decrementing active jobs.", workerID, job.URLString)
-			s.decrementActiveJobs() // DECREMENTAR AQUI (Cenário C)
-			// Não precisa `continue` ou `return` aqui se a intenção é apenas processar os jobs que já estão no buffer de workerJobQueue
-			// e então sair quando o canal for fechado. 
-			// No entanto, se o scheduler está parando, é melhor sair do loop do worker para liberar recursos mais rapidamente.
-			// Se isSchedulerStopping() for true, o jobFeederLoop também deve parar e fechar workerJobQueue, o que terminará este loop.
-			// A ação mais segura é retornar aqui para garantir que o worker pare se o contexto for cancelado.
-		return
-	}
+			s.logger.Infof("[Worker %d] Scheduler context done. Job %s (type: %s, read from queue) will not be processed. Decrementing active jobs.", workerID, job.URLString, job.JobType)
+			// If job was for phase 1, ensure its Wg is also handled if it was acquired but not processed.
+			// However, decrementActiveJobs is the main concern here for overall completion.
+			s.decrementActiveJobs() 
+			// If it's a phase 1 job that was popped but not processed, its phase1Wg.Done() won't be called.
+			// This could lead to a deadlock if all workers exit like this.
+			// Solution: if job type is CacheabilityCheck, call s.phase1CompletionWg.Done() here if the job isn't processed.
+			// This needs careful handling to avoid double Done() calls.
+			// Simpler: Let jobFeeder handle not sending jobs if context is done.
+			// If a job is ALREADY taken by a worker when context is done, the worker should attempt to finish it or fail fast.
+			// The current s.isJobContextDone checks within process functions should handle this.
+			// For now, this early exit in worker + decrement should be okay if jobs are short-lived.
+			// A more robust solution might involve a per-job context passed to process functions.
+			// The current jobCtx in process functions IS derived from s.ctx, so they will terminate.
+			return // Exit worker if scheduler is stopping
+		}
 
 		if s.config.VerbosityLevel >= 2 { // -vv
-			s.logger.Debugf("[Worker %d] Received job %s (for %s) from jobFeeder. Proceeding to processURLJob.", 
-				workerID, job.URLString, job.BaseDomain)
+			s.logger.Debugf("[Worker %d] Received job %s (Type: %s, For: %s) from jobFeeder.", 
+				workerID, job.URLString, job.JobType, job.BaseDomain)
 		}
-		s.processURLJob(workerID, job)
+
+		switch job.JobType {
+		case JobTypeCacheabilityCheck:
+			s.processCacheabilityCheckJob(workerID, job)
+		case JobTypeFullProbe:
+			s.processURLJob(workerID, job) // This is the existing function for detailed probes
+		default:
+			s.logger.Errorf("[Worker %d] Unknown job type '%s' for URL %s. Discarding job.", workerID, job.JobType, job.URLString)
+			s.decrementActiveJobs() // Ensure counter is decremented for unknown job types
+		}
 	}
 
 	if s.config.VerbosityLevel >= 2 {
@@ -524,6 +579,231 @@ func (s *Scheduler) worker(workerID int) {
 	}
 }
 
+// processCacheabilityCheckJob performs two requests to a base URL to determine if it's cacheable.
+func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetURLJob) {
+	// Este job da Fase 1 será concluído (e s.phase1CompletionWg.Done() chamado)
+	// após todas as tentativas internas ou sucesso.
+
+	var job = initialJob // Copia para modificar retries localmente, embora não usemos job.Retries aqui
+	var finalError error
+	var isCacheable bool // Mantida para armazenar o resultado da verificação
+
+	// O job da Fase 1 é finalizado aqui, então decrementamos o activeJobs e o wg da Fase 1.
+	defer func() {
+		s.phase1CompletionWg.Done() // Sinaliza que este job da Fase 1 está concluído.
+		s.decrementActiveJobs()     // Decrementa o contador global de jobs do scheduler.
+		if finalError != nil {
+			if s.config.VerbosityLevel >= 2 { // -vv
+				s.logger.Warnf("[Worker %d] [CacheCheck] Job %s for %s FAILED (within defer after all retries). Error: %v. (Debug details)", workerID, job.JobType, job.URLString, finalError)
+			} else if s.config.VerbosityLevel == 1 { // -v
+				s.logger.Warnf("[Worker %d] [CacheCheck] Job %s for %s FAILED (within defer after all retries). Error: %v", workerID, job.JobType, job.URLString, finalError)
+			}
+			// No log for verbosityLevel == 0 (normal mode) for final job failure in defer
+		}
+	}()
+
+	for attempt := 0; attempt <= s.maxRetries; attempt++ {
+		if s.isSchedulerStopping() { // Verifica o contexto principal do scheduler
+			s.logger.Warnf("[Worker %d] [CacheCheck] Scheduler stopping. Aborting job %s.", workerID, job.URLString)
+			finalError = fmt.Errorf("scheduler stopping: %w", s.ctx.Err())
+			return // Sai da função, o defer cuidará do Done/decrement
+		}
+
+		jobCtx, cancelJobCtx := context.WithCancel(s.ctx) // Contexto para esta tentativa
+
+		if s.config.VerbosityLevel >= 1 {
+			s.logger.Debugf("[Worker %d] [CacheCheck] Processing URL: %s (Internal Attempt %d/%d, Original Scheduler Retries for job: %d)",
+				workerID, job.URLString, attempt+1, s.maxRetries+1, initialJob.Retries)
+		}
+
+		// --- Probe 0 (First Baseline) ---
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[Worker %d] [CacheCheck] %s: Performing Probe 0...", workerID, job.URLString)
+		}
+		reqCtxProbe0, cancelReqCtxProbe0 := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+		probe0ReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxProbe0}
+		probe0RespData := s.performRequestWithDomainManagement(job.BaseDomain, probe0ReqData)
+		cancelReqCtxProbe0()
+
+		if s.isJobContextDone(jobCtx) { // Check jobCtx specifically for this attempt
+			s.logger.Warnf("[Worker %d] [CacheCheck] %s aborted after Probe 0 (job context done: %v).", workerID, job.URLString, jobCtx.Err())
+			finalError = fmt.Errorf("job context done after Probe 0: %w", jobCtx.Err())
+			cancelJobCtx() // Ensure jobCtx is cancelled
+			// Não retorna imediatamente, permite que o loop de retry decida
+		}
+
+		if finalError == nil && (probe0RespData.Error != nil || statusCodeFromResponse(probe0RespData.Response) == 429) {
+			statusCode := statusCodeFromResponse(probe0RespData.Response)
+			errMsg := "Probe 0 request failed"
+			if probe0RespData.Error != nil {
+				errMsg = probe0RespData.Error.Error()
+				finalError = probe0RespData.Error
+			} else {
+				finalError = fmt.Errorf("Probe 0 got status code %d", statusCode)
+			}
+			if s.config.VerbosityLevel >= 2 { // -vv
+				s.logger.Debugf("[Worker %d] [CacheCheck] Probe 0 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Detailed debug.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
+			} else if s.config.VerbosityLevel == 1 { // -v
+				s.logger.Infof("[Worker %d] [CacheCheck] Probe 0 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Will retry.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
+			}
+			// No log for verbosityLevel == 0 (normal mode) for individual probe failure
+			// Continue to retry logic below
+		} else if finalError == nil { // Probe 0 OK
+			probe0Data := buildProbeData(job.URLString, probe0ReqData, probe0RespData)
+			if probe0Data.Response == nil {
+				finalError = fmt.Errorf("probe 0 response was nil for %s", job.URLString)
+				s.logger.Errorf("[Worker %d] [CacheCheck] CRITICAL: %v", finalError)
+				// Continue to retry logic
+			} else {
+				// --- Probe 0.1 (Second Baseline for Cache Hit Confirmation) ---
+				time.Sleep(50 * time.Millisecond)
+				if s.isJobContextDone(jobCtx) {
+					s.logger.Warnf("[Worker %d] [CacheCheck] %s aborted before Probe 0.1 (job context done: %v).", workerID, job.URLString, jobCtx.Err())
+					finalError = fmt.Errorf("job context done before Probe 0.1: %w", jobCtx.Err())
+					// Continue to retry logic
+				}
+
+				if finalError == nil {
+					if s.config.VerbosityLevel >= 2 {
+						s.logger.Debugf("[Worker %d] [CacheCheck] %s: Performing Probe 0.1...", workerID, job.URLString)
+					}
+					reqCtxProbe01, cancelReqCtxProbe01 := context.WithTimeout(jobCtx, s.config.RequestTimeout)
+					probe01ReqData := networking.ClientRequestData{URL: job.URLString, Method: "GET", Ctx: reqCtxProbe01}
+					probe01RespData := s.performRequestWithDomainManagement(job.BaseDomain, probe01ReqData)
+					cancelReqCtxProbe01()
+
+					if s.isJobContextDone(jobCtx) {
+						s.logger.Warnf("[Worker %d] [CacheCheck] %s aborted after Probe 0.1 (job context done: %v).", workerID, job.URLString, jobCtx.Err())
+						finalError = fmt.Errorf("job context done after Probe 0.1: %w", jobCtx.Err())
+						// Continue to retry logic
+					}
+
+					if finalError == nil && (probe01RespData.Error != nil || statusCodeFromResponse(probe01RespData.Response) == 429) {
+						statusCode := statusCodeFromResponse(probe01RespData.Response)
+						errMsg := "Probe 0.1 request failed"
+						if probe01RespData.Error != nil {
+							errMsg = probe01RespData.Error.Error()
+							finalError = probe01RespData.Error
+						} else {
+							finalError = fmt.Errorf("Probe 0.1 got status code %d", statusCode)
+						}
+						if s.config.VerbosityLevel >= 2 { // -vv
+							s.logger.Debugf("[Worker %d] [CacheCheck] Probe 0.1 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Detailed debug.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
+						} else if s.config.VerbosityLevel == 1 { // -v
+							s.logger.Infof("[Worker %d] [CacheCheck] Probe 0.1 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Will retry.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
+						}
+						// No log for verbosityLevel == 0 (normal mode)
+						// Continue to retry logic
+					} else if finalError == nil { // Probe 0.1 OK
+						probe01Data := buildProbeData(job.URLString, probe01ReqData, probe01RespData)
+						if probe01Data.Response == nil {
+							finalError = fmt.Errorf("probe 0.1 response was nil for %s", job.URLString)
+							s.logger.Errorf("[Worker %d] [CacheCheck] CRITICAL: %v", finalError)
+							// Continue to retry logic
+						} else {
+							// --- Analyze for Cacheability ---
+							isCacheable = s.isActuallyCacheableHelper(probe0Data, probe01Data)
+							s.mu.Lock()
+							s.confirmedCacheableBaseURLs[job.URLString] = isCacheable // Store result regardless
+							s.mu.Unlock()
+
+							logLevelFn := s.logger.Infof
+							if s.config.VerbosityLevel < 1 { // If not at least -v, use Debugf for non-cacheable
+								logLevelFn = s.logger.Debugf
+							}
+
+							if isCacheable {
+								s.logger.Infof("[Worker %d] [CacheCheck] URL %s determined to be CACHEABLE (Attempt %d).", workerID, job.URLString, attempt+1)
+							} else {
+								logLevelFn("[Worker %d] [CacheCheck] URL %s determined to be NOT cacheable (Attempt %d).", workerID, job.URLString, attempt+1)
+							}
+							// Se chegou aqui, a determinação foi feita (cacheável ou não)
+							finalError = nil // Success, pois o processo de checagem em si foi concluído
+							cancelJobCtx()
+							return // Success for this job, defer will handle Done/decrement
+						}
+					}
+				}
+			}
+		}
+		cancelJobCtx() // Cancel context for this failed attempt
+
+		// If finalError is set, it means this attempt failed.
+		if finalError != nil {
+			if attempt < s.maxRetries {
+				backoffDuration := s.calculateBackoffForRetry(attempt + 1) // Backoff based on current attempt number
+				if s.config.VerbosityLevel >= 2 { // -vv
+					s.logger.Debugf("[Worker %d] [CacheCheck] Attempt %d for %s failed. Retrying after %s. (Debug)", workerID, attempt+1, job.URLString, backoffDuration)
+				} else if s.config.VerbosityLevel == 1 { // -v
+					s.logger.Infof("[Worker %d] [CacheCheck] Attempt %d for %s failed. Retrying after %s.", workerID, attempt+1, job.URLString, backoffDuration)
+				}
+				// No log for verbosityLevel == 0 (normal mode)
+				select {
+				case <-time.After(backoffDuration):
+					finalError = nil // Reset error for next attempt
+					continue       // Next iteration of the retry loop
+				case <-s.ctx.Done(): // If the main scheduler context is done during backoff
+					s.logger.Warnf("[Worker %d] [CacheCheck] Scheduler stopped during backoff for %s. Error: %v", workerID, job.URLString, s.ctx.Err())
+					finalError = fmt.Errorf("scheduler stopped during backoff: %w", s.ctx.Err())
+					return // Exit function, defer will handle
+				}
+			} else {
+				// All retries exhausted for this job
+				if s.config.VerbosityLevel >= 2 { // -vv
+					s.logger.Warnf("[Worker %d] [CacheCheck] All %d retries failed for %s. Final error: %v. Job DISCARDED. (Debug details)", workerID, s.maxRetries+1, job.URLString, finalError)
+				} else if s.config.VerbosityLevel == 1 { // -v
+					s.logger.Warnf("[Worker %d] [CacheCheck] All %d retries failed for %s. Final error: %v. Job DISCARDED.", workerID, s.maxRetries+1, job.URLString, finalError)
+				}
+				// No log for verbosityLevel == 0 (normal mode) for job discard
+				// finalError is already set
+				return // Exit function, defer will handle
+			}
+		}
+	}
+	// Should not be reached if logic is correct, loop should exit via return or continue.
+	// However, if it's reached, finalError might reflect the last attempt's state.
+}
+
+// isActuallyCacheableHelper determines if a URL is effectively cacheable for poisoning tests.
+func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeData) bool {
+	// Basic check: Was the first response generally cacheable by its headers?
+	if !utils.IsCacheable(probe0.Response) {
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[CacheCheckHelper] Probe 0 for %s not cacheable by its own headers.", probe0.URL)
+		}
+		return false
+	}
+
+	// Did the second response indicate a cache hit?
+	hit := utils.IsCacheHit(probe01.Response)
+	if !hit {
+		if s.config.VerbosityLevel >= 2 {
+			s.logger.Debugf("[CacheCheckHelper] Probe 0.1 for %s did not indicate a cache HIT.", probe01.URL)
+		}
+		// Optionally, even if no explicit HIT, if bodies are identical and Probe0 was cacheable,
+		// some might consider it "implicitly cached" or behaving as such.
+		// For now, let's be stricter and require a HIT signal.
+		return false
+	}
+	
+	// Are the bodies similar enough? (Assuming a HIT should serve identical/very similar content)
+	// This helps filter out cases where a 'HIT' might be indicated but content changes (e.g., anti-CSRF tokens in page)
+	// For cache poisoning, we need the *poisoned* static content to be served.
+	// Using a high similarity threshold.
+	if !utils.BodiesAreSimilar(probe0.Body, probe01.Body, 0.98) { // 98% similarity
+		if s.config.VerbosityLevel >= 1 { // -v
+			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT on Probe 0.1, but bodies differ significantly from Probe 0. Treating as not reliably cacheable for tests.", probe0.URL)
+		}
+		return false
+	}
+	
+	// Could also check if key headers like Content-Type, Content-Length are consistent if needed.
+
+	if s.config.VerbosityLevel >= 2 {
+		s.logger.Debugf("[CacheCheckHelper] URL %s deemed cacheable: Probe0 cacheable headers, Probe0.1 HIT, bodies similar.", probe0.URL)
+	}
+	return true
+}
 
 // processURLJob is where individual URL processing, baseline requests, and probe tests happen.
 // Agora assume que CanRequest já foi chamado e foi bem-sucedido, e NextAttemptAt já foi verificado.
@@ -1095,26 +1375,20 @@ func (s *Scheduler) decrementActiveJobs() {
 	}
 
 	if s.progressBar != nil {
-		// Atualiza a barra de progresso aqui também
-		completedJobs := s.totalJobsForProgressBar - int(remainingJobs)
-		s.progressBar.Update(completedJobs)
+		s.completedJobsInPhaseForBar++
+		s.progressBar.Update(s.completedJobsInPhaseForBar)
 	}
 
 	if remainingJobs == 0 {
 		s.logger.Infof("[Scheduler] All active jobs processed. Signaling completion.")
-		select {
-		case <-s.doneChan:
-			// Already closed
-		default:
+		s.closeDoneChanOnce.Do(func() {
 			close(s.doneChan)
-		}
+		})
 	} else if remainingJobs < 0 {
 		s.logger.Errorf("[Scheduler] CRITICAL: Active jobs count went negative (%d). This indicates a bug.", remainingJobs)
-		select {
-		case <-s.doneChan:
-		default:
+		s.closeDoneChanOnce.Do(func() {
 			close(s.doneChan) // Força o fechamento para evitar bloqueio infinito
-		}
+		})
 	}
 }
 

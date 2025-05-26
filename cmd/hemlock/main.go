@@ -236,7 +236,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			}
 			cfg.ParamsToFuzz = loadedParams
 		} else {
-			logger.Infof("Parameter fuzzing is disabled via --enable-param-fuzzing=false. Skipping param wordlist loading.")
+			// s.logger.Infof("Parameter fuzzing is disabled via --enable-param-fuzzing=false. Skipping param wordlist loading.")
 			cfg.ParamsToFuzz = []string{} // Ensure it's empty if not used
 		}
 
@@ -337,7 +337,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			rateLimitStr = fmt.Sprintf("Auto (Initial: %.2f, Min: %.2f, Max Default: %.2f req/s per domain)", cfg.InitialTargetRPS, cfg.MinTargetRPS, config.DefaultMaxInternalRPS)
 		}
 		logger.Infof("HTTP config: %s timeout | %d max retries | %s", cfg.RequestTimeout, cfg.MaxRetries, rateLimitStr)
-		logger.Infof("Concurrency: %d workers | Probes per URL: %d | Headers: %d loaded from '%s'", cfg.Concurrency, cfg.ProbeConcurrency, len(cfg.HeadersToTest), cfg.HeadersFile)
+		logger.Infof("Concurrency: %d workers | Probes per URL: %d", cfg.Concurrency, cfg.ProbeConcurrency)
 
 		if cfg.OutputFile != "" {
 			logger.Infof("Output: Results will be saved to %s (Format: %s)", cfg.OutputFile, cfg.OutputFormat)
