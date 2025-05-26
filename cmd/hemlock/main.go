@@ -24,6 +24,7 @@ var logger utils.Logger
 
 const defaultWordlistDir = "wordlists"
 const defaultHeadersFilename = "headers.txt"
+const defaultParamsFilename = "params.txt"
 
 var rootCmd = &cobra.Command{
 	Use:   "hemlock",
@@ -89,14 +90,9 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.StandbyDurationIncrementSeconds = vp.GetInt("standby-duration-increment")
 		cfg.StandbyDurationIncrement = time.Duration(cfg.StandbyDurationIncrementSeconds) * time.Second
 
-		cfg.ConductorMinPositiveRetryDelayAfter429Ms = vp.GetInt("conductor-min-positive-retry-delay-after-429")
-		cfg.ConductorMinPositiveRetryDelayAfter429 = time.Duration(cfg.ConductorMinPositiveRetryDelayAfter429Ms) * time.Millisecond
-
-		cfg.ConductorInitialRetryDelaySeconds = vp.GetInt("conductor-initial-retry-delay")
-		cfg.ConductorInitialRetryDelay = time.Duration(cfg.ConductorInitialRetryDelaySeconds) * time.Second
-
-		cfg.ConductorMaxRetryBackoffSeconds = vp.GetInt("conductor-max-retry-backoff")
-		cfg.ConductorMaxRetryBackoff = time.Duration(cfg.ConductorMaxRetryBackoffSeconds) * time.Second
+		cfg.DisableHeaderTests = vp.GetBool("disable-header-tests")
+		cfg.EnableParamFuzzing = vp.GetBool("enable-param-fuzzing")
+		cfg.ParamWordlistFile = vp.GetString("param-wordlist")
 
 		// Lógica de verbosidade revisada
 		verbosityCount, _ := cmd.Flags().GetCount("verbose") // Usar GetCount diretamente do cmd.Flags()
@@ -152,46 +148,109 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			}
 		}
 
-		// --- Load HeadersToTest ---
-		if cfg.HeadersFile == "" { 
-			exePath, err := os.Executable()
-	if err != nil {
-				logger.Warnf("Could not get executable path to find default headers: %v", err) 
-			}
-			potentialPaths := []string{
-				filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
-				filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
-				filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
-				"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
-			}
-			foundPath := ""
-			for _, p := range potentialPaths {
-				if _, err := os.Stat(p); err == nil {
-					cfg.HeadersFile = p
-					foundPath = p
-					logger.Debugf("Found default headers file at: %s", p)
-					break
+		// --- Load HeadersToTest --- (Only if header tests are NOT disabled)
+		if !cfg.DisableHeaderTests {
+			if cfg.HeadersFile == "" { 
+				exePath, err := os.Executable()
+				if err != nil {
+					logger.Warnf("Could not get executable path to find default headers: %v", err) 
 				}
+				potentialPaths := []string{
+					filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
+					filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
+					filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
+					"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
+				}
+				foundPath := ""
+				for _, p := range potentialPaths {
+					if _, err := os.Stat(p); err == nil {
+						cfg.HeadersFile = p
+						foundPath = p
+						logger.Debugf("Found default headers file at: %s", p)
+						break
+					}
+				}
+				if foundPath == "" {
+					errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential when header tests are enabled", defaultHeadersFilename, defaultWordlistDir)
+					logger.Errorf(errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+			} 
+
+			logger.Debugf("Using headers from: %s", cfg.HeadersFile)
+			loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
+			if err != nil {
+				logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
+				return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
 			}
-			if foundPath == "" {
-				errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential", defaultHeadersFilename, defaultWordlistDir)
+			if len(loadedHeaders) == 0 {
+				errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
 				logger.Errorf(errMsg)
 				return fmt.Errorf("%s", errMsg)
 			}
-		} 
+			cfg.HeadersToTest = loadedHeaders
+		} else {
+			logger.Infof("Header tests are disabled via --disable-header-tests=true. Skipping header list loading.")
+			cfg.HeadersToTest = []string{} // Ensure it's empty if disabled
+		}
 
-		logger.Debugf("Using headers from: %s", cfg.HeadersFile)
-		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
-		if err != nil {
-			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
-			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
+		// --- Load ParamsToFuzz --- (Only if param fuzzing is enabled)
+		if cfg.EnableParamFuzzing {
+			if cfg.ParamWordlistFile == "" {
+				exePath, err := os.Executable()
+				if err != nil {
+					logger.Warnf("Could not get executable path to find default param wordlist: %v", err)
+				}
+				potentialPaths := []string{
+					filepath.Join(defaultWordlistDir, defaultParamsFilename),
+					filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultParamsFilename),
+					filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultParamsFilename),
+					"./" + defaultWordlistDir + "/" + defaultParamsFilename, // Relative to current dir
+				}
+				foundPath := ""
+				for _, p := range potentialPaths {
+					if _, err := os.Stat(p); err == nil {
+						cfg.ParamWordlistFile = p
+						foundPath = p
+						logger.Debugf("Found default param wordlist file at: %s", p)
+						break
+					}
+				}
+				if foundPath == "" {
+					errMsg := fmt.Sprintf("default param wordlist file ('%s') not found in standard locations ('%s', relative paths) and --param-wordlist not specified. This file is essential when param fuzzing is enabled", defaultParamsFilename, defaultWordlistDir)
+					logger.Errorf(errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+			}
+
+			logger.Debugf("Using param wordlist from: %s", cfg.ParamWordlistFile)
+			loadedParams, err := config.LoadLinesFromFile(cfg.ParamWordlistFile)
+			if err != nil {
+				logger.Errorf("Error loading params from '%s': %v", cfg.ParamWordlistFile, err)
+				return fmt.Errorf("error loading params from '%s': %w", cfg.ParamWordlistFile, err)
+			}
+			if len(loadedParams) == 0 {
+				errMsg := fmt.Sprintf("param wordlist file '%s' is empty", cfg.ParamWordlistFile)
+				logger.Errorf(errMsg)
+				return fmt.Errorf("%s", errMsg)
+			}
+			cfg.ParamsToFuzz = loadedParams
+		} else {
+			logger.Infof("Parameter fuzzing is disabled via --enable-param-fuzzing=false. Skipping param wordlist loading.")
+			cfg.ParamsToFuzz = []string{} // Ensure it's empty if not used
 		}
-		if len(loadedHeaders) == 0 {
-			errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
-			logger.Errorf(errMsg)
-			return fmt.Errorf("%s", errMsg)
+
+		// Validate that at least one test type is enabled and has loaded inputs if enabled
+		if cfg.DisableHeaderTests && !cfg.EnableParamFuzzing {
+			// This validation is also in config.Validate(), but good to have an early exit here too.
+			return fmt.Errorf("no test types enabled: please enable parameter fuzzing (--enable-param-fuzzing=true) or ensure header tests are not disabled (--disable-header-tests=false)")
 		}
-		cfg.HeadersToTest = loadedHeaders
+		if !cfg.DisableHeaderTests && len(cfg.HeadersToTest) == 0 {
+			return fmt.Errorf("header tests are enabled (not disabled), but no headers were loaded. Check --headers-file or default locations")
+		}
+		if cfg.EnableParamFuzzing && len(cfg.ParamsToFuzz) == 0 {
+			return fmt.Errorf("param fuzzing is enabled, but no parameters were loaded from wordlist. Check --param-wordlist or default locations")
+		}
 
 		// --- Parse ProxyInput ---
 		if cfg.ProxyInput != "" {
@@ -242,9 +301,24 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		if len(cfg.Targets) == 0 {
 			logger.Fatalf("No targets specified. Use --input or -i to provide a URL, list of URLs, or a file path.")
 		}
+		// Commenting out the original direct checks as they are now conditional
+		/*
 		if len(cfg.HeadersToTest) == 0 {
 			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file location.")
 	    }
+		*/
+
+		// Log about enabled tests
+		if !cfg.DisableHeaderTests {
+			logger.Infof("Header Tests: ENABLED. %d headers loaded from '%s'", len(cfg.HeadersToTest), cfg.HeadersFile)
+		} else {
+			logger.Infof("Header Tests: DISABLED")
+		}
+		if cfg.EnableParamFuzzing {
+			logger.Infof("Parameter Fuzzing: ENABLED. %d parameters loaded from '%s'", len(cfg.ParamsToFuzz), cfg.ParamWordlistFile)
+		} else {
+			logger.Infof("Parameter Fuzzing: DISABLED")
+		}
 
 		// Log sobre a origem dos alvos
 		if cfg.TargetsFile != "" {
@@ -354,9 +428,16 @@ func init() {
 	// Input
 	rootCmd.PersistentFlags().StringP("input", "i", defaults.Input, "Input: URL, comma-separated URLs, or path to a file with URLs (one per line)")
 
-	// Headers
-	rootCmd.PersistentFlags().String("headers-file", defaults.HeadersFile, "Path to the file of headers to test (default: wordlists/headers.txt in standard locations)")
-	rootCmd.PersistentFlags().StringSliceP("header", "H", defaults.CustomHeaders, "Custom HTTP header to add to requests (can be specified multiple times, format: \"Name: Value\")")
+	// Test Types Control
+	rootCmd.PersistentFlags().Bool("disable-header-tests", defaults.DisableHeaderTests, "Disable tests for unkeyed headers (default: false, meaning headers ARE tested)")
+	rootCmd.PersistentFlags().Bool("enable-param-fuzzing", defaults.EnableParamFuzzing, "Enable parameter testing (tests original URL parameters and fuzzes new parameters from a wordlist)")
+
+	// Wordlists
+	rootCmd.PersistentFlags().String("headers-file", defaults.HeadersFile, "Path to the file of headers to test (default: wordlists/headers.txt in standard locations). Used if header tests are not disabled.")
+	rootCmd.PersistentFlags().String("param-wordlist", defaults.ParamWordlistFile, "Path to the file of parameters to fuzz (default: wordlists/params.txt in standard locations). Used if --enable-param-fuzzing is true.")
+	
+	// Headers (remains the same, but clarified usage)
+	rootCmd.PersistentFlags().StringSliceP("header", "H", defaults.CustomHeaders, "Custom HTTP header to add to ALL requests (can be specified multiple times, format: \"Name: Value\")")
 
 	// Output
 	rootCmd.PersistentFlags().StringP("output-file", "o", defaults.OutputFile, "Path to file for saving results (default: stdout)")
@@ -393,13 +474,6 @@ func init() {
 	rootCmd.PersistentFlags().Int("max-standby-duration", defaults.MaxStandbyDurationSeconds, "Maximum standby duration in seconds for repeated 429s")
 	rootCmd.PersistentFlags().Int("standby-duration-increment", defaults.StandbyDurationIncrementSeconds, "Increment to standby duration in seconds on subsequent 429s")
 	
-	// Para ConductorMinPositiveRetryDelayAfter429, o padrão em config.go é 100ms.
-	// A flag será Int, representando milissegundos.
-	rootCmd.PersistentFlags().Int("conductor-min-positive-retry-delay-after-429", defaults.ConductorMinPositiveRetryDelayAfter429Ms, "Minimum positive retry delay in milliseconds after a 429 (DomainManager)")
-	
-	rootCmd.PersistentFlags().Int("conductor-initial-retry-delay", defaults.ConductorInitialRetryDelaySeconds, "Initial retry delay in seconds for job retries (Scheduler)")
-	rootCmd.PersistentFlags().Int("conductor-max-retry-backoff", defaults.ConductorMaxRetryBackoffSeconds, "Maximum retry backoff in seconds for job retries (Scheduler)")
-
 	if err := viper.ReadInConfig(); err == nil {
 		// ... existing code ...
 	}
