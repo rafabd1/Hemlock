@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -212,7 +212,7 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		}
 
 		defer resp.Body.Close()
-		body, readErr := ioutil.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
 			finalRespData.Error = fmt.Errorf("failed to read response body from %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.cfg.MaxRetries+1, readErr)
 			finalRespData.Response = resp 

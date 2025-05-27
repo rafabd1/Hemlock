@@ -305,8 +305,6 @@ func (s *Scheduler) StartScan() []*report.Finding {
 					parsedBase, _ := url.Parse(baseURL)
 					baseDomain := parsedBase.Hostname()
 					
-					createdJobForBaseURL := false // Flag para rastrear se um job já foi criado para esta baseURL
-
 					if s.config.EnableParamFuzzing {
 						// Se fuzzing está habilitado, ele lida com URLs com e sem params.
 						if len(paramSets) == 0 { // Sem params originais, mas fuzzing habilitado
@@ -318,7 +316,6 @@ func (s *Scheduler) StartScan() []*report.Finding {
 								JobType:        JobTypeFullProbe,
 									NextAttemptAt:  time.Now(),
 							})
-							createdJobForBaseURL = true
 						} else { // Com params originais E fuzzing habilitado
 							for _, paramSet := range paramSets {
 								actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
@@ -330,42 +327,41 @@ func (s *Scheduler) StartScan() []*report.Finding {
 										NextAttemptAt:  time.Now(),
 									})
 							}
-							createdJobForBaseURL = true // Jobs foram criados para as variantes com params
 						}
 					} else { // EnableParamFuzzing é FALSE
-						// Fuzzing desabilitado. Lidar com params originais e/ou apenas headers.
+						// Testes de header estão habilitados por padrão (s.config.DisableHeaderTests é false)
+						// Queremos:
+						// 1. Um job para a URL base (sem query params) para testar headers.
+						// 2. Se a URL original tinha parâmetros, um job adicional para a URL com seus parâmetros originais, também para testar headers.
+
+						// Job para a URL base (sem query params) - sempre criar se testes de header estiverem habilitados
+						if !s.config.DisableHeaderTests {
+							// A `baseURL` de uniqueBaseURLs já é scheme + host + path (sem query params da URL original)
+							urlForBaseHeaderTest := baseURL
+							phase2Jobs = append(phase2Jobs, TargetURLJob{
+								URLString:      urlForBaseHeaderTest,
+								BaseDomain:     baseDomain,
+								OriginalParams: make(map[string]string), // Indica que este job é para a base nua
+								JobType:        JobTypeFullProbe,
+								NextAttemptAt:  time.Now(),
+							})
+						}
+
+						// Jobs adicionais para cada conjunto de parâmetros originais, se houver.
+						// Estes testarão headers na URL completa (com seus respectivos params).
 						if len(paramSets) > 0 {
-							hasNonEmptyParamSet := false
 							for _, paramSet := range paramSets {
-								if len(paramSet) > 0 {
-									hasNonEmptyParamSet = true
-									actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
+								if len(paramSet) > 0 { // Só se o conjunto de parâmetros não for vazio
+									actualTargetURL, _ := constructURLWithParams(baseURL /* scheme+host+path */, paramSet /* query */)
 									phase2Jobs = append(phase2Jobs, TargetURLJob{
-										URLString:      actualTargetURL, // Testa params originais + headers
+										URLString:      actualTargetURL,
 										BaseDomain:     baseDomain,
-										OriginalParams: paramSet,
+										OriginalParams: paramSet, // Mantém os params originais para este job
 										JobType:        JobTypeFullProbe,
 										NextAttemptAt:  time.Now(),
 									})
 								}
 							}
-							if hasNonEmptyParamSet {
-								createdJobForBaseURL = true
-							}
-						}
-						// Se chegamos aqui, ou não havia paramSets, ou todos estavam vazios.
-						// Se os testes de header estão ativos E NENHUM job foi criado ainda para esta baseURL,
-						// crie um job para a baseURL nua para testes de header.
-						if !createdJobForBaseURL && !s.config.DisableHeaderTests {
-							actualTargetURL, _ := constructURLWithParams(baseURL, make(map[string]string))
-							phase2Jobs = append(phase2Jobs, TargetURLJob{
-								URLString:      actualTargetURL, // Apenas para testes de Headers
-								BaseDomain:     baseDomain,
-								OriginalParams: make(map[string]string),
-								JobType:        JobTypeFullProbe,
-								NextAttemptAt:  time.Now(),
-							})
-							// createdJobForBaseURL = true; // Não é estritamente necessário aqui, pois é a última chance
 						}
 					}
 				}
@@ -803,7 +799,7 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 				// Continue to retry logic
 			} else {
 				// --- Probe 0.1 (Second Baseline for Cache Hit Confirmation) ---
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(250 * time.Millisecond) // Aumentado de 50ms para 250ms
 				if s.isJobContextDone(jobCtx) {
 					s.logger.Warnf("[Worker %d] [CacheCheck] %s aborted before Probe 0.1 (job context done: %v).", workerID, job.URLString, jobCtx.Err())
 					finalError = fmt.Errorf("job context done before Probe 0.1: %w", jobCtx.Err())

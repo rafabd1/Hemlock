@@ -142,15 +142,14 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 
 	// Define a default list of extensions to ignore for cache poisoning tests
 	defaultIgnoredExtensions := []string{
-		".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", // Common web assets
+		".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", // Common web assets
 		".map",                         // Source maps
-		".xml", ".json", ".txt",       // Common data files (unless specifically targeted)
 		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", // Documents
 		".zip", ".tar", ".gz", ".rar", // Archives
 		".mp4", ".avi", ".mov", ".webm", // Video
 		".mp3", ".wav", ".ogg", // Audio
 		".ico",                                                        // Favicons
-		".d.ts", ".ts", ".tsx", ".jsx", // TypeScript/JavaScript specific build/type files
+		".d.ts", ".ts", ".tsx", // TypeScript/JavaScript specific build/type files
 		".vue", ".svelte", // Framework specific files
 	}
 	lowerIgnoredExtensions := make([]string, len(defaultIgnoredExtensions))
