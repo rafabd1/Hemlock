@@ -114,7 +114,7 @@ func (p *ProxyEntry) String() string {
 const (
 	DefaultInitialRPS       float64 = 5.0
 	DefaultMinRPS           float64 = 5.0  // Mínimo de 5 req/s como solicitado
-	DefaultMaxInternalRPS   float64 = 30.0 // Máximo de 30 req/s se -l 0 ou não especificado
+	DefaultMaxInternalRPS   float64 = 10.0 // AJUSTADO: Máximo de 10 req/s se -l 0 ou não especificado, alinhado com DomainManager
 	DefaultSuccessThreshold int     = 10   // Aumentar RPS a cada N sucessos
 	DefaultRPSIncrement     float64 = 1.0  // Quanto aumentar o RPS
 )
@@ -241,10 +241,6 @@ func GetUserHomeDir() (string, error) {
 
 // Validate is still useful for validating the Config struct after being populated by Viper.
 func (c *Config) Validate() error {
-	if c.MaxTargetRPS == 0.0 {
-		c.MaxTargetRPS = DefaultMaxInternalRPS
-	}
-
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("requestTimeout must be positive")
 	}
@@ -278,12 +274,32 @@ func (c *Config) Validate() error {
 	if c.MinTargetRPS <= 0 {
 		return fmt.Errorf("minTargetRPS must be positive")
 	}
-	if c.MaxTargetRPS < c.MinTargetRPS {
-		return fmt.Errorf("maxTargetRPS (%.2f) must be greater than or equal to minTargetRPS (%.2f)", c.MaxTargetRPS, c.MinTargetRPS)
+	if c.MaxTargetRPS < 0 {
+		return fmt.Errorf("rate-limit (MaxTargetRPS) cannot be negative")
 	}
-	if c.InitialTargetRPS > c.MaxTargetRPS {
-		return fmt.Errorf("initialTargetRPS (%.2f) must not exceed maxTargetRPS (%.2f)", c.InitialTargetRPS, c.MaxTargetRPS)
+	if c.MaxTargetRPS != 0.0 { // Modo de rate limit manual (valor específico de -l fornecido)
+		if c.MaxTargetRPS < c.MinTargetRPS {
+			return fmt.Errorf("maxTargetRPS (%.2f) must be greater than or equal to minTargetRPS (%.2f) when a specific rate limit is set", c.MaxTargetRPS, c.MinTargetRPS)
+		}
+		if c.InitialTargetRPS > c.MaxTargetRPS {
+			return fmt.Errorf("initialTargetRPS (%.2f) must not exceed maxTargetRPS (%.2f) when a specific rate limit is set", c.InitialTargetRPS, c.MaxTargetRPS)
+		}
+		// Implicitamente, MinTargetRPS <= InitialTargetRPS <= MaxTargetRPS no modo manual ao satisfazer as condições acima e a próxima.
+	} else { // Modo de rate limit automático (MaxTargetRPS == 0.0)
+		// No modo automático, o teto efetivo é DefaultMaxInternalRPS
+		if c.MinTargetRPS > DefaultMaxInternalRPS {
+			return fmt.Errorf("minTargetRPS (%.2f) must not exceed DefaultMaxInternalRPS (%.2f) in auto rate-limit mode", c.MinTargetRPS, DefaultMaxInternalRPS)
+		}
+		if c.InitialTargetRPS > DefaultMaxInternalRPS {
+			return fmt.Errorf("initialTargetRPS (%.2f) must not exceed DefaultMaxInternalRPS (%.2f) in auto rate-limit mode", c.InitialTargetRPS, DefaultMaxInternalRPS)
+		}
 	}
+
+	// Esta validação é universal: Initial deve ser sempre >= Min
+	if c.InitialTargetRPS < c.MinTargetRPS {
+		return fmt.Errorf("initialTargetRPS (%.2f) must be greater than or equal to minTargetRPS (%.2f)", c.InitialTargetRPS, c.MinTargetRPS)
+	}
+
 	if c.InitialStandbyDuration <= 0 {
 		return fmt.Errorf("initialStandbyDuration must be positive")
 	}
@@ -292,9 +308,6 @@ func (c *Config) Validate() error {
 	}
 	if c.StandbyDurationIncrement <= 0 {
 		return fmt.Errorf("standbyDurationIncrement must be positive")
-	}
-	if c.MaxTargetRPS < 0 {
-		return fmt.Errorf("rate-limit (MaxTargetRPS) cannot be negative")
 	}
 
 	// Validations for DomainConductor delays
