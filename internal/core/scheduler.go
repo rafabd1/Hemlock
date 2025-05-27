@@ -127,7 +127,8 @@ type Scheduler struct {
 	totalJobsForProgressBar int // This will now represent the total for the *current phase* being displayed
 	completedJobsInPhaseForBar int // Counter for jobs completed in the current phase for progress bar
 
-	totalProbesExecuted atomic.Uint64 // NOVO: Contador para probes executadas
+	totalProbesExecutedGlobal atomic.Uint64 // Contador global de todas as probes
+	completedProbesInPhase    atomic.Uint64 // Contador de probes para a barra da FASE ATUAL (Fase 2)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -265,11 +266,11 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	// Start jobFeederLoop and workers
 	s.wg.Add(1) // For feeder
 	go s.jobFeederLoop()
-	
+
 	// Goroutine to manage transition to Phase 2
 	s.wg.Add(1) // For this orchestrating goroutine
-	go func() {
-		defer s.wg.Done()
+		go func() {
+			defer s.wg.Done()
 
 		s.phase1CompletionWg.Wait() // Wait for all Phase 1 jobs to complete
 
@@ -293,31 +294,54 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 		var phase2Jobs []TargetURLJob
 		if numCacheable > 0 {
-			for _, baseURL := range uniqueBaseURLs { 
+			for _, baseURL := range uniqueBaseURLs {
 				s.mu.Lock()
 				isBaseCacheable := s.confirmedCacheableBaseURLs[baseURL]
 				s.mu.Unlock()
 
 				if isBaseCacheable {
 					paramSets := groupedBaseURLsAndParams[baseURL]
-					// DEBUG LOG: Mostrar os paramSets para uma URL base cacheável
-					if s.config.VerbosityLevel >= 2 { // -vv
-						s.logger.Debugf("[Orchestrator-Debug] For cacheable baseURL '%s', found %d paramSets.", baseURL, len(paramSets))
-						for i, ps := range paramSets {
-							s.logger.Debugf("[Orchestrator-Debug]   ParamSet %d: %v", i, ps)
-						}
-					}
-					parsedBase, _ := url.Parse(baseURL) 
+					parsedBase, _ := url.Parse(baseURL)
 					baseDomain := parsedBase.Hostname()
-					for _, paramSet := range paramSets {
-						actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
-						phase2Jobs = append(phase2Jobs, TargetURLJob{
-							URLString:      actualTargetURL,
-							BaseDomain:     baseDomain,
-							OriginalParams: paramSet,
-							JobType:        JobTypeFullProbe,
-							NextAttemptAt:  time.Now(),
-						})
+
+					if s.config.EnableParamFuzzing {
+						// Se o fuzzing de parâmetros está habilitado, criar jobs para todos os paramSets,
+						// e se não houver paramSets, criar um com paramSet vazio para permitir o fuzzing.
+						if len(paramSets) == 0 {
+							actualTargetURL, _ := constructURLWithParams(baseURL, make(map[string]string))
+							phase2Jobs = append(phase2Jobs, TargetURLJob{
+								URLString:      actualTargetURL,
+								BaseDomain:     baseDomain,
+								OriginalParams: make(map[string]string),
+								JobType:        JobTypeFullProbe,
+								NextAttemptAt:  time.Now(),
+							})
+						} else {
+							for _, paramSet := range paramSets {
+								actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
+								phase2Jobs = append(phase2Jobs, TargetURLJob{
+									URLString:      actualTargetURL,
+									BaseDomain:     baseDomain,
+									OriginalParams: paramSet,
+									JobType:        JobTypeFullProbe,
+									NextAttemptAt:  time.Now(),
+								})
+							}
+						}
+					} else {
+						// Fuzzing de parâmetros desabilitado: só criar jobs para paramSets não vazios.
+						for _, paramSet := range paramSets {
+							if len(paramSet) > 0 {
+								actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
+								phase2Jobs = append(phase2Jobs, TargetURLJob{
+									URLString:      actualTargetURL,
+									BaseDomain:     baseDomain,
+									OriginalParams: paramSet,
+									JobType:        JobTypeFullProbe,
+									NextAttemptAt:  time.Now(),
+								})
+							}
+						}
 					}
 				}
 			}
@@ -343,13 +367,48 @@ func (s *Scheduler) StartScan() []*report.Finding {
 			}
 		}
 
-		s.logger.Infof("Scheduler: Starting Phase 2 - Full Probing with %d jobs.", len(phase2Jobs))
+		// Calcular o total estimado de probes para a Fase 2
+		estimatedTotalProbesInPhase2 := 0
+		if len(phase2Jobs) > 0 {
+			numBasePayloads := len(s.config.BasePayloads)
+			if numBasePayloads == 0 && s.config.DefaultPayloadPrefix != "" { // Lógica de fallback para payloads
+				numBasePayloads = 1
+			}
+
+			if !s.config.DisableHeaderTests {
+				estimatedTotalProbesInPhase2 += len(phase2Jobs) * len(s.config.HeadersToTest)
+			}
+			if s.config.EnableParamFuzzing {
+				estimatedTotalProbesInPhase2 += len(phase2Jobs) * len(s.config.ParamsToFuzz) * numBasePayloads
+				for _, job := range phase2Jobs { // Adicionar contagem para params originais apenas se fuzzing habilitado
+					if len(job.OriginalParams) > 0 {
+						estimatedTotalProbesInPhase2 += len(job.OriginalParams) * numBasePayloads
+					}
+				}
+			} else {
+			    // Se o fuzzing de params está desabilitado, contamos apenas os params originais não vazios
+			    for _, job := range phase2Jobs {
+			        if len(job.OriginalParams) > 0 {
+			            estimatedTotalProbesInPhase2 += len(job.OriginalParams) * numBasePayloads
+			        }
+			    }
+			}
+		}
+		if estimatedTotalProbesInPhase2 == 0 && len(phase2Jobs) > 0 {
+		    // Se há jobs na Fase 2, mas nenhuma probe foi estimada (ex: apenas headers desabilitados e fuzzing desabilitado sem params originais),
+		    // usar o número de jobs da Fase 2 para a barra, para não ficar em 0.
+		    estimatedTotalProbesInPhase2 = len(phase2Jobs)
+		}
+
+		s.logger.Infof("Scheduler: Starting Phase 2 - Full Probing with %d jobs (estimated %d probes).", len(phase2Jobs), estimatedTotalProbesInPhase2)
 		
 		// Configuração da barra da Fase 2
 		if len(phase2Jobs) > 0 && !s.config.Silent {
-			s.progressBar = output.NewProgressBar(len(phase2Jobs), 40) // s.progressBar é agora a da Fase 2
+			s.totalJobsForProgressBar = estimatedTotalProbesInPhase2 // Total para a barra da Fase 2
+			s.completedProbesInPhase.Store(0) // Resetar contador de probes para a Fase 2
+			s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40) 
 			s.progressBar.SetPrefix("Phase 2 - Probing: ")
-			s.completedJobsInPhaseForBar = 0
+			// s.completedJobsInPhaseForBar = 0 // Não é mais usado para Fase 2
 			s.progressBar.Start()
 		} else if progressBarPhase1 != nil { 
 			// Se não há jobs na Fase 2, mas havia uma barra na Fase 1 (que já foi parada),
@@ -389,7 +448,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 				time.Sleep(100 * time.Millisecond) 
 				currentJobs := atomic.LoadInt32(&s.activeJobs)
 				if currentJobs == 0 {
-					s.logger.Infof("[SchedulerMonitor] All active jobs processed (count is 0). Signaling completion.")
+					s.logger.Debugf("[SchedulerMonitor] All active jobs processed (count is 0). Signaling completion.") // Mudado para Debugf
 					s.closeDoneChanOnce.Do(func() {
 						close(s.doneChan)
 					})
@@ -413,7 +472,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	// Main wait for all jobs (Phase 1 + Phase 2) to complete
 	<-s.doneChan
 
-	s.logger.Infof("Scheduler: All scan tasks, workers, and job feeder completed.")
+	s.logger.Debugf("Scheduler: All scan tasks, workers, and job feeder completed.") // Mudado para Debugf
 	return s.findings
 }
 
@@ -492,16 +551,16 @@ func (s *Scheduler) jobFeederLoop() {
 						case <-time.After(time.Until(item.NextAttemptAt)):
 						case <-s.ctx.Done():
 							s.logger.Infof("[JobFeeder] Context done while draining heap (job %s). Discarding.", item.Job.URLString)
-							s.decrementActiveJobs()
+			s.decrementActiveJobs()
 							continue
-						}
-					}
+		}
+	}
 					s.trySendToWorkerOrRequeue(item.Job, waitingJobsHeap)
-				}
+	}
 				return // Sai do jobFeederLoop
 			}
 
-			if s.config.VerbosityLevel >= 2 { // -vv
+	if s.config.VerbosityLevel >= 2 { // -vv
 				s.logger.Debugf("[JobFeeder] Received job %s (for %s, next attempt at %s) from pendingJobsQueue. Adding to heap.",
 					job.URLString, job.BaseDomain, job.NextAttemptAt.Format(time.RFC3339))
 			}
@@ -615,7 +674,7 @@ func (s *Scheduler) worker(workerID int) {
 			// A more robust solution might involve a per-job context passed to process functions.
 			// The current jobCtx in process functions IS derived from s.ctx, so they will terminate.
 			return // Exit worker if scheduler is stopping
-		}
+	}
 
 		if s.config.VerbosityLevel >= 2 { // -vv
 			s.logger.Debugf("[Worker %d] Received job %s (Type: %s, For: %s) from jobFeeder.", 
@@ -874,7 +933,7 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 // processURLJob is where individual URL processing, baseline requests, and probe tests happen.
 // Agora assume que CanRequest já foi chamado e foi bem-sucedido, e NextAttemptAt já foi verificado.
 func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
-	s.logger.Debugf("[Worker %d] processURLJob START for %s. Scheduler's cfg.VerbosityLevel: %d, len(cfg.HeadersToTest): %d, cfg.ProbeConcurrency: %d",
+	s.logger.Debugf("[Worker %d] processURLJob START for %s. Scheduler's cfg.VerbosityLevel: %d, len(cfg.HeadersToTest): %d, cfg.ProbeConcurrency: %d", 
 		workerID, job.URLString, s.config.VerbosityLevel, len(s.config.HeadersToTest), s.config.ProbeConcurrency)
 
 	jobCtx, cancelJob := context.WithCancel(s.ctx)
@@ -883,7 +942,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	var probeSemaphore chan struct{}
 	if s.config.ProbeConcurrency > 0 {
 		probeSemaphore = make(chan struct{}, s.config.ProbeConcurrency)
-	} else {
+				} else {
 		s.logger.Warnf("[Worker %d] ProbeConcurrency é <= 0 (%d) para job %s, usando fallback de 1. Isso não deveria acontecer.", workerID, s.config.ProbeConcurrency, job.URLString)
 		probeSemaphore = make(chan struct{}, 1)
 	}
@@ -931,16 +990,16 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	}
 
 	baselineProbe := buildProbeData(job.URLString, baselineReqData, baselineRespData)
-	if baselineProbe.Response == nil {
+	if baselineProbe.Response == nil { 
 		s.logger.Errorf("[Worker %d] CRITICAL: Baseline Invalid (nil response) for %s. Discarding job.", workerID, job.URLString)
 		s.handleJobOutcome(job, false, fmt.Errorf("baseline response was nil"), 0)
 		return
 	}
-	if s.config.VerbosityLevel >= 2 {
+	if s.config.VerbosityLevel >= 2 { 
 		s.logger.Debugf("[Worker %d] Baseline for %s successful. Proceeding to probes.", workerID, job.URLString)
 	}
 
-	// --- Test Headers ---
+	// --- Test Headers --- 
 	if !s.config.DisableHeaderTests && len(s.config.HeadersToTest) > 0 {
 		if s.config.VerbosityLevel >= 1 {
 			s.logger.Debugf("[Worker %d] Starting Header Tests for %s (%d headers, %d concurrent probes).", workerID, job.URLString, len(s.config.HeadersToTest), s.config.ProbeConcurrency)
@@ -980,8 +1039,8 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						return
 					}
 					if s.config.VerbosityLevel >= 1 {
-						s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
-					}
+					    s.logger.Warnf("[Worker %d] Probe A (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeARespData.Response), probeARespData.Error)
+				    }
 					return
 				}
 				probeAProbe := buildProbeData(job.URLString, probeAReqData, probeARespData)
@@ -991,19 +1050,23 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 				cancelReqProbeB()
 				if s.isJobContextDone(jobCtx) { return }
 				if probeBRespData.Error != nil || statusCodeFromResponse(probeBRespData.Response) == 429 {
-					if statusCodeFromResponse(probeBRespData.Response) == 429 {
+			if statusCodeFromResponse(probeBRespData.Response) == 429 {
 						s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s got 429. Domain %s may go into standby. Aborting further probes for this job via cancelJob().", workerID, hn, job.URLString, job.BaseDomain)
 						cancelJob()
 						return
 					}
 					if s.config.VerbosityLevel >= 1 {
-						s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
-					}
+					    s.logger.Warnf("[Worker %d] Probe B (Header: '%s') for %s failed (Status: %d, Error: %v). Skipping this header test.", workerID, hn, job.URLString, statusCodeFromResponse(probeBRespData.Response), probeBRespData.Error)
+				    }
 					return
 				}
 				probeBProbe := buildProbeData(job.URLString, probeBReqData, probeBRespData)
 				if probeAProbe.Response != nil && probeBProbe.Response != nil {
-					s.totalProbesExecuted.Add(1)
+					s.totalProbesExecutedGlobal.Add(1)
+					if job.JobType == JobTypeFullProbe && s.progressBar != nil { // Apenas para Fase 2
+						currentCompletedProbes := s.completedProbesInPhase.Add(1)
+						s.progressBar.Update(int(currentCompletedProbes))
+					}
 					finding, errAnalyse := s.processor.AnalyzeProbes(job.URLString, "header", hn, injectedValue, baselineProbe, probeAProbe, probeBProbe)
 					if errAnalyse != nil {
 						s.logger.Errorf("[Worker %d] Processor Error (Header: '%s') for URL %s: %v", workerID, hn, job.URLString, errAnalyse)
@@ -1019,9 +1082,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			close(headerFindingsChan)
 		}()
 		for finding := range headerFindingsChan {
-			s.mu.Lock()
-			s.findings = append(s.findings, finding)
-			s.mu.Unlock()
+					s.mu.Lock()
+					s.findings = append(s.findings, finding)
+					s.mu.Unlock()
 			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Header '%s' | Payload: '%s' | Details: %s",
 				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
 			if finding.Status == report.StatusConfirmed {
@@ -1087,7 +1150,7 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						s.logger.Debugf("[Worker %d] Testing Original Param '%s=%s' for %s", workerID, pn, pp, job.URLString)
 					}
 					probeAURL, errProbeAURL := modifyURLQueryParam(job.URLString, pn, pp)
-					if errProbeAURL != nil {
+				if errProbeAURL != nil {
 						s.logger.Errorf("[Worker %d] CRITICAL: Failed to construct Probe A URL for original param test ('%s=%s'): %v. Skipping.", workerID, pn, pp, errProbeAURL)
 						return
 					}
@@ -1097,14 +1160,14 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 					cancelReqParamProbeA()
 					if s.isJobContextDone(jobCtx) { return }
 					if probeAParamRespData.Error != nil || statusCodeFromResponse(probeAParamRespData.Response) == 429 {
-						if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
+				if statusCodeFromResponse(probeAParamRespData.Response) == 429 {
 							s.logger.Warnf("[Worker %d] Probe A (Original Param '%s=%s') for %s got 429. Domain %s may go into standby. Aborting job.", workerID, pn, pp, probeAURL, job.BaseDomain)
 							cancelJob() 
 							return
 						}
 						if s.config.VerbosityLevel >= 1 {
 							s.logger.Warnf("[Worker %d] Probe A (Original Param '%s=%s') for %s failed (Status: %d, Error: %v). Skipping.", workerID, pn, pp, probeAURL, statusCodeFromResponse(probeAParamRespData.Response), probeAParamRespData.Error)
-						}
+					    }
 						return
 					}
 					probeAParamProbe := buildProbeData(probeAURL, probeAParamReqData, probeAParamRespData)
@@ -1121,12 +1184,16 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 						}
 						if s.config.VerbosityLevel >= 1 {
 							s.logger.Warnf("[Worker %d] Probe B (Original Param '%s=%s', original URL %s) failed (Status: %d, Error: %v). Skipping.", workerID, pn, pp, job.URLString, statusCodeFromResponse(probeBParamRespData.Response), probeBParamRespData.Error)
-						}
+					    }
 						return
 					}
-					probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
+				probeBParamProbe := buildProbeData(job.URLString, probeBParamReqData, probeBParamRespData)
 					if probeAParamProbe.Response != nil && probeBParamProbe.Response != nil {
-						s.totalProbesExecuted.Add(1)
+						s.totalProbesExecutedGlobal.Add(1)
+						if job.JobType == JobTypeFullProbe && s.progressBar != nil { // Apenas para Fase 2
+							currentCompletedProbes := s.completedProbesInPhase.Add(1)
+							s.progressBar.Update(int(currentCompletedProbes))
+						}
 						finding, errAnalyseParam := s.processor.AnalyzeProbes(probeAURL, "param", pn, pp, baselineProbe, probeAParamProbe, probeBParamProbe)
 						if errAnalyseParam != nil {
 							s.logger.Errorf("[Worker %d] Processor Error (Original Param '%s=%s') for URL %s: %v", workerID, pn, pp, probeAURL, errAnalyseParam)
@@ -1143,9 +1210,9 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 			close(paramFindingsChan)
 		}()
 		for finding := range paramFindingsChan {
-			s.mu.Lock()
-			s.findings = append(s.findings, finding)
-			s.mu.Unlock()
+						s.mu.Lock()
+						s.findings = append(s.findings, finding)
+						s.mu.Unlock()
 			logMessage := fmt.Sprintf("Type: %s | URL: %s | Via: Param '%s' | Payload: '%s' | Details: %s",
 				finding.Vulnerability, finding.URL, finding.InputName, finding.Payload, finding.Description)
 			if finding.Status == report.StatusConfirmed {
@@ -1241,7 +1308,11 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 					}
 					probeBFuzzedProbe := buildProbeData(job.URLString, probeBFuzzedReqData, probeBFuzzedRespData)
 					if probeAFuzzedProbe.Response != nil && probeBFuzzedProbe.Response != nil {
-						s.totalProbesExecuted.Add(1)
+						s.totalProbesExecutedGlobal.Add(1)
+						if job.JobType == JobTypeFullProbe && s.progressBar != nil { // Apenas para Fase 2
+							currentCompletedProbes := s.completedProbesInPhase.Add(1)
+							s.progressBar.Update(int(currentCompletedProbes))
+						}
 						finding, errAnalyseFuzzed := s.processor.AnalyzeProbes(probeAFuzzedURL, "fuzzed_param", pnFuzz, ppVal, baselineProbe, probeAFuzzedProbe, probeBFuzzedProbe)
 						if errAnalyseFuzzed != nil {
 							s.logger.Errorf("[Worker %d] Processor Error (Fuzzed Param '%s=%s') for URL %s: %v", workerID, pnFuzz, ppVal, probeAFuzzedURL, errAnalyseFuzzed)
@@ -1290,8 +1361,8 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 		s.logger.Warnf("[Worker %d] Job for %s aborted (context done just before completion, reason: %v).", workerID, job.URLString, jobCtx.Err())
 		s.handleJobOutcome(job, false, fmt.Errorf("job processing timed out or was aborted before completion: %w", jobCtx.Err()), 0)
 		return
-	default:
-		if s.config.VerbosityLevel >= 1 {
+		default:
+		if s.config.VerbosityLevel >= 1 { 
 			s.logger.Infof("[Worker %d] Successfully COMPLETED all tests for job: %s (Total Scheduler Attempts: %d)", workerID, job.URLString, job.Retries+1)
 		}
 		s.handleJobOutcome(job, true, nil, 0)
@@ -1440,23 +1511,14 @@ func (s *Scheduler) decrementActiveJobs() {
 		s.logger.Infof("[Scheduler] Decremented active jobs. Remaining: %d", remainingJobs)
 	}
 
-	if s.progressBar != nil {
+	// A barra da Fase 1 (contagem de URLs) é atualizada aqui.
+	// A barra da Fase 2 (contagem de probes) é atualizada em processURLJob.
+	if s.progressBar != nil && s.progressBar.GetPrefixForDebug() == "Phase 1/2 (Cache Checks): " { 
 		s.completedJobsInPhaseForBar++
 		s.progressBar.Update(s.completedJobsInPhaseForBar)
 	}
 
-	// NÃO FECHAR s.doneChan AQUI. A GOROUTINE ORQUESTRADORA CUIDARÁ DISSO.
-	// if remainingJobs == 0 {
-	// 	s.logger.Infof("[Scheduler] All active jobs processed. Signaling completion.")
-	// 	s.closeDoneChanOnce.Do(func() {
-	// 		close(s.doneChan)
-	// 	})
-	// } else if remainingJobs < 0 {
-	// 	s.logger.Errorf("[Scheduler] CRITICAL: Active jobs count went negative (%d). This indicates a bug.", remainingJobs)
-	// 	s.closeDoneChanOnce.Do(func() {
-	// 		close(s.doneChan) // Força o fechamento para evitar bloqueio infinito
-	// 	})
-	// }
+	// NÃO FECHAR s.doneChan AQUI. A GOROUTINE DE MONITORAMENTO CUIDARÁ DISSO.
 }
 
 // Helper function to add a query parameter to a URL string without mutating original parts

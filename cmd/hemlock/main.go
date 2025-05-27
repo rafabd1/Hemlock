@@ -150,45 +150,45 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 
 		// --- Load HeadersToTest --- (Only if header tests are NOT disabled)
 		if !cfg.DisableHeaderTests {
-			if cfg.HeadersFile == "" { 
-				exePath, err := os.Executable()
-				if err != nil {
-					logger.Warnf("Could not get executable path to find default headers: %v", err) 
-				}
-				potentialPaths := []string{
-					filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
-					filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
-					filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
-					"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
-				}
-				foundPath := ""
-				for _, p := range potentialPaths {
-					if _, err := os.Stat(p); err == nil {
-						cfg.HeadersFile = p
-						foundPath = p
-						logger.Debugf("Found default headers file at: %s", p)
-						break
-					}
-				}
-				if foundPath == "" {
-					errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential when header tests are enabled", defaultHeadersFilename, defaultWordlistDir)
-					logger.Errorf(errMsg)
-					return fmt.Errorf("%s", errMsg)
-				}
-			} 
-
-			logger.Debugf("Using headers from: %s", cfg.HeadersFile)
-			loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
-			if err != nil {
-				logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
-				return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
+		if cfg.HeadersFile == "" { 
+			exePath, err := os.Executable()
+	if err != nil {
+				logger.Warnf("Could not get executable path to find default headers: %v", err) 
 			}
-			if len(loadedHeaders) == 0 {
-				errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
+			potentialPaths := []string{
+				filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
+				filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
+				filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
+				"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
+			}
+			foundPath := ""
+			for _, p := range potentialPaths {
+				if _, err := os.Stat(p); err == nil {
+					cfg.HeadersFile = p
+					foundPath = p
+					logger.Debugf("Found default headers file at: %s", p)
+					break
+				}
+			}
+			if foundPath == "" {
+					errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential when header tests are enabled", defaultHeadersFilename, defaultWordlistDir)
 				logger.Errorf(errMsg)
 				return fmt.Errorf("%s", errMsg)
 			}
-			cfg.HeadersToTest = loadedHeaders
+		} 
+
+		logger.Debugf("Using headers from: %s", cfg.HeadersFile)
+		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
+		if err != nil {
+			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
+			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
+		}
+		if len(loadedHeaders) == 0 {
+			errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
+			logger.Errorf(errMsg)
+			return fmt.Errorf("%s", errMsg)
+		}
+		cfg.HeadersToTest = loadedHeaders
 		} else {
 			logger.Infof("Header tests are disabled via --disable-header-tests=true. Skipping header list loading.")
 			cfg.HeadersToTest = []string{} // Ensure it's empty if disabled
@@ -318,7 +318,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			logger.Infof("Parameter Fuzzing: ENABLED. %d parameters loaded from '%s'", len(cfg.ParamsToFuzz), cfg.ParamWordlistFile)
 		} else {
 			logger.Infof("Parameter Fuzzing: DISABLED")
-		}
+	    }
 
 		// Log sobre a origem dos alvos
 		if cfg.TargetsFile != "" {
@@ -473,7 +473,7 @@ func init() {
 	rootCmd.PersistentFlags().Int("initial-standby-duration", defaults.InitialStandbyDurationSeconds, "Initial standby duration in seconds after a 429 response")
 	rootCmd.PersistentFlags().Int("max-standby-duration", defaults.MaxStandbyDurationSeconds, "Maximum standby duration in seconds for repeated 429s")
 	rootCmd.PersistentFlags().Int("standby-duration-increment", defaults.StandbyDurationIncrementSeconds, "Increment to standby duration in seconds on subsequent 429s")
-	
+
 	if err := viper.ReadInConfig(); err == nil {
 		// ... existing code ...
 	}

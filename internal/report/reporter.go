@@ -45,7 +45,12 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 	}
 
 	if len(findings) == 0 {
-		fmt.Fprintln(outputWriter, "No vulnerabilities or potential issues found.")
+		// Só imprimir esta mensagem se a saída for para stdout e o formato for texto.
+		// Se for para arquivo, a ausência de conteúdo no arquivo já indica isso.
+		// Se for JSON para stdout, uma lista vazia [] já indica isso.
+		if outputPath == "" && strings.ToLower(format) == "text" {
+			fmt.Fprintln(outputWriter, "No vulnerabilities or potential issues found.")
+		}
 		return nil
 	}
 
