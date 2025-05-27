@@ -37,6 +37,7 @@ type Logger interface {
 	Warnf(format string, v ...interface{})
 	Errorf(format string, v ...interface{})
 	Fatalf(format string, v ...interface{})
+	Successf(format string, v ...interface{})
 }
 
 // defaultLogger is a basic implementation of the Logger interface.
@@ -46,6 +47,7 @@ type defaultLogger struct {
 	warnLogger  *log.Logger
 	errorLogger *log.Logger
 	fatalLogger *log.Logger
+	successLogger *log.Logger
 	logLevel    LogLevel
 	noColor     bool
 	silent      bool
@@ -106,6 +108,7 @@ func NewDefaultLogger(level LogLevel, noColor bool, silent bool) Logger {
 		warnLogger:  log.New(warnOut, emptyPrefix, flags),
 		errorLogger: log.New(errorOut, emptyPrefix, flags),
 		fatalLogger: log.New(fatalOut, emptyPrefix, flags),
+		successLogger: log.New(infoOut, emptyPrefix, flags),
 		logLevel:    level,
 		noColor:     noColor,
 		silent:      silent,
@@ -121,12 +124,22 @@ func (l *defaultLogger) logInternal(logger *log.Logger, levelStr string, levelCo
 	}
 
 	currentTime := time.Now().Format("15:04:05")
-	prefix := fmt.Sprintf("%s [%s] ",
-		colorize(fmt.Sprintf("[%s]", currentTime), colorDim, l.noColor),
-		colorize(levelStr, levelColor, l.noColor),
-	)
-	message := fmt.Sprintf(format, v...)
-	logger.Print(prefix + message)
+	basePrefix := fmt.Sprintf("[%s]", currentTime)
+	levelPrefix := fmt.Sprintf("[%s]", levelStr)
+	messageBody := fmt.Sprintf(format, v...)
+
+	var finalMessage string
+	if !l.noColor && levelStr == "SUCCESS" && levelColor == colorGreen { 
+		finalMessage = fmt.Sprintf("%s %s",
+			colorize(basePrefix, colorDim, l.noColor),
+			colorize(fmt.Sprintf("%s %s", levelPrefix, messageBody), colorGreen, false))
+	} else {
+		finalMessage = fmt.Sprintf("%s %s %s",
+			colorize(basePrefix, colorDim, l.noColor),
+			colorize(levelPrefix, levelColor, l.noColor),
+			messageBody)
+	}
+	logger.Print(finalMessage)
 }
 
 func (l *defaultLogger) logFatalfInternal(logger *log.Logger, levelStr string, levelColor string, format string, v ...interface{}) {
@@ -180,6 +193,15 @@ func (l *defaultLogger) Errorf(format string, v ...interface{}) {
 func (l *defaultLogger) Fatalf(format string, v ...interface{}) {
 	if l.logLevel <= LevelFatal {
 		l.logFatalfInternal(l.fatalLogger, "FATAL", colorRed, format, v...)
+	}
+}
+
+func (l *defaultLogger) Successf(format string, v ...interface{}) {
+	if l.silent && l.logLevel > LevelInfo {
+		return
+	}
+	if l.logLevel <= LevelInfo {
+		l.logInternal(l.successLogger, "SUCCESS", colorGreen, format, v...)
 	}
 }
 

@@ -263,12 +263,12 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 	return groupedParams, uniqueBaseURLs, totalQueryParametersFound, baseURLsWithParamsCount
 }
 
-// NoOpLogger is a logger that does nothing, useful for utility functions
-// where a logger might not always be provided.
+// NoOpLogger is a logger that performs no operations.
 type NoOpLogger struct{}
 
 func (l *NoOpLogger) Debugf(format string, args ...interface{}) {}
 func (l *NoOpLogger) Infof(format string, args ...interface{})  {}
 func (l *NoOpLogger) Warnf(format string, args ...interface{})  {}
 func (l *NoOpLogger) Errorf(format string, args ...interface{}) {}
-func (l *NoOpLogger) Fatalf(format string, args ...interface{}) {} 
+func (l *NoOpLogger) Fatalf(format string, args ...interface{}) {}
+func (l *NoOpLogger) Successf(format string, args ...interface{}) {} 

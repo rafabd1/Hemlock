@@ -278,14 +278,17 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 		// Parar e limpar a barra da Fase 1
 		if progressBarPhase1 != nil {
-			// fmt.Fprintf(os.Stderr, "\n[DEBUG SCHED] About to Stop Phase 1 bar. Instance: %p, Prefix: '%s'\n", progressBarPhase1, progressBarPhase1.GetPrefixForDebug())
 			progressBarPhase1.Stop()
-			// fmt.Fprintf(os.Stderr, "[DEBUG SCHED] Done Stopping Phase 1 bar. Instance: %p\n", progressBarPhase1)
 		}
 
+		// DEBUG LOGS IMEDIATAMENTE APÓS A FASE 1 COMPLETAR
 		s.mu.Lock()
 		numCacheable := len(s.confirmedCacheableBaseURLs)
 		s.mu.Unlock()
+		initialActiveJobsAfterPhase1 := atomic.LoadInt32(&s.activeJobs)
+		s.logger.Debugf("[Orchestrator-Debug] After Phase 1 Wait: numCacheable=%d, initialActiveJobsAfterPhase1=%d", 
+			numCacheable, initialActiveJobsAfterPhase1)
+
 		s.logger.Infof("Scheduler: Phase 1 (Cacheability Check) COMPLETED. Found %d cacheable base URLs.", numCacheable)
 
 		var phase2Jobs []TargetURLJob
@@ -297,6 +300,13 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 				if isBaseCacheable {
 					paramSets := groupedBaseURLsAndParams[baseURL]
+					// DEBUG LOG: Mostrar os paramSets para uma URL base cacheável
+					if s.config.VerbosityLevel >= 2 { // -vv
+						s.logger.Debugf("[Orchestrator-Debug] For cacheable baseURL '%s', found %d paramSets.", baseURL, len(paramSets))
+						for i, ps := range paramSets {
+							s.logger.Debugf("[Orchestrator-Debug]   ParamSet %d: %v", i, ps)
+						}
+					}
 					parsedBase, _ := url.Parse(baseURL) 
 					baseDomain := parsedBase.Hostname()
 					for _, paramSet := range paramSets {
@@ -313,9 +323,24 @@ func (s *Scheduler) StartScan() []*report.Finding {
 			}
 		}
 		
-		// Incrementar activeJobs para Fase 2 ANTES de enfileirar e ANTES que doneChan possa ser fechado
+		// Incrementar activeJobs para Fase 2 ANTES de enfileirar
 		if len(phase2Jobs) > 0 {
 			atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs)))
+		}
+
+		// MAIS DEBUG LOGS ANTES DA DECISÃO DA FASE 2
+		finalActiveJobsBeforePhase2Queue := atomic.LoadInt32(&s.activeJobs)
+		s.logger.Debugf("[Orchestrator-Debug] Before Phase 2 queueing: len(phase2Jobs)=%d, finalActiveJobsBeforePhase2Queue=%d", 
+			len(phase2Jobs), finalActiveJobsBeforePhase2Queue)
+		// Mostrar os paramSets se verbosidade -vv
+		if s.config.VerbosityLevel >= 2 && numCacheable > 0 {
+			for baseURLScanned := range s.confirmedCacheableBaseURLs { // CORRIGIDO: for baseURLScanned
+				paramSetsForThisURL := groupedBaseURLsAndParams[baseURLScanned]
+				s.logger.Debugf("[Orchestrator-Debug] For confirmed cacheable baseURL '%s', found %d paramSets in groupedBaseURLsAndParams.", baseURLScanned, len(paramSetsForThisURL))
+				for i, ps := range paramSetsForThisURL {
+					s.logger.Debugf("[Orchestrator-Debug]   ParamSet %d for %s: %v", i, baseURLScanned, ps)
+				}
+			}
 		}
 
 		s.logger.Infof("Scheduler: Starting Phase 2 - Full Probing with %d jobs.", len(phase2Jobs))
@@ -336,19 +361,53 @@ func (s *Scheduler) StartScan() []*report.Finding {
 		}
 
 		if len(phase2Jobs) > 0 {
-			atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs)))
+			// atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs))) // ESTA LINHA É A REDUNDANTE E SERÁ REMOVIDA
 			for _, job := range phase2Jobs {
 				s.pendingJobsQueue <- job
 			}
 		} else {
-			// Se não há jobs na fase 2, e fase 1 também já terminou (activeJobs seria 0 se fase 1 não teve jobs ou todos acabaram)
-			if atomic.LoadInt32(&s.activeJobs) == 0 {
-				s.logger.Infof("Scheduler: No Phase 1 or Phase 2 jobs to run. Signaling completion via orchestrator.")
-				s.closeDoneChanOnce.Do(func() {
-					close(s.doneChan)
-				})
-			}
+			// Se não há jobs na fase 2, e fase 1 também já terminou
+			// Não fechar s.doneChan aqui. Deixar que decrementActiveJobs cuide disso
+			// quando o último job da Fase 1 (ou qualquer job que ainda exista) termine.
+			// Se activeJobs já é 0 aqui, decrementActiveJobs já o teria fechado ou o fechará em breve.
+			s.logger.Debugf("[Orchestrator-Debug] No Phase 2 jobs to enqueue. activeJobs currently: %d", atomic.LoadInt32(&s.activeJobs))
+			// if atomic.LoadInt32(&s.activeJobs) == 0 {  // LÓGICA DE FECHAMENTO REMOVIDA DAQUI
+			// 	s.logger.Infof("Scheduler: No Phase 1 or Phase 2 jobs to run. Signaling completion via orchestrator.")
+			// 	s.closeDoneChanOnce.Do(func() {
+			// 		close(s.doneChan)
+			// 	})
+			// }
 		}
+
+		// INICIAR GOROUTINE DE MONITORAMENTO PARA FECHAR s.doneChan QUANDO activeJobs == 0
+		s.wg.Add(1) // Adicionar ao WaitGroup principal do scheduler para esta goroutine de monitoramento
+		go func() {
+			defer s.wg.Done()
+			for {
+				// Verificar periodicamente ou usar um canal se quiser ser mais reativo
+				// Para simplicidade, um loop de polling com sleep curto.
+				time.Sleep(100 * time.Millisecond) 
+				currentJobs := atomic.LoadInt32(&s.activeJobs)
+				if currentJobs == 0 {
+					s.logger.Infof("[SchedulerMonitor] All active jobs processed (count is 0). Signaling completion.")
+					s.closeDoneChanOnce.Do(func() {
+						close(s.doneChan)
+					})
+					return // Sair da goroutine de monitoramento
+				} else if currentJobs < 0 {
+					s.logger.Errorf("[SchedulerMonitor] CRITICAL: Active jobs count went negative (%d). Signaling completion to avoid deadlock.", currentJobs)
+					s.closeDoneChanOnce.Do(func() {
+						close(s.doneChan)
+					})
+					return // Sair da goroutine de monitoramento
+				}
+				// Opcional: Adicionar um log de depuração aqui para ver currentJobs periodicamente se verbosidade alta
+				if s.config.VerbosityLevel >= 2 {
+					s.logger.Debugf("[SchedulerMonitor] Active jobs: %d. Waiting for 0 to complete.", currentJobs)
+				}
+			}
+		}()
+
 	}() // End of orchestrator goroutine
 
 	// Main wait for all jobs (Phase 1 + Phase 2) to complete
@@ -639,7 +698,7 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 				errMsg = probe0RespData.Error.Error()
 				finalError = probe0RespData.Error
 			} else {
-				finalError = fmt.Errorf("Probe 0 got status code %d", statusCode)
+				finalError = fmt.Errorf("probe 0 got status code %d", statusCode)
 			}
 			if s.config.VerbosityLevel >= 2 { // -vv
 				s.logger.Debugf("[Worker %d] [CacheCheck] Probe 0 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Detailed debug.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
@@ -685,7 +744,7 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 							errMsg = probe01RespData.Error.Error()
 							finalError = probe01RespData.Error
 						} else {
-							finalError = fmt.Errorf("Probe 0.1 got status code %d", statusCode)
+							finalError = fmt.Errorf("probe 0.1 got status code %d", statusCode)
 						}
 						if s.config.VerbosityLevel >= 2 { // -vv
 							s.logger.Debugf("[Worker %d] [CacheCheck] Probe 0.1 for %s failed (Status: %d, Err: %s). Attempt %d/%d. Detailed debug.", workerID, job.URLString, statusCode, errMsg, attempt+1, s.maxRetries+1)
@@ -707,15 +766,22 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 							s.confirmedCacheableBaseURLs[job.URLString] = isCacheable // Store result regardless
 							s.mu.Unlock()
 
-							logLevelFn := s.logger.Infof
-							if s.config.VerbosityLevel < 1 { // If not at least -v, use Debugf for non-cacheable
-								logLevelFn = s.logger.Debugf
-							}
+							// logLevelFn := s.logger.Infof // Removido pois não é mais necessário com Successf
+							// if s.config.VerbosityLevel < 1 { // If not at least -v, use Debugf for non-cacheable
+							// 	logLevelFn = s.logger.Debugf
+							// }
 
 							if isCacheable {
-								s.logger.Infof("[Worker %d] [CacheCheck] URL %s determined to be CACHEABLE (Attempt %d).", workerID, job.URLString, attempt+1)
+								// Log CACHEABLE usando o novo Successf (que aparece se log LevelInfo estiver ativo)
+								s.logger.Successf("[Worker %d] [CacheCheck] URL %s CACHEABLE.", workerID, job.URLString)
 							} else {
-								logLevelFn("[Worker %d] [CacheCheck] URL %s determined to be NOT cacheable (Attempt %d).", workerID, job.URLString, attempt+1)
+								// Para URLs NÃO CACHEÁVEIS, manter o log apenas para níveis de verbosidade mais altos
+								if s.config.VerbosityLevel >= 2 { // -vv (debug)
+									s.logger.Debugf("[Worker %d] [CacheCheck] URL %s determined to be NOT cacheable (Attempt %d).", workerID, job.URLString, attempt+1)
+								} else if s.config.VerbosityLevel == 1 { // -v (info)
+									s.logger.Infof("[Worker %d] [CacheCheck] URL %s determined to be NOT cacheable (Attempt %d).", workerID, job.URLString, attempt+1)
+								}
+								// No log para verbosityLevel == 0 (normal) se NÃO for cacheável
 							}
 							// Se chegou aqui, a determinação foi feita (cacheável ou não)
 							finalError = nil // Success, pois o processo de checagem em si foi concluído
@@ -1379,17 +1445,18 @@ func (s *Scheduler) decrementActiveJobs() {
 		s.progressBar.Update(s.completedJobsInPhaseForBar)
 	}
 
-	if remainingJobs == 0 {
-		s.logger.Infof("[Scheduler] All active jobs processed. Signaling completion.")
-		s.closeDoneChanOnce.Do(func() {
-			close(s.doneChan)
-		})
-	} else if remainingJobs < 0 {
-		s.logger.Errorf("[Scheduler] CRITICAL: Active jobs count went negative (%d). This indicates a bug.", remainingJobs)
-		s.closeDoneChanOnce.Do(func() {
-			close(s.doneChan) // Força o fechamento para evitar bloqueio infinito
-		})
-	}
+	// NÃO FECHAR s.doneChan AQUI. A GOROUTINE ORQUESTRADORA CUIDARÁ DISSO.
+	// if remainingJobs == 0 {
+	// 	s.logger.Infof("[Scheduler] All active jobs processed. Signaling completion.")
+	// 	s.closeDoneChanOnce.Do(func() {
+	// 		close(s.doneChan)
+	// 	})
+	// } else if remainingJobs < 0 {
+	// 	s.logger.Errorf("[Scheduler] CRITICAL: Active jobs count went negative (%d). This indicates a bug.", remainingJobs)
+	// 	s.closeDoneChanOnce.Do(func() {
+	// 		close(s.doneChan) // Força o fechamento para evitar bloqueio infinito
+	// 	})
+	// }
 }
 
 // Helper function to add a query parameter to a URL string without mutating original parts
