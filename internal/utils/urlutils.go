@@ -141,7 +141,6 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 	}
 
 	// Define a default list of extensions to ignore for cache poisoning tests
-	// TODO: This list could be made configurable in the future
 	defaultIgnoredExtensions := []string{
 		".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".eot", // Common web assets
 		".map",                         // Source maps
@@ -153,12 +152,49 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 		".ico",                                                        // Favicons
 		".d.ts", ".ts", ".tsx", ".jsx", // TypeScript/JavaScript specific build/type files
 		".vue", ".svelte", // Framework specific files
-		// Consider adding more based on typical non-HTML, non-dynamic content
 	}
 	lowerIgnoredExtensions := make([]string, len(defaultIgnoredExtensions))
 	for i, ext := range defaultIgnoredExtensions {
 		lowerIgnoredExtensions[i] = strings.ToLower(ext)
 	}
+
+	// Keywords that often precede dynamic content identifiers (like IDs or slugs)
+	// These are used to normalize paths for grouping similar template URLs.
+	genericKeywords := []string{
+		// Content Types
+		"article", "articles", "post", "posts", "blog", "news",
+		"item", "items", "product", "products", "prd", "shop", "store",
+		"doc", "docs", "document", "documents", "file", "files", "asset", "assets",
+		"image", "images", "gallery", "photo", "photos", "video", "videos", "media",
+		"event", "events", "release", "releases", "pr", // "pr" for pull request or press release pages
+
+		// Structure & Navigation
+		"category", "categories", "collection", "collections", "tag", "tags", "topic", "topics", "archive", "archives",
+		"section", "sections", "page", "pages", "app", "module", "components", // "component" might be too generic alone for some frameworks
+		"view", "show", "display", "browse",
+		"detail", "details", "list", "listing",
+
+		// User Related
+		"user", "users", "profile", "profiles", "member", "members", "author", "authors", "account", "accounts", "customer", "customers",
+
+		// Support & Info
+		"kb", "knowledgebase", "faq", "help", "guide", "tutorial", "solution", "solutions", "support", // "support" added, use with path logic
+
+		// Community & Interaction
+		"thread", "threads", "forum", "forums", "comment", "comments", "discussion", "discussions", "issue", "issues",
+
+		// Services & Actions
+		"service", "services", "tool", "tools", "api", "job", "jobs", "task", "tasks",
+		// "download", "upload", // Might be too specific or part of file names
+		// "search", "query", // Often have query params, path itself might be stable
+
+		// Location/Organization
+		"location", "locations", "branch", "branches", "office", "offices", "department", "departments",
+
+		// E-commerce / Generic
+		"order", "orders", "id", "ref", "resource", "entity",
+	}
+
 
 	for _, rawURL := range rawURLs {
 		// Attempt to parse the raw URL early to check its extension first
@@ -179,6 +215,7 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 				}
 			}
 			if isIgnored {
+				logger.Debugf("URL '%s' skipped due to ignored extension '%s'", rawURL, currentExtension)
 				continue
 			}
 		}
@@ -194,6 +231,56 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 			logger.Warnf("Skipping URL due to parse error after normalization: %s, error: %v", normalizedFullURL, err)
 			continue
 		}
+
+		// --- Advanced Path Normalization ---
+		originalPathForLog := u.Path
+		pathNormalized := false
+
+		pathSegments := strings.Split(strings.Trim(u.Path, "/"), "/")
+		// Handle empty path or path with only "/" which results in pathSegments like [""]
+		if len(pathSegments) == 1 && pathSegments[0] == "" {
+			// This is a root path (e.g., "/"), no keyword normalization needed for segments.
+		} else {
+			for i, segment := range pathSegments {
+				segLower := strings.ToLower(segment)
+				for _, keyword := range genericKeywords {
+					if segLower == keyword {
+						// If this segment is a keyword AND it's not the last segment in the path
+						// (meaning there is likely an ID or further sub-path after it)
+						// OR if it IS the last segment BUT the keyword itself often represents a template base (e.g. /products/)
+						// For now, sticking to the more conservative "not the last segment" to avoid over-truncating.
+						// Consider a flag or more sophisticated logic if /products/ itself should be distinct from /products/item123.
+						// The current goal is to group /products/item123 and /products/item456 into /products/ for phase 1 base URL checks.
+						if i < len(pathSegments)-1 {
+							// Normalize path to /path/to/.../keyword/
+							// Reconstruct path up to and including the keyword segment
+							// Ensure leading slash, and segments joined by slashes, plus a trailing slash.
+							normalizedPath := "/" + strings.Join(pathSegments[:i+1], "/") + "/"
+							// Use path.Clean to handle potential double slashes like "//" if a segment was empty,
+							// and to ensure a canonical path representation.
+							u.Path = path.Clean(normalizedPath)
+
+							// path.Clean might remove the trailing slash if the path is just "/".
+							// Ensure the trailing slash is present for consistency, unless it's the root path.
+							if u.Path != "/" && !strings.HasSuffix(u.Path, "/") {
+								u.Path += "/"
+							}
+							pathNormalized = true
+							break // Keyword found and path normalized, exit keyword loop
+						}
+					}
+				}
+				if pathNormalized {
+					break // Path normalized, exit path segment loop
+				}
+			}
+		}
+		
+		if pathNormalized {
+			logger.Debugf("Path for URL '%s' normalized from '%s' to '%s' for grouping.", rawURL, originalPathForLog, u.Path)
+		}
+		// --- End of Advanced Path Normalization ---
+
 
 		// Construct base URL (scheme + host + path)
 		baseURL := &url.URL{
