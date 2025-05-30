@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	// Required for time.Duration in examples if any
@@ -21,6 +23,7 @@ import (
 
 var cfg config.Config
 var logger utils.Logger
+var resumeFilePath string // Nova variável global para o caminho do arquivo de resumo
 
 const defaultWordlistDir = "wordlists"
 const defaultHeadersFilename = "headers.txt"
@@ -98,7 +101,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.MaxDomain429Retries = vp.GetInt("max-domain-429-retries")
 
 		// Lógica de verbosidade revisada
-		verbosityCount, _ := cmd.Flags().GetCount("verbose") // Usar GetCount diretamente do cmd.Flags()
+		verbosityCount, _ := cmd.Flags().GetCount("verbose")
 
 		if cfg.Silent {
 			cfg.VerbosityLevel = -1
@@ -123,139 +126,152 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// No futuro, NewDefaultLogger poderia aceitar cfg.VerbosityLevel diretamente
 		// para um controle mais granular se "trace" etc., fossem adicionados.
 		
-		// --- Process Input (-i, --input) ---
-		if cfg.Input != "" {
-			// Check if input is a file path
-			if _, err := os.Stat(cfg.Input); err == nil {
-				// Input is a file, load targets from it
-				logger.Debugf("Input '%s' detected as a file. Reading targets from file.", cfg.Input)
-				fileTargets, errLoad := config.LoadLinesFromFile(cfg.Input)
-				if errLoad != nil {
-					logger.Errorf("Error reading targets from input file '%s': %v", cfg.Input, errLoad)
-					return fmt.Errorf("error reading targets from input file '%s': %w", cfg.Input, errLoad)
-				}
-				cfg.Targets = fileTargets
-				cfg.TargetsFile = cfg.Input // Store the fact it came from a file for logging consistency
-			} else {
-				// Input is not a file, treat as comma-separated list or single URL
-				logger.Debugf("Input '%s' detected as URL(s).", cfg.Input)
-				if strings.Contains(cfg.Input, ",") {
-					cfg.Targets = strings.Split(cfg.Input, ",")
-				} else {
-					cfg.Targets = []string{cfg.Input}
-				}
-				// Trim spaces from targets
-				for i := range cfg.Targets {
-					cfg.Targets[i] = strings.TrimSpace(cfg.Targets[i])
-				}
-			}
-		}
-
-		// --- Load HeadersToTest --- (Only if header tests are NOT disabled)
-		if !cfg.DisableHeaderTests {
-		if cfg.HeadersFile == "" { 
-			exePath, err := os.Executable()
-	if err != nil {
-				logger.Warnf("Could not get executable path to find default headers: %v", err) 
-			}
-			potentialPaths := []string{
-				filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
-				filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
-				filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
-				"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
-			}
-			foundPath := ""
-			for _, p := range potentialPaths {
-				if _, err := os.Stat(p); err == nil {
-					cfg.HeadersFile = p
-					foundPath = p
-					logger.Debugf("Found default headers file at: %s", p)
-					break
-				}
-			}
-			if foundPath == "" {
-					errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential when header tests are enabled", defaultHeadersFilename, defaultWordlistDir)
-				logger.Errorf(errMsg)
-				return fmt.Errorf("%s", errMsg)
-			}
-		} 
-
-		logger.Debugf("Using headers from: %s", cfg.HeadersFile)
-		loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
-		if err != nil {
-			logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
-			return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
-		}
-		if len(loadedHeaders) == 0 {
-			errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
-			logger.Errorf(errMsg)
-			return fmt.Errorf("%s", errMsg)
-		}
-		cfg.HeadersToTest = loadedHeaders
+		// Carregar estado de resumo ANTES de outras validações de input, se a flag --resume for fornecida
+		resumeFilePath = vp.GetString("resume")
+		if resumeFilePath != "" {
+			logger.Infof("Attempting to resume scan from state file: %s", resumeFilePath)
+			// A lógica de carregar o estado e aplicá-lo à cfg será feita no Scheduler
+			// Mas precisamos garantir que a cfg não seja sobrescrita por flags subsequentes
+			// se ela for populada a partir do arquivo de resumo.
+			// Por enquanto, apenas armazenamos o caminho. O Scheduler usará isso.
+			// Se o arquivo de resumo for usado, muitas das configurações de input (alvos, etc.)
+			// virão do arquivo de estado, não das flags ou do input direto.
+			// Esta lógica precisará de refinamento para priorizar corretamente.
 		} else {
-			logger.Infof("Header tests are disabled via --disable-header-tests=true. Skipping header list loading.")
-			cfg.HeadersToTest = []string{} // Ensure it's empty if disabled
-		}
+			// --- Process Input (-i, --input) --- APENAS SE NÃO ESTIVER RETOMANDO
+			if cfg.Input != "" {
+				// Check if input is a file path
+				if _, err := os.Stat(cfg.Input); err == nil {
+					// Input is a file, load targets from it
+					logger.Debugf("Input '%s' detected as a file. Reading targets from file.", cfg.Input)
+					fileTargets, errLoad := config.LoadLinesFromFile(cfg.Input)
+					if errLoad != nil {
+						logger.Errorf("Error reading targets from input file '%s': %v", cfg.Input, errLoad)
+						return fmt.Errorf("error reading targets from input file '%s': %w", cfg.Input, errLoad)
+					}
+					cfg.Targets = fileTargets
+					cfg.TargetsFile = cfg.Input // Store the fact it came from a file for logging consistency
+				} else {
+					// Input is not a file, treat as comma-separated list or single URL
+					logger.Debugf("Input '%s' detected as URL(s).", cfg.Input)
+					if strings.Contains(cfg.Input, ",") {
+						cfg.Targets = strings.Split(cfg.Input, ",")
+					} else {
+						cfg.Targets = []string{cfg.Input}
+					}
+					// Trim spaces from targets
+					for i := range cfg.Targets {
+						cfg.Targets[i] = strings.TrimSpace(cfg.Targets[i])
+					}
+				}
+			}
 
-		// --- Load ParamsToFuzz --- (Only if param fuzzing is enabled)
-		if cfg.EnableParamFuzzing {
-			if cfg.ParamWordlistFile == "" {
+			// --- Load HeadersToTest --- (Only if header tests are NOT disabled)
+			if !cfg.DisableHeaderTests {
+			if cfg.HeadersFile == "" { 
 				exePath, err := os.Executable()
-				if err != nil {
-					logger.Warnf("Could not get executable path to find default param wordlist: %v", err)
+			if err != nil {
+					logger.Warnf("Could not get executable path to find default headers: %v", err) 
 				}
 				potentialPaths := []string{
-					filepath.Join(defaultWordlistDir, defaultParamsFilename),
-					filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultParamsFilename),
-					filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultParamsFilename),
-					"./" + defaultWordlistDir + "/" + defaultParamsFilename, // Relative to current dir
+					filepath.Join(defaultWordlistDir, defaultHeadersFilename),                           
+					filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultHeadersFilename),    
+					filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultHeadersFilename), 
+					"./" + defaultWordlistDir + "/" + defaultHeadersFilename, // Relative to current dir
 				}
 				foundPath := ""
 				for _, p := range potentialPaths {
 					if _, err := os.Stat(p); err == nil {
-						cfg.ParamWordlistFile = p
+						cfg.HeadersFile = p
 						foundPath = p
-						logger.Debugf("Found default param wordlist file at: %s", p)
+						logger.Debugf("Found default headers file at: %s", p)
 						break
 					}
 				}
 				if foundPath == "" {
-					errMsg := fmt.Sprintf("default param wordlist file ('%s') not found in standard locations ('%s', relative paths) and --param-wordlist not specified. This file is essential when param fuzzing is enabled", defaultParamsFilename, defaultWordlistDir)
+						errMsg := fmt.Sprintf("default headers file ('%s') not found in standard locations ('%s', relative paths) and --headers-file not specified. This file is essential when header tests are enabled", defaultHeadersFilename, defaultWordlistDir)
 					logger.Errorf(errMsg)
 					return fmt.Errorf("%s", errMsg)
 				}
-			}
+			} 
 
-			logger.Debugf("Using param wordlist from: %s", cfg.ParamWordlistFile)
-			loadedParams, err := config.LoadLinesFromFile(cfg.ParamWordlistFile)
+			logger.Debugf("Using headers from: %s", cfg.HeadersFile)
+			loadedHeaders, err := config.LoadLinesFromFile(cfg.HeadersFile)
 			if err != nil {
-				logger.Errorf("Error loading params from '%s': %v", cfg.ParamWordlistFile, err)
-				return fmt.Errorf("error loading params from '%s': %w", cfg.ParamWordlistFile, err)
+				logger.Errorf("Error loading headers from '%s': %v", cfg.HeadersFile, err)
+				return fmt.Errorf("error loading headers from '%s': %w", cfg.HeadersFile, err)
 			}
-			if len(loadedParams) == 0 {
-				errMsg := fmt.Sprintf("param wordlist file '%s' is empty", cfg.ParamWordlistFile)
+			if len(loadedHeaders) == 0 {
+				errMsg := fmt.Sprintf("headers file '%s' is empty", cfg.HeadersFile)
 				logger.Errorf(errMsg)
 				return fmt.Errorf("%s", errMsg)
 			}
-			cfg.ParamsToFuzz = loadedParams
-		} else {
-			// s.logger.Infof("Parameter fuzzing is disabled via --enable-param-fuzzing=false. Skipping param wordlist loading.")
-			cfg.ParamsToFuzz = []string{} // Ensure it's empty if not used
+			cfg.HeadersToTest = loadedHeaders
+			} else {
+				logger.Infof("Header tests are disabled via --disable-header-tests=true. Skipping header list loading.")
+				cfg.HeadersToTest = []string{} // Ensure it's empty if disabled
+			}
+
+			// --- Load ParamsToFuzz --- (Only if param fuzzing is enabled)
+			if cfg.EnableParamFuzzing {
+				if cfg.ParamWordlistFile == "" {
+					exePath, err := os.Executable()
+					if err != nil {
+						logger.Warnf("Could not get executable path to find default param wordlist: %v", err)
+					}
+					potentialPaths := []string{
+						filepath.Join(defaultWordlistDir, defaultParamsFilename),
+						filepath.Join(filepath.Dir(exePath), defaultWordlistDir, defaultParamsFilename),
+						filepath.Join(filepath.Dir(exePath), "..", defaultWordlistDir, defaultParamsFilename),
+						"./" + defaultWordlistDir + "/" + defaultParamsFilename, // Relative to current dir
+					}
+					foundPath := ""
+					for _, p := range potentialPaths {
+						if _, err := os.Stat(p); err == nil {
+							cfg.ParamWordlistFile = p
+							foundPath = p
+							logger.Debugf("Found default param wordlist file at: %s", p)
+							break
+						}
+					}
+					if foundPath == "" {
+						errMsg := fmt.Sprintf("default param wordlist file ('%s') not found in standard locations ('%s', relative paths) and --param-wordlist not specified. This file is essential when param fuzzing is enabled", defaultParamsFilename, defaultWordlistDir)
+						logger.Errorf(errMsg)
+						return fmt.Errorf("%s", errMsg)
+					}
+				}
+
+				logger.Debugf("Using param wordlist from: %s", cfg.ParamWordlistFile)
+				loadedParams, err := config.LoadLinesFromFile(cfg.ParamWordlistFile)
+				if err != nil {
+					logger.Errorf("Error loading params from '%s': %v", cfg.ParamWordlistFile, err)
+					return fmt.Errorf("error loading params from '%s': %w", cfg.ParamWordlistFile, err)
+				}
+				if len(loadedParams) == 0 {
+					errMsg := fmt.Sprintf("param wordlist file '%s' is empty", cfg.ParamWordlistFile)
+					logger.Errorf(errMsg)
+					return fmt.Errorf("%s", errMsg)
+				}
+				cfg.ParamsToFuzz = loadedParams
+			} else {
+				// s.logger.Infof("Parameter fuzzing is disabled via --enable-param-fuzzing=false. Skipping param wordlist loading.")
+				cfg.ParamsToFuzz = []string{} // Ensure it's empty if not used
+			}
+
+			// Validate that at least one test type is enabled and has loaded inputs if enabled
+			if cfg.DisableHeaderTests && !cfg.EnableParamFuzzing {
+				// Este validation é também em config.Validate(), mas bom ter um early exit aqui também.
+				return fmt.Errorf("no test types enabled: please enable parameter fuzzing (--enable-param-fuzzing=true) or ensure header tests are not disabled (--disable-header-tests=false)")
+			}
+			if !cfg.DisableHeaderTests && len(cfg.HeadersToTest) == 0 {
+				return fmt.Errorf("header tests are enabled (not disabled), but no headers were loaded. Check --headers-file or default locations")
+			}
+			if cfg.EnableParamFuzzing && len(cfg.ParamsToFuzz) == 0 {
+				return fmt.Errorf("param fuzzing is enabled, but no parameters were loaded from wordlist. Check --param-wordlist or default locations")
+			}
 		}
 
-		// Validate that at least one test type is enabled and has loaded inputs if enabled
-		if cfg.DisableHeaderTests && !cfg.EnableParamFuzzing {
-			// This validation is also in config.Validate(), but good to have an early exit here too.
-			return fmt.Errorf("no test types enabled: please enable parameter fuzzing (--enable-param-fuzzing=true) or ensure header tests are not disabled (--disable-header-tests=false)")
-		}
-		if !cfg.DisableHeaderTests && len(cfg.HeadersToTest) == 0 {
-			return fmt.Errorf("header tests are enabled (not disabled), but no headers were loaded. Check --headers-file or default locations")
-		}
-		if cfg.EnableParamFuzzing && len(cfg.ParamsToFuzz) == 0 {
-			return fmt.Errorf("param fuzzing is enabled, but no parameters were loaded from wordlist. Check --param-wordlist or default locations")
-		}
-
-		// --- Parse ProxyInput ---
+		// --- Parse ProxyInput --- (Sempre processar, mesmo em resume, caso o proxy tenha mudado)
 		if cfg.ProxyInput != "" {
 			parsedPx, errPx := utils.ParseProxyInput(cfg.ProxyInput, logger) // This line has the linter error
 			if errPx != nil {
@@ -268,50 +284,22 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		} else {
 			cfg.ParsedProxies = []config.ProxyEntry{}
 		}
-		return nil
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		// Define ANSI color codes directly here for the banner
-		const colorGreenForBanner = "\033[32m"
-		const colorResetForBanner = "\033[0m"
 
-		// 1. Display Banner (somente se não estiver no modo silencioso)
-		if !cfg.Silent {
-			banner := `
-   _    _                _            _    
-  | |  | |              | |          | |   
-  | |__| | ___ _ __ ___ | | ___   ___| | __
-  |  __  |/ _ \ '_ ` + "`" + ` _ \| |/ _ \ / __| |/ /
-  | |  | |  __/ | | | | | | (_) | (__|   < 
-  |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
-`
-			version := "v0.1.0" // Atualizar conforme necessário
-			author := "github.com/rafabd1"
-
-			// Apply color to the banner string
-			coloredBanner := banner
-			if !cfg.NoColor {
-				coloredBanner = colorGreenForBanner + banner + colorResetForBanner
+		// Se estiver retomando, a validação da config original já aconteceu.
+		// No entanto, algumas configurações podem ser revalidadas (ex: proxy, se permitido mudar)
+		if resumeFilePath == "" { // Só valida a config completa se não estiver retomando
+			if err := cfg.Validate(); err != nil {
+				logger.Fatalf("Invalid configuration: %v", err)
 			}
-			fmt.Printf("%s\n", coloredBanner)
-			fmt.Printf("\t\t\tWeb Cache Poisoning Scanner | %s by %s\n\n", version, author)
+			if len(cfg.Targets) == 0 {
+				logger.Fatalf("No targets specified. Use --input or -i to provide a URL, list of URLs, or a file path.")
+			}
+		} else {
+			logger.Infof("Resuming scan. Initial config validation skipped, will use config from state file.")
+			// Poderíamos ter uma validação mais leve aqui para config que PODE mudar em resume (ex: proxy, verbosity)
 		}
-		
-		// 2. Validar configuração (após o banner, antes de mais logs)
-		if err := cfg.Validate(); err != nil {
-			logger.Fatalf("Invalid configuration: %v", err)
-		}
-		if len(cfg.Targets) == 0 {
-			logger.Fatalf("No targets specified. Use --input or -i to provide a URL, list of URLs, or a file path.")
-		}
-		// Commenting out the original direct checks as they are now conditional
-		/*
-		if len(cfg.HeadersToTest) == 0 {
-			logger.Fatalf("No headers to test were loaded. Check --headers-file or the default file location.")
-	    }
-		*/
 
-		// Log about enabled tests
+		// Log sobre enabled tests (mesmo em resume, para info)
 		if !cfg.DisableHeaderTests {
 			logger.Infof("Header Tests: ENABLED. %d headers loaded from '%s'", len(cfg.HeadersToTest), cfg.HeadersFile)
 		} else {
@@ -360,69 +348,108 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// We only need uniqueBaseURLs here for logging purposes.
 		// The scheduler will perform its own full preprocessing.
 		// Capturamos totalParamsFound e numURLsWithParams para o log.
-		_, uniqueBaseURLs, totalParamsFound, numURLsWithParams := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
-		// No error is returned by PreprocessAndGroupURLs; it logs errors internally.
+		// Se estiver retomando, estes números podem não ser do início total, mas do que falta processar.
+		// Isso será tratado pelo Scheduler ao carregar o estado.
+		var uniqueBaseURLsForLog []string
+		var totalParamsFoundForLog, numURLsWithParamsForLog int
+
+		if resumeFilePath == "" {
+			_, uniqueBaseURLsForLog, totalParamsFoundForLog, numURLsWithParamsForLog = utils.PreprocessAndGroupURLs(cfg.Targets, logger)
+		} else {
+			// No modo resume, o Scheduler cuidará de determinar os targets restantes.
+			// Por enquanto, podemos deixar estes logs um pouco genéricos ou o Scheduler os atualizará.
+			logger.Infof("Target counts will be determined from resume state by the Scheduler.")
+		}
 
 		// Calculate numUniqueDomains from uniqueBaseURLs
 		numUniqueDomains := 0
-		if len(uniqueBaseURLs) > 0 {
+		if len(uniqueBaseURLsForLog) > 0 { // Usar a variável local para logging
 			domainSet := make(map[string]struct{})
-			for _, baseURL := range uniqueBaseURLs {
+			for _, baseURL := range uniqueBaseURLsForLog {
 				u, errParseURL := url.Parse(baseURL)
 				if errParseURL == nil {
 					domainSet[u.Hostname()] = struct{}{}
-	} else {
-					// Log a warning if a base URL cannot be parsed, though this should be rare
-					// if PreprocessAndGroupURLs produced it.
+				} else {
 					logger.Warnf("Could not parse base URL '%s' from preprocessed list to count domain: %v", baseURL, errParseURL)
 				}
 			}
 			numUniqueDomains = len(domainSet)
 		}
 
-		if len(uniqueBaseURLs) == 0 {
+		if resumeFilePath == "" && len(uniqueBaseURLsForLog) == 0 && len(cfg.Targets) > 0 {
 			logger.Fatalf("No processable URLs after pre-processing. Check your target list and filters.")
+		} else if resumeFilePath == "" { // Apenas logar se não estiver em modo resume, onde o scheduler decide
+			logger.Infof("Processing %d unique target URLs across %d domains.", len(uniqueBaseURLsForLog), numUniqueDomains)
 		}
-		logger.Infof("Processing %d unique target URLs across %d domains.", len(uniqueBaseURLs), numUniqueDomains)
 
-		if totalParamsFound > 0 && numURLsWithParams > 0 {
-			logger.Infof("Parameters: Extracted %d total unique query parameters from %d URLs.", totalParamsFound, numURLsWithParams)
+		if resumeFilePath == "" && totalParamsFoundForLog > 0 && numURLsWithParamsForLog > 0 {
+			logger.Infof("Parameters: Extracted %d total unique query parameters from %d URLs.", totalParamsFoundForLog, numURLsWithParamsForLog)
 		}
 
 		// 5. Inicializar Serviços e Iniciar Scan
 		logger.Infof("Hemlock Cache Scanner initializing scan...")
 
+		// Passar resumeFilePath para NewClient e NewScheduler se necessário, ou eles leem de cfg.
+		// Por agora, o Scheduler centralizará a lógica de carregar estado.
+		cfg.ResumeFilePath = resumeFilePath // Adicionar ao config para o Scheduler usar.
+
 		httpClient, errClient := networking.NewClient(&cfg, logger)
-	if errClient != nil {
-		logger.Fatalf("Failed to create HTTP client: %v", errClient)
-	}
+		if errClient != nil {
+			logger.Fatalf("Failed to create HTTP client: %v", errClient)
+		}
 
 		processor := core.NewProcessor(&cfg, logger)
 		domainManager := networking.NewDomainManager(&cfg, logger)
 		scheduler := core.NewScheduler(&cfg, httpClient, processor, domainManager, logger)
 
-	findings := scheduler.StartScan() 
+		// Configurar o signal handler AGORA que o scheduler existe.
+		setupSignalHandler(scheduler, logger)
+
+		findings := scheduler.StartScan()
 
 		logger.Infof("Scan completed. Found %d potential vulnerabilities.", len(findings))
-	errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
-	if errReport != nil {
-		logger.Errorf("Failed to generate report: %v", errReport)
-		if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
-			logger.Warnf("Attempting to print report to stdout as fallback...")
-			fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
-			if fbErr != nil {
-				logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+		errReport := report.GenerateReport(findings, cfg.OutputFile, cfg.OutputFormat)
+		if errReport != nil {
+			logger.Errorf("Failed to generate report: %v", errReport)
+			if cfg.OutputFile != "" && (strings.ToLower(cfg.OutputFormat) == "text" || strings.ToLower(cfg.OutputFormat) == "json") {
+				logger.Warnf("Attempting to print report to stdout as fallback...")
+				fbErr := report.GenerateReport(findings, "", cfg.OutputFormat) 
+				if fbErr != nil {
+					logger.Errorf("Fallback to stdout also failed: %v", fbErr)
+				}
 			}
-		}
 		} else if len(findings) > 0 {
 			logger.Infof("Report generated successfully.")
-	} else {
+		} else {
 		    logger.Infof("No vulnerabilities found or report not generated due to no findings.")
-	}
+		}
 
-	logger.Infof("Hemlock Cache Scanner finished.")
+		logger.Infof("Hemlock Cache Scanner finished.")
 		return nil
 	},
+}
+
+// setupSignalHandler configura um listener para sinais de interrupção (Ctrl+C)
+// para tentar salvar o estado do scan antes de sair.
+func setupSignalHandler(s *core.Scheduler, l utils.Logger) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c // Aguarda o sinal
+		l.Warnf("Interrupt signal received. Attempting to save scan state...")
+		fileName := fmt.Sprintf("hemlock_resume_%s.json", time.Now().Format("20060102_150405"))
+		if s != nil {
+			err := s.SaveState(fileName)
+			if err != nil {
+				l.Errorf("Failed to save scan state: %v", err)
+			} else {
+				l.Infof("Scan state saved to %s. You can resume with --resume %s", fileName, fileName)
+			}
+		} else {
+			l.Warnf("Scheduler not initialized, cannot save state.")
+		}
+		os.Exit(1) // Sai após tentar salvar
+	}()
 }
 
 func init() {
@@ -462,6 +489,9 @@ func init() {
 	// Proxy
 	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy to use (URL, CSV list, or file path)")
 
+	// Nova flag para retomar o scan
+	rootCmd.PersistentFlags().String("resume", "", "Path to a Hemlock resume state file (e.g., hemlock_resume_YYYYMMDD_HHMMSS.json) to continue a previous scan")
+
 	// Adicionar descrição para a nova flag de probes
 	if err := rootCmd.PersistentFlags().SetAnnotation("probes", "description", []string{"Number of concurrent probes (e.g., header/param tests) per URL"}); err != nil {
 		// Não usar logger aqui pois ele pode não estar inicializado ainda em init()
@@ -486,9 +516,15 @@ func init() {
 }
 
 func main() {
+	// O logger aqui é o logger global inicializado em PersistentPreRunE.
+	// O Scheduler ainda não foi criado, então não podemos passar para setupSignalHandler ainda.
+	// Uma solução é mover a inicialização do scheduler para mais cedo ou
+	// ter uma forma de registrar o scheduler no signal handler depois.
+
+	// Por enquanto, o signal handler será configurado dentro do RunE, onde o scheduler existe.
+	// Isso significa que um Ctrl+C antes do RunE (ex: durante o parsing de flags) não salvará.
+
 	if err := rootCmd.Execute(); err != nil {
-		// Logger might not be initialized here if error is from Cobra parsing itself pre-PersistentPreRunE
-		// So, fmt.Fprintf to stderr is appropriate.
 		fmt.Fprintf(os.Stderr, "Error executing hemlock: %v\n", err)
 		os.Exit(1)
 	}

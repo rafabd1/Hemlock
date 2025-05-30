@@ -72,6 +72,9 @@ type Config struct {
 
 	// New field for domain-level 429 retries
 	MaxDomain429Retries int `mapstructure:"max-domain-429-retries"`
+
+	// New field for resume functionality
+	ResumeFilePath string `mapstructure:"resume-file-path,omitempty"` // Path to the resume state file, not loaded from config file, but set via flag
 }
 
 // ProxyEntry holds the parsed information for a single proxy.
@@ -180,6 +183,9 @@ func GetDefaultConfig() *Config {
 
 		// Default for domain-level 429 retries
 		MaxDomain429Retries: 4, // Default maximum 429 retries for a domain before discarding it
+
+		// Default for resume functionality
+		ResumeFilePath: "", // No resume file by default
 	}
 }
 

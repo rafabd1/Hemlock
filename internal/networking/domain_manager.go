@@ -51,6 +51,70 @@ type DomainBucket struct {
 	discarded           bool // True se o domínio foi descartado
 }
 
+// DomainBucketState é uma representação exportável do estado de um DomainBucket para serialização.
+// Os campos devem corresponder aos de DomainBucket que precisam ser salvos/carregados.
+type DomainBucketState struct {
+	Tokens                 float64   `json:"tokens"`
+	LastRefillTime         time.Time `json:"last_refill_time"`
+	RefillRate             float64   `json:"refill_rate"`
+	MaxTokens              float64   `json:"max_tokens"`
+	LastRequestTime        time.Time `json:"last_request_time"`
+
+	StandbyUntil           time.Time     `json:"standby_until"`
+	CurrentStandbyDuration time.Duration `json:"current_standby_duration"`
+
+	IsAutoMode                 bool    `json:"is_auto_mode"`
+	CurrentRPS               float64 `json:"current_rps"`
+	MinRPS                   float64 `json:"min_rps"`
+	MaxRPSAuto               float64 `json:"max_rps_auto"`
+	ConsecutiveSuccesses       int     `json:"consecutive_successes"`
+	ConsecutiveNonCriticalErrors int     `json:"consecutive_non_critical_errors"`
+
+	Current429Retries int  `json:"current_429_retries"`
+	Discarded           bool `json:"discarded"`
+}
+
+// ToState converte um DomainBucket para DomainBucketState.
+func (b *DomainBucket) ToState() DomainBucketState {
+	return DomainBucketState{
+		Tokens:                 b.tokens,
+		LastRefillTime:         b.lastRefillTime,
+		RefillRate:             b.refillRate,
+		MaxTokens:              b.maxTokens,
+		LastRequestTime:        b.lastRequestTime,
+		StandbyUntil:           b.standbyUntil,
+		CurrentStandbyDuration: b.currentStandbyDuration,
+		IsAutoMode:                 b.isAutoMode,
+		CurrentRPS:               b.currentRPS,
+		MinRPS:                   b.minRPS,
+		MaxRPSAuto:               b.maxRPSAuto,
+		ConsecutiveSuccesses:       b.consecutiveSuccesses,
+		ConsecutiveNonCriticalErrors: b.consecutiveNonCriticalErrors,
+		Current429Retries:        b.current429Retries,
+		Discarded:                b.discarded,
+	}
+}
+
+// FromState atualiza um DomainBucket a partir de um DomainBucketState.
+// O bucket receptor (b) deve ser um ponteiro para que as modificações persistam.
+func (b *DomainBucket) FromState(state DomainBucketState) {
+	b.tokens = state.Tokens
+	b.lastRefillTime = state.LastRefillTime
+	b.refillRate = state.RefillRate
+	b.maxTokens = state.MaxTokens
+	b.lastRequestTime = state.LastRequestTime
+	b.standbyUntil = state.StandbyUntil
+	b.currentStandbyDuration = state.CurrentStandbyDuration
+	b.isAutoMode = state.IsAutoMode
+	b.currentRPS = state.CurrentRPS
+	b.minRPS = state.MinRPS
+	b.maxRPSAuto = state.MaxRPSAuto
+	b.consecutiveSuccesses = state.ConsecutiveSuccesses
+	b.consecutiveNonCriticalErrors = state.ConsecutiveNonCriticalErrors
+	b.current429Retries = state.Current429Retries
+	b.discarded = state.Discarded
+}
+
 // refill atualiza os tokens no bucket com base no tempo passado desde a última recarga.
 func (b *DomainBucket) refill() {
 	now := time.Now()
@@ -398,6 +462,81 @@ func (dm *DomainManager) IsDomainDiscarded(domain string) bool {
 		return false // Domínio não conhecido não está descartado
 	}
 	return bucket.discarded
+}
+
+// GetAllDomainStates retorna uma cópia do estado de todos os buckets de domínio.
+// Isso é usado para salvar o estado do scan.
+func (dm *DomainManager) GetAllDomainStates() map[string]DomainBucketState {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	states := make(map[string]DomainBucketState)
+	for domain, bucket := range dm.domainStatus {
+		states[domain] = bucket.ToState()
+	}
+	return states
+}
+
+// ApplyResumeState restaura o estado dos buckets de domínio a partir de um estado salvo.
+func (dm *DomainManager) ApplyResumeState(savedStates map[string]DomainBucketState) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	if dm.domainStatus == nil {
+		dm.domainStatus = make(map[string]*DomainBucket)
+	}
+
+	for domain, state := range savedStates {
+		bucket, exists := dm.domainStatus[domain]
+		if !exists {
+			// Se o bucket não existia, precisamos criar um e depois aplicar o estado.
+			// A criação de um bucket aqui deve usar os valores de config atuais (dm.config)
+			// para consistência, e então o estado do arquivo de resumo sobrescreve os campos relevantes.
+			targetRate := dm.config.MaxTargetRPS
+			isAuto := false
+			var currentRate, minRate, maxAutoRate float64
+
+			if targetRate <= 0 {
+				isAuto = true
+				currentRate = dm.config.InitialTargetRPS
+				minRate = dm.config.MinTargetRPS
+				maxAutoRate = config.DefaultMaxInternalRPS
+				if currentRate <= 0 { currentRate = 1.0 }
+			} else {
+				isAuto = false
+				currentRate = targetRate
+				minRate = targetRate
+				maxAutoRate = targetRate
+			}
+
+			newBucket := &DomainBucket{
+				tokens:                 currentRate, 
+				maxTokens:              currentRate,
+				refillRate:             currentRate,
+				lastRefillTime:         time.Now(), // Será sobrescrito por FromState se presente no estado salvo
+				standbyUntil:           time.Time{},
+				currentStandbyDuration: dm.config.InitialStandbyDuration,
+				lastRequestTime:        time.Time{},
+				isAutoMode:                 isAuto,
+				currentRPS:               currentRate,
+				minRPS:                   minRate,
+				maxRPSAuto:               maxAutoRate,
+				consecutiveSuccesses:       0,
+				consecutiveNonCriticalErrors: 0,
+				current429Retries:          0,
+				discarded:                  false,
+			}
+			dm.domainStatus[domain] = newBucket
+			bucket = newBucket
+			dm.logger.Debugf("[DomainManager ApplyResumeState] Created new bucket for domain '%s' before applying saved state.", domain)
+		}
+		// Agora aplica o estado salvo ao bucket (existente ou recém-criado)
+		bucket.FromState(state)
+		dm.logger.Debugf("[DomainManager ApplyResumeState] Applied saved state to bucket for domain '%s'. Discarded: %v, StandbyUntil: %s", 
+			domain, bucket.discarded, bucket.standbyUntil.Format(time.RFC3339))
+	}
+	dm.logger.Infof("DomainManager state successfully restored for %d domains from resume file.", len(savedStates))
+	return nil
 }
 
 // GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.
