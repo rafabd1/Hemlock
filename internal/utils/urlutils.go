@@ -149,6 +149,11 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 		".mp4", ".avi", ".mov", ".webm", // Video
 		".mp3", ".wav", ".ogg", // Audio
 		".ico",                                                        // Favicons
+		".css", // Stylesheets
+		".js",  // JavaScript files
+		".json", // JSON data files, often static or API responses not typically a direct target for this tool's header/param based WCP on base URL
+		".txt", // Text files
+		".xml", // XML files, including sitemaps etc.
 		".d.ts", ".ts", ".tsx", // TypeScript/JavaScript specific build/type files
 		".vue", ".svelte", // Framework specific files
 	}

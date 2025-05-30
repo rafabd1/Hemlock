@@ -966,15 +966,31 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 		return false
 	}
 
-	// Did the second response indicate a cache hit?
-	hit := utils.IsCacheHit(probe01.Response)
-	if !hit {
+	// Did the second response indicate a cache hit according to headers?
+	hitByHeaders := utils.IsCacheHit(probe01.Response)
+	if !hitByHeaders {
 		if s.config.VerbosityLevel >= 2 {
-			s.logger.Debugf("[CacheCheckHelper] Probe 0.1 for %s did not indicate a cache HIT.", probe01.URL)
+			s.logger.Debugf("[CacheCheckHelper] Probe 0.1 for %s did not indicate a cache HIT by headers (IsCacheHit returned false).", probe01.URL)
 		}
-		// Optionally, even if no explicit HIT, if bodies are identical and Probe0 was cacheable,
-		// some might consider it "implicitly cached" or behaving as such.
-		// For now, let's be stricter and require a HIT signal.
+		return false
+	}
+
+	// If headers indicate a HIT, further check ETag and Last-Modified consistency.
+	etag0 := probe0.RespHeaders.Get("ETag")
+	etag01 := probe01.RespHeaders.Get("ETag")
+	if etag0 != "" && etag01 != "" && etag0 != etag01 {
+		if s.config.VerbosityLevel >= 1 { // -v
+			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT by headers, but ETags differ. Probe0 ETag: '%s', Probe0.1 ETag: '%s'. Treating as NOT reliably cacheable.", probe0.URL, etag0, etag01)
+		}
+		return false
+	}
+
+	lastModified0 := probe0.RespHeaders.Get("Last-Modified")
+	lastModified01 := probe01.RespHeaders.Get("Last-Modified")
+	if lastModified0 != "" && lastModified01 != "" && lastModified0 != lastModified01 {
+		if s.config.VerbosityLevel >= 1 { // -v
+			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT by headers, but Last-Modified dates differ. Probe0 Last-Mod: '%s', Probe0.1 Last-Mod: '%s'. Treating as NOT reliably cacheable.", probe0.URL, lastModified0, lastModified01)
+		}
 		return false
 	}
 	
@@ -984,7 +1000,7 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 	// Using a high similarity threshold.
 	if !utils.BodiesAreSimilar(probe0.Body, probe01.Body, 0.98) { // 98% similarity
 		if s.config.VerbosityLevel >= 1 { // -v
-			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT on Probe 0.1, but bodies differ significantly from Probe 0. Treating as not reliably cacheable for tests.", probe0.URL)
+			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT by headers and consistent ETag/Last-Modified (if present), but bodies differ significantly. Treating as not reliably cacheable for tests.", probe0.URL)
 		}
 		return false
 	}
@@ -992,7 +1008,7 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 	// Could also check if key headers like Content-Type, Content-Length are consistent if needed.
 
 	if s.config.VerbosityLevel >= 2 {
-		s.logger.Debugf("[CacheCheckHelper] URL %s deemed cacheable: Probe0 cacheable headers, Probe0.1 HIT, bodies similar.", probe0.URL)
+		s.logger.Debugf("[CacheCheckHelper] URL %s deemed cacheable: Probe0 cacheable headers, Probe0.1 HIT by headers, ETag/Last-Modified consistent (if present), bodies similar.", probe0.URL)
 	}
 	return true
 }

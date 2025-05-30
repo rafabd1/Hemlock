@@ -184,26 +184,38 @@ func IsCacheHit(resp *http.Response) bool {
 		return false
 	}
 
-	// Check X-Cache header (common)
+	// Explicitly check for MISS or ERROR states first
 	xCache := strings.ToLower(resp.Header.Get("X-Cache"))
-	if strings.Contains(xCache, "hit") {
-		// Also check it doesn't say miss, e.g. "miss, hit" or some other complex value
-		if !strings.Contains(xCache, "miss") { // Simple check, could be more robust
-			return true
-		}
+	if strings.Contains(xCache, "miss") || strings.Contains(xCache, "error") {
+		return false
 	}
 
-	// Check X-Cache-Lookup header (common)
 	xCacheLookup := strings.ToLower(resp.Header.Get("X-Cache-Lookup"))
-	if strings.Contains(xCacheLookup, "hit") {
-		if !strings.Contains(xCacheLookup, "miss") {
-			return true
-		}
+	if strings.Contains(xCacheLookup, "miss") || strings.Contains(xCacheLookup, "error") {
+		return false
 	}
 
-	// Check CF-Cache-Status header (Cloudflare)
 	cfCacheStatus := strings.ToUpper(resp.Header.Get("CF-Cache-Status"))
 	switch cfCacheStatus {
+	case "MISS", "EXPIRED", "BYPASS", "DYNAMIC", "ERROR": // Added ERROR here
+		return false
+	// HIT, UPDATING, REVALIDATED are handled below as positive indicators
+	}
+
+	// Check X-Cache header (common) for HIT
+	if strings.Contains(xCache, "hit") {
+		// Already checked for miss/error above, so a pure "hit" here is good.
+		return true
+	}
+
+	// Check X-Cache-Lookup header (common) for HIT
+	if strings.Contains(xCacheLookup, "hit") {
+		// Already checked for miss/error above.
+		return true
+	}
+
+	// Check CF-Cache-Status header (Cloudflare) for HIT states
+	switch cfCacheStatus { // Re-check for positive states, as negative states already returned false
 	case "HIT", "UPDATING", "REVALIDATED": // UPDATING and REVALIDATED often mean a hit while stale content is updated
 		return true
 	}
