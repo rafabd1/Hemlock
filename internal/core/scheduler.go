@@ -3,15 +3,12 @@ package core
 import (
 	"container/heap"
 	"context"
-	"encoding/json"
 	"errors" // Added for errors.Is
 	"fmt"
 	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
-	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -140,19 +137,12 @@ type Scheduler struct {
 	// Fields for two-phase scanning
 	confirmedCacheableBaseURLs map[string]bool // Stores base URLs confirmed as cacheable
 	phase1CompletionWg         sync.WaitGroup    // WaitGroup for cacheability check phase
-
-	// Fields for saving/resuming scan state
-	resumeState                       *ResumeState      // Holds state if resuming
-	phase2JobsCompleted               map[string]bool   // Tracks completed Phase 2 jobs (job.URLString -> true)
-	uniqueBaseURLsProcessedInPhase1 map[string]bool   // Tracks base URLs fully processed in Phase 1 (outcome in confirmedCacheableBaseURLs)
-	currentScanPhase                ResumePhase       // Current operational phase of the scheduler
-	hemlockVersion                  string            // Version of Hemlock running/saved
 }
 
 // NewScheduler creates a new Scheduler instance.
 func NewScheduler(cfg *config.Config, client *networking.Client, processor *Processor, dm *networking.DomainManager, logger utils.Logger) *Scheduler {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Scheduler{ // Changed to s :=
+	return &Scheduler{
 		config:        cfg,
 		client:        client,
 		processor:     processor,
@@ -163,16 +153,7 @@ func NewScheduler(cfg *config.Config, client *networking.Client, processor *Proc
 		doneChan:      make(chan struct{}),
 		ctx:           ctx,
 		cancel:        cancel,
-
-		// Initialize new fields for state management
-		confirmedCacheableBaseURLs: make(map[string]bool), // Moved initialization here
-		phase2JobsCompleted:               make(map[string]bool),
-		uniqueBaseURLsProcessedInPhase1: make(map[string]bool),
-		currentScanPhase:                PhaseUnknown,      // Will be set during StartScan or LoadState
-		hemlockVersion:                  "0.1.0-dev", // TODO: Get this from a global constant or build flag
-		// resumeState will be nil until loaded
 	}
-	return s // Return s
 }
 
 // buildProbeData converts networking.ClientResponseData to core.ProbeData.
@@ -202,149 +183,323 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 // StartScan begins the scanning process based on the scheduler's configuration.
 func (s *Scheduler) StartScan() []*report.Finding {
 	s.logger.Debugf("Scheduler: Initializing scan...")
+	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
 
-	// --- Carregar Estado de Resumo (se aplicável) ---
-	if s.config.ResumeFilePath != "" {
-		err := s.loadState(s.config.ResumeFilePath)
-		if err != nil {
-			s.logger.Fatalf("Failed to load resume state from '%s': %v. Aborting.", s.config.ResumeFilePath, err)
-			if s.resumeState != nil && s.resumeState.Findings != nil {
-				return s.resumeState.Findings
-			}
-			return []*report.Finding{}
-		}
-	} else {
-		s.currentScanPhase = Phase1Cacheability
-		s.uniqueBaseURLsProcessedInPhase1 = make(map[string]bool)
-		s.confirmedCacheableBaseURLs = make(map[string]bool)
-		s.phase2JobsCompleted = make(map[string]bool)
-	}
-
-	// --- Deferir Limpeza Final ---
+	// Defer para limpeza finalíssima da última instância da barra e contexto do scheduler
 	defer func() {
-		if s.progressBar != nil {
+		if s.progressBar != nil { // Se alguma barra foi criada em algum momento
 			s.progressBar.Finalize()
 		}
-		output.SetActiveProgressBar(nil)
-		s.cancel() // Cancela o contexto principal do scheduler
+		output.SetActiveProgressBar(nil) // Garante que nenhuma barra fique como global no final
+		s.cancel()                       // Cancela o contexto principal do scheduler
 	}()
 
-	// --- Determinar Targets e Agrupamento Inicial ---
-	groupedBaseURLsAndParams, uniqueBaseURLsFromConfig, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
-
-	if len(s.config.Targets) == 0 {
-		s.logger.Warnf("Scheduler: No targets in current configuration. Aborting scan.")
-		return s.findings
-	}
-	if len(uniqueBaseURLsFromConfig) == 0 && s.resumeState == nil {
-		s.logger.Fatalf("Scheduler: No processable unique base URLs from config and not resuming. Aborting scan.")
+	if len(uniqueBaseURLs) == 0 {
+		s.logger.Warnf("Scheduler: No processable targets. Aborting scan.")
 		return s.findings
 	}
 
-	// --- Inicializar Canais e Workers ---
+	// Inicializar canais ANTES de iniciar jobFeederLoop
+	// A capacidade exata de pendingQueueBufferSize será definida mais tarde, quando soubermos o total da Fase 1.
+	// Por enquanto, um buffer razoável para workerJobQueue.
 	concurrencyLimit := s.config.Concurrency
 	if concurrencyLimit <= 0 { concurrencyLimit = 1 }
 	s.workerJobQueue = make(chan TargetURLJob, concurrencyLimit)
+	// pendingJobsQueue será inicializado após calcularmos os jobs da Fase 1 ou um total preliminar.
+
+	// --- PHASE 1: Cacheability Checks ---
+	s.logger.Infof("Scheduler: Starting Phase 1 - Cacheability Checks for %d unique base URLs.", len(uniqueBaseURLs))
+	s.confirmedCacheableBaseURLs = make(map[string]bool)
+	
+	var phase1Jobs []TargetURLJob
+	for _, baseURL := range uniqueBaseURLs {
+		parsedBase, err := url.Parse(baseURL)
+		if err != nil {
+			s.logger.Warnf("Scheduler: Failed to parse base URL '%s' for cacheability check: %v. Skipping.", baseURL, err)
+			continue
+		}
+		phase1Jobs = append(phase1Jobs, TargetURLJob{
+			URLString:  baseURL,
+			BaseDomain: parsedBase.Hostname(),
+			JobType:    JobTypeCacheabilityCheck,
+			NextAttemptAt: time.Now(),
+		})
+	}
+
+	s.phase1CompletionWg.Add(len(phase1Jobs)) // Adiciona ao WaitGroup ANTES de iniciar workers ou enfileirar
+
+	// Inicializa pendingJobsQueue e workers DEPOIS de saber len(phase1Jobs)
+	pendingQueueBufferSizePhase1 := len(phase1Jobs) + concurrencyLimit // concurrencyLimit já definido
+	if pendingQueueBufferSizePhase1 < 100 {pendingQueueBufferSizePhase1 = 100}
+	s.pendingJobsQueue = make(chan TargetURLJob, pendingQueueBufferSizePhase1)
 
 	for i := 0; i < concurrencyLimit; i++ {
 		s.wg.Add(1)
-		go s.worker(i)
+		go s.worker(i) 
 	}
-	s.wg.Add(1) // Para jobFeederLoop
-	go s.jobFeederLoop()
-
-	// --- Lógica de Retomada ou Início de Novo Scan (Cálculo de Jobs Pendentes) ---
-	var phase1JobsToQueue []TargetURLJob
-	var phase2JobsActualForOrchestrator []TargetURLJob // Jobs da Fase 2 a serem enfileirados pela goroutine orquestradora
-	initialActiveJobsCount := int32(0)
-
-	if s.resumeState != nil {
-		s.logger.Infof("Resuming scan from phase: %s", s.currentScanPhase)
-
-		if s.currentScanPhase == Phase1Cacheability {
-			for _, baseURL := range uniqueBaseURLsFromConfig {
-				if !s.uniqueBaseURLsProcessedInPhase1[baseURL] {
-					parsedBase, err := url.Parse(baseURL)
-					if err != nil {
-						s.logger.Warnf("Scheduler (Resume Phase 1): Failed to parse base URL '%s': %v. Skipping.", baseURL, err)
-						continue
-					}
-					phase1JobsToQueue = append(phase1JobsToQueue, TargetURLJob{
-						URLString:     baseURL,
-						BaseDomain:    parsedBase.Hostname(),
-						JobType:       JobTypeCacheabilityCheck,
-						NextAttemptAt: time.Now(),
-					})
-				}
-			}
-			s.logger.Infof("Resuming Phase 1: %d base URLs already processed, %d pending cacheability checks.", len(s.uniqueBaseURLsProcessedInPhase1), len(phase1JobsToQueue))
-			s.phase1CompletionWg.Add(len(phase1JobsToQueue))
-			initialActiveJobsCount = int32(len(phase1JobsToQueue))
-		} else if s.currentScanPhase == Phase2Probing {
-			s.logger.Infof("Resuming Phase 2: Phase 1 considered completed. Phase 2 jobs will be calculated by orchestrator.")
-			// phase1CompletionWg não é incrementado. initialActiveJobsCount será atualizado pelo orquestrador.
-		} else if s.currentScanPhase == PhaseComplete {
-			s.logger.Infof("Scan was already complete according to resume state. No new jobs to queue.")
-		}
-	} else { // Novo Scan
-		// s.currentScanPhase já é Phase1Cacheability
-		for _, baseURL := range uniqueBaseURLsFromConfig {
-			parsedBase, err := url.Parse(baseURL)
-			if err != nil {
-				s.logger.Warnf("Scheduler (New Scan Phase 1): Failed to parse base URL '%s': %v. Skipping.", baseURL, err)
-				continue
-			}
-			phase1JobsToQueue = append(phase1JobsToQueue, TargetURLJob{
-				URLString:     baseURL,
-				BaseDomain:    parsedBase.Hostname(),
-				JobType:       JobTypeCacheabilityCheck,
-				NextAttemptAt: time.Now(),
-			})
-		}
-		s.phase1CompletionWg.Add(len(phase1JobsToQueue))
-		initialActiveJobsCount = int32(len(phase1JobsToQueue))
-		s.logger.Infof("Scheduler: Starting Phase 1 - Cacheability Checks for %d unique base URLs.", len(phase1JobsToQueue))
-	}
-
-	// --- Inicializar pendingJobsQueue e enfileirar jobs iniciais da Fase 1 ---
-	pendingQueueBufferSize := len(phase1JobsToQueue) + concurrencyLimit
-	if s.currentScanPhase == Phase2Probing {
-		// Estimativa para buffer se estiver retomando a Fase 2. A orquestradora calculará os jobs reais.
-		numPotentialPhase2Jobs := 0
-		for _, isCacheable := range s.confirmedCacheableBaseURLs {
-			if isCacheable { numPotentialPhase2Jobs++ }
-		}
-		pendingQueueBufferSize = (numPotentialPhase2Jobs * (len(s.config.HeadersToTest) + len(s.config.ParamsToFuzz))) + concurrencyLimit
-	}
-	if pendingQueueBufferSize < 100 { pendingQueueBufferSize = 100 }
-	s.pendingJobsQueue = make(chan TargetURLJob, pendingQueueBufferSize)
-
-	atomic.StoreInt32(&s.activeJobs, initialActiveJobsCount) // Usar initialActiveJobsCount aqui
-	if len(phase1JobsToQueue) > 0 {
-		// s.activeJobs já foi definido com initialActiveJobsCount que é len(phase1JobsToQueue) para novos scans
-		// ou para os jobs pendentes da fase 1 no resume. Não precisa adicionar novamente aqui.
-		for _, job := range phase1JobsToQueue {
+	
+	if len(phase1Jobs) > 0 {
+		atomic.AddInt32(&s.activeJobs, int32(len(phase1Jobs))) // INCREMENTA activeJobs para Fase 1
+		for _, job := range phase1Jobs {
 			s.pendingJobsQueue <- job
 		}
+	} else {
+		s.logger.Warnf("Scheduler: No jobs created for Phase 1 (Cacheability Check).")
+		// Se não houver jobs na Fase 1, a goroutine orquestradora (que espera phase1CompletionWg)
+		// será liberada imediatamente se len(phase1Jobs) for 0 e Add(0) foi chamado.
+		// Ela então procederá para a Fase 2 ou finalizará.
 	}
+	
+	// Configuração da barra da Fase 1
+	s.totalJobsForProgressBar = len(phase1Jobs) // Total for Phase 1 progress bar
+	s.completedJobsInPhaseForBar = 0            // Reset for Phase 1
 
-	// --- Configuração da Barra de Progresso e Orquestração de Fases ---
-	s.setupProgressBarAndOrchestratePhases(uniqueBaseURLsFromConfig, groupedBaseURLsAndParams, phase1JobsToQueue, phase2JobsActualForOrchestrator)
-
-	// --- Aguardar Conclusão ---
-	select {
-	case <-s.doneChan:
-		s.logger.Debugf("Scheduler: s.doneChan closed. All scan tasks, workers, and job feeder presumed completed.")
-	case <-s.ctx.Done():
-		s.logger.Warnf("Scheduler: Main context ctx.Done() received. Scan is terminating prematurely.")
+	if s.totalJobsForProgressBar > 0 && !s.config.Silent { // Initialize progress bar here for Phase 1
+		s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40)
+		s.progressBar.SetPrefix("Phase 1/2 (Cache Checks): ")
+		s.progressBar.Start()
+	} else if !s.config.Silent { // Handle case where Phase 1 has 0 jobs but we still might want a bar for Phase 2
+		s.progressBar = output.NewProgressBar(0, 40) // Start with 0, will be reset
+		s.progressBar.SetPrefix("Phase 1/2 (Cache Checks): ")
+		s.progressBar.Start()
 	}
+	
+	// Start jobFeederLoop and workers
+	s.wg.Add(1) // For feeder
+	go s.jobFeederLoop()
 
-	s.logger.Debugf("Scheduler: Scan processing finished. Returning findings.")
+	// Goroutine to manage transition to Phase 2
+	s.wg.Add(1) // For this orchestrating goroutine
+		go func() {
+			defer s.wg.Done()
+
+		s.phase1CompletionWg.Wait() // Wait for all Phase 1 jobs to complete
+
+		// Captura a instância da barra da Fase 1 ANTES de qualquer coisa da Fase 2
+		progressBarPhase1 := s.progressBar
+
+		// Parar e limpar a barra da Fase 1
+		if progressBarPhase1 != nil {
+			progressBarPhase1.Stop()
+		}
+
+		// DEBUG LOGS IMEDIATAMENTE APÓS A FASE 1 COMPLETAR
+		s.mu.Lock()
+		numCacheable := len(s.confirmedCacheableBaseURLs)
+		s.mu.Unlock()
+		initialActiveJobsAfterPhase1 := atomic.LoadInt32(&s.activeJobs)
+		s.logger.Debugf("[Orchestrator-Debug] After Phase 1 Wait: numCacheable=%d, initialActiveJobsAfterPhase1=%d", 
+			numCacheable, initialActiveJobsAfterPhase1)
+
+		s.logger.Infof("Scheduler: Phase 1 (Cacheability Check) COMPLETED. Found %d cacheable base URLs.", numCacheable)
+
+		var phase2Jobs []TargetURLJob
+		if numCacheable > 0 {
+			for _, baseURL := range uniqueBaseURLs {
+				s.mu.Lock()
+				isBaseCacheable := s.confirmedCacheableBaseURLs[baseURL]
+				s.mu.Unlock()
+
+				if isBaseCacheable {
+					paramSets := groupedBaseURLsAndParams[baseURL]
+					parsedBase, _ := url.Parse(baseURL)
+					baseDomain := parsedBase.Hostname()
+					
+					if s.config.EnableParamFuzzing {
+						// Se fuzzing está habilitado, ele lida com URLs com e sem params.
+						if len(paramSets) == 0 { // Sem params originais, mas fuzzing habilitado
+							actualTargetURL, _ := constructURLWithParams(baseURL, make(map[string]string))
+							phase2Jobs = append(phase2Jobs, TargetURLJob{
+								URLString:      actualTargetURL, // Testará headers na URL base + fuzzing de novos params
+								BaseDomain:     baseDomain,
+								OriginalParams: make(map[string]string),
+								JobType:        JobTypeFullProbe,
+									NextAttemptAt:  time.Now(),
+							})
+						} else { // Com params originais E fuzzing habilitado
+							for _, paramSet := range paramSets {
+								actualTargetURL, _ := constructURLWithParams(baseURL, paramSet)
+									phase2Jobs = append(phase2Jobs, TargetURLJob{
+										URLString:      actualTargetURL, // Testará params originais + headers + fuzzing de novos params
+										BaseDomain:     baseDomain,
+										OriginalParams: paramSet,
+										JobType:        JobTypeFullProbe,
+										NextAttemptAt:  time.Now(),
+									})
+							}
+						}
+					} else { // EnableParamFuzzing é FALSE
+						// Testes de header estão habilitados por padrão (s.config.DisableHeaderTests é false)
+						// Queremos:
+						// 1. Um job para a URL base (sem query params) para testar headers.
+						// 2. Se a URL original tinha parâmetros, um job adicional para a URL com seus parâmetros originais, também para testar headers.
+
+						// Job para a URL base (sem query params) - sempre criar se testes de header estiverem habilitados
+						if !s.config.DisableHeaderTests {
+							// A `baseURL` de uniqueBaseURLs já é scheme + host + path (sem query params da URL original)
+							urlForBaseHeaderTest := baseURL
+							phase2Jobs = append(phase2Jobs, TargetURLJob{
+								URLString:      urlForBaseHeaderTest,
+								BaseDomain:     baseDomain,
+								OriginalParams: make(map[string]string), // Indica que este job é para a base nua
+								JobType:        JobTypeFullProbe,
+								NextAttemptAt:  time.Now(),
+							})
+						}
+
+						// Jobs adicionais para cada conjunto de parâmetros originais, se houver.
+						// Estes testarão headers na URL completa (com seus respectivos params).
+						if len(paramSets) > 0 {
+							for _, paramSet := range paramSets {
+								if len(paramSet) > 0 { // Só se o conjunto de parâmetros não for vazio
+									actualTargetURL, _ := constructURLWithParams(baseURL /* scheme+host+path */, paramSet /* query */)
+									phase2Jobs = append(phase2Jobs, TargetURLJob{
+										URLString:      actualTargetURL,
+										BaseDomain:     baseDomain,
+										OriginalParams: paramSet, // Mantém os params originais para este job
+										JobType:        JobTypeFullProbe,
+										NextAttemptAt:  time.Now(),
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// Incrementar activeJobs para Fase 2 ANTES de enfileirar
+		if len(phase2Jobs) > 0 {
+			atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs)))
+		}
+
+		// MAIS DEBUG LOGS ANTES DA DECISÃO DA FASE 2
+		finalActiveJobsBeforePhase2Queue := atomic.LoadInt32(&s.activeJobs)
+		s.logger.Debugf("[Orchestrator-Debug] Before Phase 2 queueing: len(phase2Jobs)=%d, finalActiveJobsBeforePhase2Queue=%d, EnableParamFuzzing: %v", 
+			len(phase2Jobs), finalActiveJobsBeforePhase2Queue, s.config.EnableParamFuzzing)
+		// Mostrar os paramSets se verbosidade -vv
+		if s.config.VerbosityLevel >= 2 && numCacheable > 0 {
+			countLogged := 0
+			for baseURLScanned, isActuallyCacheable := range s.confirmedCacheableBaseURLs { // Iterar sobre o mapa de cacheáveis
+				if isActuallyCacheable && countLogged < 5 { // Logar para até 5 cacheáveis
+					paramSetsForThisURL := groupedBaseURLsAndParams[baseURLScanned]
+					s.logger.Debugf("[Orchestrator-Debug] For confirmed cacheable baseURL '%s', found %d paramSets in groupedBaseURLsAndParams.", baseURLScanned, len(paramSetsForThisURL))
+					for i, ps := range paramSetsForThisURL {
+						s.logger.Debugf("[Orchestrator-Debug]   ParamSet %d for %s: %v", i, baseURLScanned, ps)
+					}
+					countLogged++
+				}
+			}
+		}
+
+		// Calcular o total estimado de probes para a Fase 2
+		estimatedTotalProbesInPhase2 := 0
+		if len(phase2Jobs) > 0 {
+			numBasePayloads := len(s.config.BasePayloads)
+			if numBasePayloads == 0 && s.config.DefaultPayloadPrefix != "" { // Lógica de fallback para payloads
+				numBasePayloads = 1
+			}
+
+			if !s.config.DisableHeaderTests {
+				estimatedTotalProbesInPhase2 += len(phase2Jobs) * len(s.config.HeadersToTest)
+			}
+			if s.config.EnableParamFuzzing {
+				estimatedTotalProbesInPhase2 += len(phase2Jobs) * len(s.config.ParamsToFuzz) * numBasePayloads
+				for _, job := range phase2Jobs { // Adicionar contagem para params originais apenas se fuzzing habilitado
+					if len(job.OriginalParams) > 0 {
+						estimatedTotalProbesInPhase2 += len(job.OriginalParams) * numBasePayloads
+					}
+				}
+			} else {
+			    // Se o fuzzing de params está desabilitado, contamos apenas os params originais não vazios
+			    for _, job := range phase2Jobs {
+			        if len(job.OriginalParams) > 0 {
+			            estimatedTotalProbesInPhase2 += len(job.OriginalParams) * numBasePayloads
+			        }
+			    }
+			}
+		}
+		if estimatedTotalProbesInPhase2 == 0 && len(phase2Jobs) > 0 {
+		    // Se há jobs na Fase 2, mas nenhuma probe foi estimada (ex: apenas headers desabilitados e fuzzing desabilitado sem params originais),
+		    // usar o número de jobs da Fase 2 para a barra, para não ficar em 0.
+		    estimatedTotalProbesInPhase2 = len(phase2Jobs)
+		}
+
+		s.logger.Infof("Scheduler: Starting Phase 2 - Full Probing with %d jobs (estimated %d probes).", len(phase2Jobs), estimatedTotalProbesInPhase2)
+		
+		// Configuração da barra da Fase 2
+		if len(phase2Jobs) > 0 && !s.config.Silent {
+			s.totalJobsForProgressBar = estimatedTotalProbesInPhase2 // Total para a barra da Fase 2
+			s.completedProbesInPhase.Store(0) // Resetar contador de probes para a Fase 2
+			s.progressBar = output.NewProgressBar(s.totalJobsForProgressBar, 40) 
+			s.progressBar.SetPrefix("Phase 2 - Probing: ")
+			// s.completedJobsInPhaseForBar = 0 // Não é mais usado para Fase 2
+			s.progressBar.Start()
+		} else if progressBarPhase1 != nil { 
+			// Se não há jobs na Fase 2, mas havia uma barra na Fase 1 (que já foi parada),
+			// garante que nenhuma barra esteja como global.
+			output.SetActiveProgressBar(nil)
+		} else {
+			// Se não havia barra na Fase 1 e não há jobs na Fase 2
+			output.SetActiveProgressBar(nil)
+		}
+
+		if len(phase2Jobs) > 0 {
+			// atomic.AddInt32(&s.activeJobs, int32(len(phase2Jobs))) // ESTA LINHA É A REDUNDANTE E SERÁ REMOVIDA
+			for _, job := range phase2Jobs {
+				s.pendingJobsQueue <- job
+			}
+		} else {
+			// Se não há jobs na fase 2, e fase 1 também já terminou
+			// Não fechar s.doneChan aqui. Deixar que decrementActiveJobs cuide disso
+			// quando o último job da Fase 1 (ou qualquer job que ainda exista) termine.
+			// Se activeJobs já é 0 aqui, decrementActiveJobs já o teria fechado ou o fechará em breve.
+			s.logger.Debugf("[Orchestrator-Debug] No Phase 2 jobs to enqueue. activeJobs currently: %d", atomic.LoadInt32(&s.activeJobs))
+			// if atomic.LoadInt32(&s.activeJobs) == 0 {  // LÓGICA DE FECHAMENTO REMOVIDA DAQUI
+			// 	s.logger.Infof("Scheduler: No Phase 1 or Phase 2 jobs to run. Signaling completion via orchestrator.")
+			// 	s.closeDoneChanOnce.Do(func() {
+			// 		close(s.doneChan)
+			// 	})
+			// }
+		}
+
+		// INICIAR GOROUTINE DE MONITORAMENTO PARA FECHAR s.doneChan QUANDO activeJobs == 0
+		s.wg.Add(1) // Adicionar ao WaitGroup principal do scheduler para esta goroutine de monitoramento
+		go func() {
+			defer s.wg.Done()
+			for {
+				// Verificar periodicamente ou usar um canal se quiser ser mais reativo
+				// Para simplicidade, um loop de polling com sleep curto.
+				time.Sleep(100 * time.Millisecond) 
+				currentJobs := atomic.LoadInt32(&s.activeJobs)
+				if currentJobs == 0 {
+					s.logger.Debugf("[SchedulerMonitor] All active jobs processed (count is 0). Signaling completion.") // Mudado para Debugf
+					s.closeDoneChanOnce.Do(func() {
+						close(s.doneChan)
+					})
+					return // Sair da goroutine de monitoramento
+				} else if currentJobs < 0 {
+					s.logger.Errorf("[SchedulerMonitor] CRITICAL: Active jobs count went negative (%d). Signaling completion to avoid deadlock.", currentJobs)
+					s.closeDoneChanOnce.Do(func() {
+						close(s.doneChan)
+					})
+					return // Sair da goroutine de monitoramento
+				}
+				// Opcional: Adicionar um log de depuração aqui para ver currentJobs periodicamente se verbosidade alta
+				if s.config.VerbosityLevel >= 2 {
+					s.logger.Debugf("[SchedulerMonitor] Active jobs: %d. Waiting for 0 to complete.", currentJobs)
+				}
+			}
+		}()
+
+	}() // End of orchestrator goroutine
+
+	// Main wait for all jobs (Phase 1 + Phase 2) to complete
+	<-s.doneChan
+
+	s.logger.Debugf("Scheduler: All scan tasks, workers, and job feeder completed.") // Mudado para Debugf
 	return s.findings
 }
-
-// generatePhase2JobsForBaseURL é um helper para criar jobs da Fase 2 para uma dada URL base e seus param sets.
-// ... existing code ...
 
 // jobFeederLoop é uma goroutine que pega jobs da pendingJobsQueue,
 // espera por job.NextAttemptAt se necessário (usando um min-heap),
@@ -1696,234 +1851,4 @@ func addQueryParamToURL(originalURL string, paramName string, paramValue string)
 	queryValues.Add(paramName, paramValue) // Use Add to allow multiple params with same name if needed, though Set is fine for fuzzing one at a time
 	u.RawQuery = queryValues.Encode()
 	return u.String(), nil
-}
-
-// SaveState collects the current state of the scheduler and related components
-// and saves it to a JSON file at the given filePath.
-func (s *Scheduler) SaveState(filePath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.config == nil {
-		return fmt.Errorf("cannot save state: scheduler config is nil")
-	}
-
-	dmStatus := make(map[string]networking.DomainBucketState)
-	if s.domainManager != nil {
-		dmStatus = s.domainManager.GetAllDomainStates()
-	} else {
-		if s.logger != nil {
-			s.logger.Warnf("DomainManager is nil during SaveState. Skipping its state.")
-		} else {
-			fmt.Printf("Warning: DomainManager is nil during SaveState. Skipping its state.\n")
-		}
-	}
-
-	// Determine currentScanPhase. This might need refinement to be more accurate based on scheduler's internal state.
-	// For now, use the s.currentScanPhase field which should be maintained by the scheduler.
-	currentPhaseToSave := s.currentScanPhase
-	if currentPhaseToSave == PhaseUnknown {
-		// Basic inference if still unknown at save time
-		if len(s.uniqueBaseURLsProcessedInPhase1) > 0 || len(s.phase2JobsCompleted) > 0 || len(s.confirmedCacheableBaseURLs) > 0 {
-			if len(s.phase2JobsCompleted) > 0 || (s.progressBar != nil && strings.Contains(s.progressBar.GetPrefixForDebug(), "Phase 2")) {
-				currentPhaseToSave = Phase2Probing
-			} else {
-				currentPhaseToSave = Phase1Cacheability
-			}
-		} else {
-			currentPhaseToSave = Phase1Cacheability // Default to Phase1 if no progress indication
-		}
-		if s.logger != nil {
-			s.logger.Debugf("Inferred currentScanPhase as '%s' for saving state because it was PhaseUnknown.", currentPhaseToSave)
-		}
-	}
-
-	stateToSave := ResumeState{
-		HemlockVersion:     s.hemlockVersion,
-		Timestamp:          time.Now(),
-		OriginalConfig:     s.config,
-		CurrentScanPhase:   currentPhaseToSave,
-
-		UniqueBaseURLsProcessedInPhase1: s.uniqueBaseURLsProcessedInPhase1,
-		ConfirmedCacheableBaseURLs:    s.confirmedCacheableBaseURLs,
-		Phase2JobsCompleted:           s.phase2JobsCompleted,
-		Findings:                      s.findings,
-		DomainManagerStatus:           dmStatus,
-
-		TotalProbesExecutedGlobal: s.totalProbesExecutedGlobal.Load(),
-	}
-
-	if s.progressBar != nil {
-		prefix := s.progressBar.GetPrefixForDebug()
-		if strings.Contains(prefix, "Phase 1") {
-			stateToSave.ProgressBarPhase1TotalJobs = s.totalJobsForProgressBar // s.totalJobsForProgressBar should reflect current phase's total
-			stateToSave.ProgressBarPhase1CompletedJobs = s.completedJobsInPhaseForBar // s.completedJobsInPhaseForBar for phase 1
-		} else if strings.Contains(prefix, "Phase 2") {
-			stateToSave.ProgressBarPhase2TotalProbes = s.totalJobsForProgressBar // s.totalJobsForProgressBar for phase 2 (probes)
-			stateToSave.ProgressBarPhase2CompletedProbes = s.completedProbesInPhase.Load()
-		}
-	} else {
-	    // If progress bar is nil, try to make reasonable defaults or log.
-        // For Phase 1, if it was completed without a bar, completed should equal total.
-        if currentPhaseToSave == Phase2Probing || currentPhaseToSave == PhaseComplete { // Phase 1 is done
-            // This assumes all phase 1 jobs were processed if we are in or past phase 2.
-            // This might not be accurate if the bar was never initialized but phase 1 jobs were queued.
-            // A better approach would be to derive this from len(s.uniqueBaseURLsProcessedInPhase1) vs. total initial phase 1 jobs.
-            // For now, we'll leave them as 0 if no bar, or the logic above will handle it.
-        }
-	}
-
-	logMsgPrefix := "Scheduler SaveState: "
-	if s.logger != nil {
-		s.logger.Infof(logMsgPrefix+"Saving scan state to %s...", filePath)
-	} else {
-		fmt.Printf(logMsgPrefix+"Saving scan state to %s...\n", filePath)
-	}
-
-	data, err := json.MarshalIndent(stateToSave, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal resume state: %w", err)
-	}
-
-	err = os.WriteFile(filePath, data, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write resume state file '%s': %w", filePath, err)
-	}
-
-	if s.logger != nil {
-		s.logger.Infof(logMsgPrefix+"Scan state saved successfully to %s", filePath)
-	} else {
-		fmt.Printf(logMsgPrefix+"Scan state saved successfully to %s\n", filePath)
-	}
-	return nil
-}
-
-// markJobAsCompletedForResume marca um job como concluído nos mapas de rastreamento de resumo.
-// Esta função garante que, mesmo que um job seja reenfileirado e depois o scan seja interrompido,
-// o seu estado "original" de conclusão (antes do reenfileiramento que pode não ter acontecido)
-// não seja perdido para a lógica de resumo.
-// ATENÇÃO: Esta lógica precisa ser chamada no momento certo.
-// Por exemplo, quando um job é *finalmente* descartado após todas as retries, ou quando é *bem sucedido*.
-func (s *Scheduler) markJobAsCompletedForResume(job TargetURLJob) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if job.JobType == JobTypeCacheabilityCheck {
-		// Para a Fase 1, uniqueBaseURLsProcessedInPhase1[baseURL] = true indica que o processCacheabilityCheckJob foi concluído para esta URL base.
-		// O resultado (se foi cacheável ou não) é armazenado em s.confirmedCacheableBaseURLs.
-		// Ambas as informações são importantes para o resumo.
-		s.uniqueBaseURLsProcessedInPhase1[job.URLString] = true
-		s.logger.Debugf("[Scheduler Resume] Marked Phase 1 job for base URL %s as processed for resume.", job.URLString)
-	} else if job.JobType == JobTypeFullProbe {
-		s.phase2JobsCompleted[job.URLString] = true
-		s.logger.Debugf("[Scheduler Resume] Marked Phase 2 job %s as completed for resume.", job.URLString)
-	}
-}
-
-// loadState carrega o estado de um scan anterior a partir de um arquivo JSON.
-func (s *Scheduler) loadState(filePath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.logger.Infof("Scheduler: Attempting to load scan state from %s...", filePath)
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read resume state file '%s': %w", filePath, err)
-	}
-
-	var loadedState ResumeState
-	err = json.Unmarshal(data, &loadedState)
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal resume state from '%s': %w", filePath, err)
-	}
-
-	// Validar versão (simples por enquanto)
-	if loadedState.HemlockVersion != s.hemlockVersion {
-		s.logger.Warnf("Version mismatch: File saved with Hemlock %s, current version is %s. Compatibility issues may occur.", loadedState.HemlockVersion, s.hemlockVersion)
-	}
-
-	// Restaurar o estado
-	s.resumeState = &loadedState
-	s.currentScanPhase = loadedState.CurrentScanPhase
-	s.findings = loadedState.Findings
-	
-	if loadedState.UniqueBaseURLsProcessedInPhase1 != nil {
-		s.uniqueBaseURLsProcessedInPhase1 = loadedState.UniqueBaseURLsProcessedInPhase1
-	}
-	if loadedState.ConfirmedCacheableBaseURLs != nil {
-		s.confirmedCacheableBaseURLs = loadedState.ConfirmedCacheableBaseURLs
-	}
-	if loadedState.Phase2JobsCompleted != nil {
-		s.phase2JobsCompleted = loadedState.Phase2JobsCompleted
-	}
-
-	// Restaurar contadores globais e da barra de progresso
-	s.totalProbesExecutedGlobal.Store(loadedState.TotalProbesExecutedGlobal)
-	
-	// Os valores da barra de progresso do estado salvo são usados para inicializar
-	// s.completedJobsInPhaseForBar e s.completedProbesInPhase.
-	// s.totalJobsForProgressBar será recalculado com base nos jobs pendentes.
-	s.completedJobsInPhaseForBar = loadedState.ProgressBarPhase1CompletedJobs
-	s.completedProbesInPhase.Store(loadedState.ProgressBarPhase2CompletedProbes)
-
-	// Mesclar Config: A config original do estado é a base.
-	// Flags da CLI que devem sobrescrever: OutputFile, Verbosity, NoColor, Silent, ProxyInput.
-	// Targets vêm do estado original.
-	originalTargets := s.config.Targets // Salva os targets da CLI caso não haja no estado (improvável)
-	cliOutputFile := s.config.OutputFile
-	cliOutputFormat := s.config.OutputFormat
-	cliVerbosityLevel := s.config.VerbosityLevel
-	cliVerbosityStr := s.config.Verbosity
-	cliNoColor := s.config.NoColor
-	cliSilent := s.config.Silent
-	cliProxyInput := s.config.ProxyInput
-	cliParsedProxies := s.config.ParsedProxies
-	// Outras flags que podem ser alteradas no resume (ex: concurrency, timeout) também podem ser tratadas aqui.
-	cliConcurrency := s.config.Concurrency
-	cliRequestTimeout := s.config.RequestTimeout
-	cliMaxRetries := s.config.MaxRetries
-
-	s.config = loadedState.OriginalConfig // Carrega a config do estado salvo
-
-s.logger.Infof("Original config loaded from state file. Target count from state: %d", len(s.config.Targets))
-
-	// Reaplicar flags da CLI que devem sobrescrever
-	s.config.OutputFile = cliOutputFile
-	s.config.OutputFormat = cliOutputFormat
-	s.config.VerbosityLevel = cliVerbosityLevel
-	s.config.Verbosity = cliVerbosityStr
-	s.config.NoColor = cliNoColor
-	s.config.Silent = cliSilent
-	s.config.ProxyInput = cliProxyInput       // Reaplicar proxy da CLI
-	s.config.ParsedProxies = cliParsedProxies // Reaplicar proxies parseados da CLI
-	s.config.Concurrency = cliConcurrency
-	s.config.RequestTimeout = cliRequestTimeout
-	s.config.MaxRetries = cliMaxRetries
-
-	// Se a config do estado não tinha targets (muito antigo ou corrompido), usa os da CLI
-	if len(s.config.Targets) == 0 && len(originalTargets) > 0 {
-		s.logger.Warnf("No targets found in the loaded state's original config. Using targets from current CLI input.")
-		s.config.Targets = originalTargets
-	}
-
-	// Recalcular o logger com a verbosidade potencialmente atualizada
-	logLevel := utils.StringToLogLevel(s.config.Verbosity)
-	s.logger = utils.NewDefaultLogger(logLevel, s.config.NoColor, s.config.Silent)
-	s.logger.Infof("Logger re-initialized with verbosity '%s' (Level: %d) after loading state.", s.config.Verbosity, s.config.VerbosityLevel)
-
-	// Restaurar estado do DomainManager
-	if s.domainManager != nil && loadedState.DomainManagerStatus != nil {
-		err = s.domainManager.ApplyResumeState(loadedState.DomainManagerStatus)
-		if err != nil {
-			return fmt.Errorf("failed to apply DomainManager state: %w", err)
-		}
-		s.logger.Infof("DomainManager state restored successfully.")
-	} else if s.domainManager == nil {
-		s.logger.Warnf("DomainManager is nil. Cannot restore its state.")
-	} else { // loadedState.DomainManagerStatus is nil
-		s.logger.Warnf("No DomainManager state found in the resume file.")
-	}
-
-	s.logger.Infof("Scheduler state loaded successfully from %s. Resuming from Phase: %s", filePath, s.currentScanPhase)
-	return nil
 }
