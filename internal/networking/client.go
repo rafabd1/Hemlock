@@ -194,11 +194,11 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		if err != nil {
 			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
 			if reqData.Ctx.Err() == context.DeadlineExceeded {
-				c.logger.Warnf("Request to %s timed out (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
+				c.logger.Debugf("Request to %s timed out (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
 			} else if reqData.Ctx.Err() == context.Canceled {
-				c.logger.Warnf("Request to %s canceled by context (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
+				c.logger.Debugf("Request to %s canceled by context (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
 			} else if strings.Contains(err.Error(), "dial tcp") && strings.Contains(err.Error(), "timeout") {
-				c.logger.Warnf("Request to %s failed with TCP dial timeout (attempt %d/%d): %v", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
+				c.logger.Debugf("Request to %s failed with TCP dial timeout (attempt %d/%d): %v", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
 			}
 			if attempt == c.config.MaxRetries {
 				return finalRespData

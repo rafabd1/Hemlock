@@ -237,7 +237,7 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		// Verifica se o limite de retries 429 do domínio foi atingido
 		if bucket.current429Retries >= dm.config.MaxDomain429Retries {
 			bucket.discarded = true
-			dm.logger.Errorf("[DomainManager] Domain '%s' DISCARDED permanently after %d (>=%d) repeated 429 errors.",
+			dm.logger.Warnf("Domain '%s' DISCARDED permanently after %d (>=%d) repeated 429 errors.",
 				domain, bucket.current429Retries, dm.config.MaxDomain429Retries)
 			// O domínio agora está marcado como descartado. CanRequest irá bloqueá-lo.
 		}
@@ -247,7 +247,7 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		if bucket.currentStandbyDuration > dm.config.MaxStandbyDuration {
 			bucket.currentStandbyDuration = dm.config.MaxStandbyDuration
 		}
-		dm.logger.Infof("[DomainManager] Domain '%s' next standby duration for 429s increased to %s.", domain, bucket.currentStandbyDuration)
+		dm.logger.Debugf("[DomainManager] Domain '%s' next standby duration for 429s increased to %s.", domain, bucket.currentStandbyDuration)
 
 		// No modo automático, resetar RPS para o mínimo após um 429.
 		if bucket.isAutoMode {
