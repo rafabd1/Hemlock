@@ -59,34 +59,68 @@ func ParseProxyInput(proxyInput string, logger Logger) ([]config.ProxyEntry, err
 			continue
 		}
 
-		// Attempt to parse the proxy string
-		// Format: [scheme://][user:pass@]host:port
 		var scheme, user, pass, host, port string
+		scheme = "http" // Default scheme
 
-		// Default scheme
-		scheme = "http"
-
-		urlStr := trimmedStr
-		if !strings.Contains(urlStr, "://") {
-			urlStr = "http://" + urlStr // Prepend default scheme if not present for URL parser
+		// Tentativa 1: Usar url.Parse para formatos padrão (scheme://user:pass@host:port)
+		parsedAsURL := false
+		if strings.Contains(trimmedStr, "://") {
+			if parsedURL, err := url.Parse(trimmedStr); err == nil {
+				if parsedURL.Scheme != "" { scheme = parsedURL.Scheme }
+				host = parsedURL.Hostname()
+				port = parsedURL.Port()
+				if parsedURL.User != nil {
+					user = parsedURL.User.Username()
+					pass, _ = parsedURL.User.Password()
+				}
+				if host != "" && port != "" {
+					parsedAsURL = true
+				} else {
+					// url.Parse pode ter sucesso parcial, ex: "http://semporta"
+					// Resetamos para tentar o fallback se host ou porta estiverem faltando.
+					scheme = "http" // Reset to default
+					host, port, user, pass = "", "", "", ""
+				}
+			}
 		}
 
-		parsedURL, err := url.Parse(urlStr)
-		if err != nil {
-			logger.Warnf("Failed to parse proxy string '%s' (as URL '%s'): %v. Skipping this proxy.", trimmedStr, urlStr, err)
-			continue
-		}
+		// Tentativa 2: Fallback para formatos como user:pass@host:port ou host:port ou ip:port:user:pass
+		if !parsedAsURL {
+			parts := strings.Split(trimmedStr, "@")
+			mainPart := ""
+			if len(parts) == 2 { // Contém user:pass@
+				userInfoParts := strings.SplitN(parts[0], ":", 2)
+				user = userInfoParts[0]
+				if len(userInfoParts) == 2 {
+					pass = userInfoParts[1]
+				}
+				mainPart = parts[1]
+			} else { // Não contém user:pass@
+				mainPart = parts[0]
+			}
 
-		if parsedURL.Scheme != "" {
-			scheme = parsedURL.Scheme
-		}
-
-		host = parsedURL.Hostname()
-		port = parsedURL.Port()
-
-		if parsedURL.User != nil {
-			user = parsedURL.User.Username()
-			pass, _ = parsedURL.User.Password()
+			// Agora, mainPart pode ser host:port ou ip:port:user:pass (se user/pass não foram pegos antes)
+			// ou apenas host (se não houver porta)
+			colParts := strings.Split(mainPart, ":")
+			if len(colParts) >= 2 { // Pelo menos host:port
+				host = colParts[0]
+				port = colParts[1]
+				if len(colParts) == 4 && user == "" && pass == "" { // Formato ip:port:user:pass e user/pass ainda não definidos
+					// Isso sugere que o formato original era ip:port:user:pass
+					// Se user e pass já foram preenchidos pelo split com "@", não sobrescrever aqui.
+					user = colParts[2]
+					pass = colParts[3]
+					// Neste caso, o 'scheme' permanece o default "http"
+				} else if len(colParts) > 2 && (user != "" || pass != "") {
+					// Se já tínhamos user/pass (de user:pass@host:port:something_else),
+					// e há mais de duas partes após o '@', isso é um formato estranho.
+					// Por enquanto, apenas pegamos host e port.
+					logger.Warnf("Proxy string '%s' has an unusual format after '@'. Using host='%s', port='%s'. Extra parts: %v", trimmedStr, host, port, colParts[2:])
+				}
+			} else if len(colParts) == 1 { // Apenas host, sem porta
+				host = colParts[0]
+				// Port fica vazio, o que será tratado abaixo
+			}
 		}
 
 		if host == "" {
@@ -94,41 +128,10 @@ func ParseProxyInput(proxyInput string, logger Logger) ([]config.ProxyEntry, err
 			continue
 		}
 		if port == "" {
-			// Try to extract host and port if url.Parse didn't get it (e.g. if no scheme was prepended and it was just host:port)
-			parts := strings.Split(trimmedStr, ":")
-			if len(parts) == 2 && host == parts[0] { // host matched, so second part is likely port
-				port = parts[1]
-			} else if len(parts) > 1 && !strings.Contains(trimmedStr, "://") { // if host:port:user:pass format, for example.
-			    // This is a simplified parsing for direct host:port or user:pass@host:port if url.Parse failed it.
-			    // More complex manual parsing might be needed for non-URL formats not caught by url.Parse
-			    // For now, if url.Parse didn't get a port, and it's not a simple host:port, we might miss it.
-			    // Let's re-evaluate if host is set but port is not.
-			    // If the original string (trimmedStr) did not have a scheme, url.Parse might misinterpret host:port.
-			    if !strings.Contains(trimmedStr, "://") { // It was likely a host:port type string
-			        hostPortParts := strings.SplitN(trimmedStr, "@", 2)
-			        var actualHostPortPart string
-			        if len(hostPortParts) == 2 { // Contains user:pass@
-			            userInfoParts := strings.SplitN(hostPortParts[0], ":", 2)
-			            user = userInfoParts[0]
-			            if len(userInfoParts) == 2 {pass = userInfoParts[1]}
-			            actualHostPortPart = hostPortParts[1]
-			        } else { // No user:pass@
-			            actualHostPortPart = hostPortParts[0]
-			        }
-
-			        finalSplit := strings.SplitN(actualHostPortPart, ":", 2)
-			        if len(finalSplit) == 2 {
-			            host = finalSplit[0]
-			            port = finalSplit[1]
-			        } else {
-			             host = finalSplit[0] // no port
-			        }
-			    }
-			    if port == "" { // still no port
-			        logger.Warnf("Proxy string '%s' resulted in empty port after attempting to manually parse host:port. Skipping.", trimmedStr)
-			        continue
-			    }
-			}
+			// Se a porta ainda estiver vazia, logar e pular.
+			// Poderíamos ter um default (ex: 80 ou 8080), mas é melhor exigir.
+			logger.Warnf("Proxy string '%s' resulted in empty port. Skipping.", trimmedStr)
+			continue
 		}
 
 		// Construct the full host string (hostname:port)

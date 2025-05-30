@@ -5,9 +5,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
 	"net/http"
+
+	// "net/http/httputil" // Removido pois não está sendo usado
 	"net/url"
 	"strings"
 	"sync"
@@ -24,29 +24,31 @@ const (
 	DefaultRetryDelayMaxMs = 5000 // formerly from config.RetryDelayMaxMs
 )
 
-// Client manages HTTP requests and client-specific configurations.
-// It's a wrapper around http.Client to include custom logic for Hemlock.
+// Client struct manages HTTP requests, including custom headers, retries, and proxy support.
 type Client struct {
-	httpClient        *http.Client
-	userAgent         string
-	logger            utils.Logger
-	cfg               *config.Config
-	currentProxyIndex int
-	proxyMutex        sync.Mutex
+	baseClient       *http.Client
+	config           *config.Config
+	logger           utils.Logger
+	userAgent        string
+	parsedProxies    []config.ProxyEntry
+	proxyLock        sync.Mutex
+	domainProxyIndex map[string]int
+	defaultTransport *http.Transport
+	currentProxyIndex int // For global round-robin if needed, not primary for domain-specific
+	// proxyMutex        sync.Mutex // proxyLock é usado para domainProxyIndex
 }
 
-// ClientRequestData holds all necessary data to perform an HTTP request.
-// This structure standardizes how requests are made by the client.
+// ClientRequestData struct encapsulates all necessary data for making a request.
 type ClientRequestData struct {
-	URL           string
-	Method        string
-	Body          []byte // For POST, PUT, etc.
-	CustomHeaders http.Header
-	Ctx           context.Context
+	URL            string
+	Method         string
+	Body           string
+	CustomHeaders  http.Header // Alterado para http.Header para facilitar o uso
+	RequestHeaders http.Header // Renomeado de CustomHeaders para clareza, usado para headers específicos da requisição
+	Ctx            context.Context
 }
 
-// ClientResponseData holds the outcome of an HTTP request.
-// This includes the HTTP response, body, and any errors encountered.
+// ClientResponseData struct holds the outcome of an HTTP request.
 type ClientResponseData struct {
 	Response    *http.Response
 	Body        []byte
@@ -54,202 +56,185 @@ type ClientResponseData struct {
 	Error       error
 }
 
-// NewClient creates a new instance of the custom HTTP client.
-// It configures the underlying http.Client with timeouts and proxy settings with rotation.
+// NewClient creates a new HTTP Client with specified configurations.
 func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
-	clientInstance := &Client{
-		userAgent:         cfg.UserAgent,
-		logger:            logger,
-		cfg:               cfg,
+	baseTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: cfg.InsecureSkipVerify,
+		},
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+
+	c := &Client{
+		config:           cfg,
+		logger:           logger,
+		userAgent:        cfg.UserAgent,
+		parsedProxies:    cfg.ParsedProxies,
+		domainProxyIndex: make(map[string]int),
+		defaultTransport: baseTransport,
 		currentProxyIndex: 0,
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify},
-		DialContext: (&net.Dialer{
-			Timeout:   cfg.RequestTimeout,
-			KeepAlive: 30 * time.Second, // Este KeepAlive é para o dialer, não para as conexões HTTP persistentes
-		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableKeepAlives:     true,
-	}
-
-	if len(cfg.ParsedProxies) > 0 {
-		transport.Proxy = func(req *http.Request) (*url.URL, error) {
-			clientInstance.proxyMutex.Lock()
-			defer clientInstance.proxyMutex.Unlock()
-
-			if len(clientInstance.cfg.ParsedProxies) == 0 {
-				return nil, nil // Sem proxies para usar
-			}
-
-			// Seleciona o proxy atual e avança o índice para a próxima vez
-			proxyEntry := clientInstance.cfg.ParsedProxies[clientInstance.currentProxyIndex]
-			clientInstance.currentProxyIndex = (clientInstance.currentProxyIndex + 1) % len(clientInstance.cfg.ParsedProxies)
-
-			proxyStr := proxyEntry.String()
-			proxyURL, err := url.Parse(proxyStr)
-			if err != nil {
-				// This is a configuration error, should be visible in normal mode.
-				clientInstance.logger.Warnf("Falha ao parsear URL do proxy rotacionado ('%s'): %v. Tentando sem proxy para esta requisição.", proxyStr, err)
-				return nil, nil // Não usar proxy se o parse falhar
-			}
-			if clientInstance.cfg.VerbosityLevel >= 2 { // -vv
-				clientInstance.logger.Debugf("Usando proxy rotacionado para requisição a %s: %s", req.URL.Host, proxyURL.String())
-			}
-			return proxyURL, nil
-		}
-	} else {
-		if cfg.VerbosityLevel >= 2 { // -vv
-			logger.Debugf("Nenhum proxy configurado para o cliente HTTP.")
-		}
-	}
-
-	httpClient := &http.Client{
-		Transport: transport,
+	c.baseClient = &http.Client{
+		Transport: c.defaultTransport,
 		Timeout:   cfg.RequestTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return http.ErrUseLastResponse
 			}
 			if cfg.VerbosityLevel >= 2 { // -vv
-				logger.Debugf("Redirect detectado de %s para %s", via[len(via)-1].URL, req.URL)
+				c.logger.Debugf("Redirect detectado de %s para %s", via[len(via)-1].URL, req.URL)
 			}
 			return nil
 		},
 	}
 
-	clientInstance.httpClient = httpClient
-	return clientInstance, nil
+	return c, nil
 }
 
-// PerformRequest executes an HTTP request based on ClientRequestData.
-// It returns ClientResponseData containing the response details or any error.
+// getProxyForDomain selects a proxy for a given target domain using round-robin per domain.
+func (c *Client) getProxyForDomain(targetDomain string) *url.URL {
+	c.proxyLock.Lock()
+	defer c.proxyLock.Unlock()
+
+	if len(c.parsedProxies) == 0 {
+		return nil
+	}
+
+	currentIndex, exists := c.domainProxyIndex[targetDomain]
+	if !exists {
+		currentIndex = 0
+	} else {
+		currentIndex = (currentIndex + 1) % len(c.parsedProxies)
+	}
+	c.domainProxyIndex[targetDomain] = currentIndex
+
+	selectedProxyEntry := c.parsedProxies[currentIndex]
+	proxyURL, err := url.Parse(selectedProxyEntry.URL)
+	if err != nil {
+		c.logger.Warnf("Failed to parse stored proxy URL '%s': %v. Skipping proxy.", selectedProxyEntry.URL, err)
+		return nil
+	}
+
+	if c.config.VerbosityLevel >= 1 {
+		c.logger.Debugf("Selected proxy '%s' for target domain '%s' (Index: %d)", proxyURL.String(), targetDomain, currentIndex)
+	}
+	return proxyURL
+}
+
+// PerformRequest executes an HTTP request based on the provided ClientRequestData.
 func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 	var finalRespData ClientResponseData
 
-	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
-		if attempt > 0 {
-			baseDelay := time.Duration(DefaultRetryDelayBaseMs) * time.Millisecond
-			maxDelay := time.Duration(DefaultRetryDelayMaxMs) * time.Millisecond
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		req, errBuildReq := http.NewRequestWithContext(reqData.Ctx, reqData.Method, reqData.URL, strings.NewReader(reqData.Body))
+		if errBuildReq != nil {
+			finalRespData.Error = fmt.Errorf("failed to build request for %s: %w", reqData.URL, errBuildReq)
+			return finalRespData
+		}
 
-			delay := baseDelay * time.Duration(1<<(attempt-1)) // Exponential: 2^(attempt-1)
-			// Add jitter: +/- 20% of calculated delay
-			jitter := time.Duration(rand.Intn(int(delay/5))) - (delay / 10)
-			delay += jitter
+		req.Header.Set("User-Agent", c.userAgent)
 
-			if delay > maxDelay && maxDelay > 0 { // maxDelay > 0 means there's a limit
-				delay = maxDelay
-			}
-			if delay < 0 { // Ensure delay is not negative due to jitter
-				delay = 0
-			}
-
-			if c.cfg.VerbosityLevel >= 1 { // -v or -vv
-				logMsg := fmt.Sprintf("[Client] Request for %s failed (attempt %d/%d). Error: %v. Retrying after %s.", 
-					reqData.URL, attempt, c.cfg.MaxRetries, finalRespData.Error, delay)
-				if c.cfg.VerbosityLevel >= 2 { // -vv for more detail
-					c.logger.Debugf(logMsg) 
-				} else { // -v
-					c.logger.Warnf(logMsg) // Use Warnf for -v to make retries more visible than pure debug
+		// Aplicar headers específicos da requisição (reqData.RequestHeaders)
+		if reqData.RequestHeaders != nil {
+			for key, values := range reqData.RequestHeaders {
+				for _, value := range values {
+					req.Header.Add(key, value) // Use Add para suportar múltiplos valores para o mesmo header
 				}
 			}
-			time.Sleep(delay)
 		}
 
-		var req *http.Request
-		var err error
-
-		// Usar contexto se disponível
-		if reqData.Ctx != nil {
-			req, err = http.NewRequestWithContext(reqData.Ctx, reqData.Method, reqData.URL, strings.NewReader(string(reqData.Body)))
-		} else {
-			// Fallback para o caso de Ctx não ser fornecido (idealmente, deve ser sempre fornecido)
-			c.logger.Warnf("[Client] Performing request for %s without context. Consider passing a context.", reqData.URL)
-			req, err = http.NewRequest(reqData.Method, reqData.URL, strings.NewReader(string(reqData.Body)))
-		}
-		
-		if err != nil {
-			finalRespData.Error = fmt.Errorf("failed to create request for %s: %w", reqData.URL, err)
-			continue 
-		}
-
-		// Set User-Agent and then any custom headers from config
-		req.Header.Set("User-Agent", c.userAgent)
-		
-		// Add any custom headers specified in config
-		for _, headerLine := range c.cfg.CustomHeaders {
-			parts := strings.SplitN(headerLine, ":", 2)
+		// Aplicar headers customizados globais (c.config.CustomHeaders)
+		// Estes são aplicados apenas se não foram definidos pelos headers específicos da requisição.
+		for _, headerStr := range c.config.CustomHeaders {
+			parts := strings.SplitN(headerStr, ":", 2)
 			if len(parts) == 2 {
 				headerName := strings.TrimSpace(parts[0])
 				headerValue := strings.TrimSpace(parts[1])
-				req.Header.Set(headerName, headerValue)
+				if req.Header.Get(headerName) == "" { // Só adiciona se não foi definido por reqData.RequestHeaders
+					req.Header.Set(headerName, headerValue)
+				}
+			}
+		}
+
+		// Determinar o cliente HTTP a ser usado (com ou sem proxy)
+		currentHttpClient := c.baseClient
+		targetHost := req.URL.Hostname() // Obter o host do URL da requisição
+
+		if len(c.parsedProxies) > 0 {
+			selectedProxyURL := c.getProxyForDomain(targetHost)
+			if selectedProxyURL != nil {
+				proxiedTransport := c.defaultTransport.Clone()
+				proxiedTransport.Proxy = http.ProxyURL(selectedProxyURL)
+				currentHttpClient = &http.Client{
+					Transport:     proxiedTransport,
+					Timeout:       c.config.RequestTimeout,
+					CheckRedirect: c.baseClient.CheckRedirect,
+				}
+				if c.config.VerbosityLevel >= 1 {
+					c.logger.Debugf("Using proxy %s for request to %s (target host: %s)", selectedProxyURL.String(), reqData.URL, targetHost)
+				}
 			} else {
-				c.logger.Warnf("[Client] Invalid custom header format (expected 'Name: Value'): %s", headerLine)
-			}
-		}
-		
-		// Finally add any request-specific custom headers (these have highest priority)
-		for key, values := range reqData.CustomHeaders {
-			for _, value := range values {
-				req.Header.Add(key, value)
+				if c.config.VerbosityLevel >= 1 {
+					c.logger.Debugf("No proxy selected by getProxyForDomain for %s (target host: %s), using direct connection.", reqData.URL, targetHost)
+				}
 			}
 		}
 
-		if c.cfg.VerbosityLevel >= 2 { // -vv
+		if c.config.VerbosityLevel >= 2 {
 			c.logger.Debugf("[Client Attempt: %d] Sending %s to %s with headers: %v", attempt+1, reqData.Method, reqData.URL, req.Header)
+			if reqData.Body != "" {
+				c.logger.Debugf("[Client Attempt: %d] Request body: %s", attempt+1, reqData.Body)
+			}
 		}
-		resp, err := c.httpClient.Do(req)
+
+		resp, err := currentHttpClient.Do(req)
 		if err != nil {
-			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.cfg.MaxRetries+1, err)
-			if attempt == c.cfg.MaxRetries {
-				break 
+			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
+			if reqData.Ctx.Err() == context.DeadlineExceeded {
+				c.logger.Warnf("Request to %s timed out (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
+			} else if reqData.Ctx.Err() == context.Canceled {
+				c.logger.Warnf("Request to %s canceled by context (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)
+			} else if strings.Contains(err.Error(), "dial tcp") && strings.Contains(err.Error(), "timeout") {
+				c.logger.Warnf("Request to %s failed with TCP dial timeout (attempt %d/%d): %v", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
 			}
-			continue 
-		}
-
-		defer resp.Body.Close()
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			finalRespData.Error = fmt.Errorf("failed to read response body from %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.cfg.MaxRetries+1, readErr)
-			finalRespData.Response = resp 
-			finalRespData.RespHeaders = resp.Header
-			if attempt == c.cfg.MaxRetries {
-				break 
+			if attempt == c.config.MaxRetries {
+				return finalRespData
 			}
-			continue 
-		}
-
-		if c.cfg.VerbosityLevel >= 2 { // -vv
-			c.logger.Debugf("[Client] Response received from %s (attempt %d/%d): Status %s, Body Size: %d", reqData.URL, attempt+1, c.cfg.MaxRetries+1, resp.Status, len(body))
-		}
-
-		if resp.StatusCode >= 500 && resp.StatusCode <= 599 { // Retry on 5xx errors
-			finalRespData.Error = fmt.Errorf("server returned status %s for %s (attempt %d/%d)", resp.Status, reqData.URL, attempt+1, c.cfg.MaxRetries+1)
-			finalRespData.Response = resp
-			finalRespData.Body = body
-			finalRespData.RespHeaders = resp.Header
-			if attempt == c.cfg.MaxRetries {
-				break
-			}
+			time.Sleep(time.Duration(c.config.ConductorInitialRetryDelaySeconds) * time.Second)
 			continue
 		}
 
-		// Request and body reading successful, and status code is not a retryable one (e.g. 5xx)
-		finalRespData.Response = resp
-		finalRespData.Body = body
-		finalRespData.RespHeaders = resp.Header
-		finalRespData.Error = nil // Clear any previous attempt error
-		return finalRespData // Success, return immediately
-	}
+		bodyBytes, errReadBody := io.ReadAll(resp.Body)
+		resp.Body.Close() // Fechar o corpo aqui, independentemente do erro de leitura
+		if errReadBody != nil {
+			finalRespData.Error = fmt.Errorf("failed to read response body for %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.config.MaxRetries+1, errReadBody)
+			if attempt == c.config.MaxRetries {
+				return finalRespData
+			}
+			time.Sleep(time.Duration(c.config.ConductorInitialRetryDelaySeconds) * time.Second)
+			continue
+		}
 
-	// If all retries failed, finalRespData.Error will contain the last error encountered.
-	// Log the final failure only if verbosity allows (error is returned anyway for scheduler to handle)
-	if finalRespData.Error != nil && c.cfg.VerbosityLevel >= 1 { // -v or -vv
-		c.logger.Errorf("[Client] All %d attempts failed for %s. Last error: %v", c.cfg.MaxRetries+1, reqData.URL, finalRespData.Error)
+		finalRespData.Response = resp
+		finalRespData.Body = bodyBytes
+		finalRespData.RespHeaders = resp.Header
+		finalRespData.Error = nil
+
+		if c.config.VerbosityLevel >= 2 {
+			c.logger.Debugf("Request to %s (attempt %d) successful. Status: %s. Body size: %d", reqData.URL, attempt+1, resp.Status, len(finalRespData.Body))
+			if len(finalRespData.Body) > 0 { // Logar corpos pequenos para depuração, apenas se não estiver vazio
+				logLength := len(finalRespData.Body)
+				if logLength > 500 {
+					logLength = 500
+				}
+				c.logger.Debugf("Response body (first %d bytes): %s", logLength, string(finalRespData.Body[:logLength]))
+			}
+		}
+		return finalRespData
 	}
 	return finalRespData
 }
+

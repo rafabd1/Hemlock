@@ -54,3 +54,5 @@ dev/
 .cursor
 
 output.*
+
+proxies.txt
