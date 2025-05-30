@@ -214,8 +214,14 @@ func PreprocessAndGroupURLs(rawURLs []string, logger Logger) (map[string][]map[s
 				}
 			}
 			if isIgnored {
-				logger.Debugf("URL '%s' skipped due to ignored extension '%s'", rawURL, currentExtension)
-				continue
+				// Only skip if it has an ignored extension AND no query parameters.
+				if parsedForExtCheck.RawQuery == "" {
+					logger.Debugf("URL '%s' skipped: ignored extension '%s' and no query parameters.", rawURL, currentExtension)
+					continue
+				} else {
+					logger.Debugf("URL '%s' NOT skipped despite ignored extension '%s' because it has query parameters: '%s'", rawURL, currentExtension, parsedForExtCheck.RawQuery)
+					// If it has query parameters, do not skip based on extension.
+				}
 			}
 		}
 
