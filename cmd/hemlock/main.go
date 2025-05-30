@@ -94,6 +94,9 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.EnableParamFuzzing = vp.GetBool("enable-param-fuzzing")
 		cfg.ParamWordlistFile = vp.GetString("param-wordlist")
 
+		// Carregar nova configuração para retries de 429 em nível de domínio
+		cfg.MaxDomain429Retries = vp.GetInt("max-domain-429-retries")
+
 		// Lógica de verbosidade revisada
 		verbosityCount, _ := cmd.Flags().GetCount("verbose") // Usar GetCount diretamente do cmd.Flags()
 
@@ -473,6 +476,9 @@ func init() {
 	rootCmd.PersistentFlags().Int("initial-standby-duration", defaults.InitialStandbyDurationSeconds, "Initial standby duration in seconds after a 429 response")
 	rootCmd.PersistentFlags().Int("max-standby-duration", defaults.MaxStandbyDurationSeconds, "Maximum standby duration in seconds for repeated 429s")
 	rootCmd.PersistentFlags().Int("standby-duration-increment", defaults.StandbyDurationIncrementSeconds, "Increment to standby duration in seconds on subsequent 429s")
+
+	// Nova flag para retries de 429 em nível de domínio
+	rootCmd.PersistentFlags().Int("max-domain-429-retries", defaults.MaxDomain429Retries, "Maximum 429 retries for a domain before discarding all its URLs")
 
 	if err := viper.ReadInConfig(); err == nil {
 		// ... existing code ...

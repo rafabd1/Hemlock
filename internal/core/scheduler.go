@@ -569,6 +569,14 @@ func (s *Scheduler) jobFeederLoop() {
 				// Processar o que resta no heap antes de sair
 				for waitingJobsHeap.Len() > 0 {
 					item := heap.Pop(waitingJobsHeap).(*HeapItem)
+
+					// VERIFICAR SE O DOMÍNIO FOI DESCARTADO (NOVO - para jobs do heap no final)
+					if s.domainManager.IsDomainDiscarded(item.Job.BaseDomain) {
+						s.logger.Warnf("[JobFeeder] Job %s for DISCARDED domain %s (from heap drain). Discarding job and compensating progress.", item.Job.URLString, item.Job.BaseDomain)
+						s.handleDiscardedDomainJob(item.Job)
+						continue // Pular para o próximo item do heap
+					}
+
 					if time.Now().Before(item.NextAttemptAt) {
 						// Se o job ainda não está pronto, esperar por ele.
 						// Ou, alternativamente, descartar se o contexto estiver feito.
@@ -589,8 +597,16 @@ func (s *Scheduler) jobFeederLoop() {
 				s.logger.Debugf("[JobFeeder] Received job %s (for %s, next attempt at %s) from pendingJobsQueue. Adding to heap.",
 					job.URLString, job.BaseDomain, job.NextAttemptAt.Format(time.RFC3339))
 			}
-			heap.Push(waitingJobsHeap, &HeapItem{Job: job, NextAttemptAt: job.NextAttemptAt})
-			scheduleNextWakeup()
+
+			// VERIFICAR SE O DOMÍNIO FOI DESCARTADO (NOVO - para jobs da pendingJobsQueue)
+			if s.domainManager.IsDomainDiscarded(job.BaseDomain) {
+				s.logger.Warnf("[JobFeeder] Job %s for DISCARDED domain %s (from pendingJobsQueue). Discarding job and compensating progress.", job.URLString, job.BaseDomain)
+				s.handleDiscardedDomainJob(job)
+				// Não adiciona ao heap, apenas continua para o próximo select
+			} else {
+				heap.Push(waitingJobsHeap, &HeapItem{Job: job, NextAttemptAt: job.NextAttemptAt})
+				scheduleNextWakeup()
+			}
 
 		case <-timerChan:
 			if s.config.VerbosityLevel >= 2 {
@@ -598,6 +614,14 @@ func (s *Scheduler) jobFeederLoop() {
 			}
 			for waitingJobsHeap.Len() > 0 && !(*waitingJobsHeap)[0].NextAttemptAt.After(time.Now()) {
 				item := heap.Pop(waitingJobsHeap).(*HeapItem)
+
+				// VERIFICAR SE O DOMÍNIO FOI DESCARTADO (NOVO - para jobs do heap via timer)
+				if s.domainManager.IsDomainDiscarded(item.Job.BaseDomain) {
+					s.logger.Warnf("[JobFeeder] Job %s for DISCARDED domain %s (from heap timer). Discarding job and compensating progress.", item.Job.URLString, item.Job.BaseDomain)
+					s.handleDiscardedDomainJob(item.Job)
+					continue // Pular para o próximo item do heap que está pronto
+				}
+
 				s.trySendToWorkerOrRequeue(item.Job, waitingJobsHeap)
 			}
 			scheduleNextWakeup()
@@ -631,6 +655,15 @@ func (s *Scheduler) jobFeederLoop() {
 // Tenta obter permissão do DomainManager e enviar para workerJobQueue.
 // Se não for possível, recoloca no heap com um novo NextAttemptAt.
 func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQueue) {
+	// Adicionada verificação de descarte de domínio aqui também, como uma dupla checagem
+	// ou caso a lógica de chamada mude. Se o job chegou aqui, ele já deveria ter passado
+	// pela verificação no loop principal do jobFeederLoop.
+	if s.domainManager.IsDomainDiscarded(job.BaseDomain) {
+		s.logger.Warnf("[JobFeeder/trySend] Job %s for DISCARDED domain %s. Discarding instead of sending/re-queuing.", job.URLString, job.BaseDomain)
+		s.handleDiscardedDomainJob(job) // Lida com a compensação de progresso e decremento
+		return
+	}
+
 	can, waitTimeDM := s.domainManager.CanRequest(job.BaseDomain)
 	now := time.Now()
 
@@ -665,6 +698,15 @@ func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQu
 		// A abordagem atual de bloqueio no send para workerJobQueue é aceitável se o s.ctx.Done() o interromper.
 		}
 		} else {
+		// Se CanRequest retornar false, pode ser devido a standby normal OU porque o domínio foi descartado
+		// (já que CanRequest agora checa bucket.discarded).
+		// Se o domínio foi descartado, IsDomainDiscarded retornará true, e o waitTimeDM será enorme.
+		if s.domainManager.IsDomainDiscarded(job.BaseDomain) {
+			s.logger.Warnf("[JobFeeder/trySend] Domain %s for job %s is DISCARDED. Discarding job instead of re-queuing for long wait.", job.BaseDomain, job.URLString)
+			s.handleDiscardedDomainJob(job)
+			return
+		}
+
 		job.NextAttemptAt = now.Add(waitTimeDM)
 		if s.config.VerbosityLevel >= 1 {
 			s.logger.Infof("[JobFeeder] DomainManager denied job %s for %s. Re-queuing to heap for %s (NextAttemptAt: %s).",
@@ -1773,6 +1815,30 @@ func (s *Scheduler) decrementActiveJobs() {
 	}
 
 	// NÃO FECHAR s.doneChan AQUI. A GOROUTINE DE MONITORAMENTO CUIDARÁ DISSO.
+}
+
+// handleDiscardedDomainJob lida com o descarte de um job devido ao seu domínio ter sido descartado.
+func (s *Scheduler) handleDiscardedDomainJob(job TargetURLJob) {
+	s.decrementActiveJobs() // Sempre decrementa o contador geral de jobs ativos.
+
+	if job.JobType == JobTypeCacheabilityCheck { // Job da Fase 1
+		s.phase1CompletionWg.Done() // Sinaliza que este job da Fase 1 está concluído.
+		// Atualiza a barra de progresso da Fase 1
+		if s.progressBar != nil && s.progressBar.GetPrefixForDebug() == "Phase 1/2 (Cache Checks): " {
+			s.completedJobsInPhaseForBar++
+			s.progressBar.Update(s.completedJobsInPhaseForBar)
+		}
+	} else if job.JobType == JobTypeFullProbe { // Job da Fase 2
+		estimatedProbes := calculateEstimatedProbesForJob(job, s.config, s.logger)
+		if estimatedProbes > 0 {
+			s.logger.Debugf("[Scheduler] Compensating %d estimated probes for job %s of discarded domain %s.",
+				estimatedProbes, job.URLString, job.BaseDomain)
+			s.completedProbesInPhase.Add(uint64(estimatedProbes))
+			if s.progressBar != nil && s.progressBar.GetPrefixForDebug() == "Phase 2 - Probing: " { // Garante que é a barra da Fase 2
+				s.progressBar.Update(int(s.completedProbesInPhase.Load()))
+			}
+		}
+	}
 }
 
 // Helper function to add a query parameter to a URL string without mutating original parts

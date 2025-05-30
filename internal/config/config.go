@@ -69,6 +69,9 @@ type Config struct {
 	EnableParamFuzzing  bool     `mapstructure:"enable-param-fuzzing"`
 	ParamWordlistFile   string   `mapstructure:"param-wordlist-file"` // Path to a file containing parameters for fuzzing
 	ParamsToFuzz        []string // Loaded parameters from ParamWordlistFile
+
+	// New field for domain-level 429 retries
+	MaxDomain429Retries int `mapstructure:"max-domain-429-retries"`
 }
 
 // ProxyEntry holds the parsed information for a single proxy.
@@ -174,6 +177,9 @@ func GetDefaultConfig() *Config {
 		EnableParamFuzzing:  false, // Parameter fuzzing disabled by default
 		ParamWordlistFile:   "",    // No custom param wordlist by default
 		ParamsToFuzz:        []string{},
+
+		// Default for domain-level 429 retries
+		MaxDomain429Retries: 4, // Default maximum 429 retries for a domain before discarding it
 	}
 }
 
@@ -357,6 +363,10 @@ func (c *Config) Validate() error {
 	// as c.ParamsToFuzz might be empty here if the load hasn't happened or failed.
 	// However, we can check if ParamWordlistFile implies ParamsToFuzz should exist.
 	// For now, we'll rely on main.go to error out if EnableParamFuzzing is true and no params are loaded.
+
+	if c.MaxDomain429Retries < 0 {
+		return fmt.Errorf("maxDomain429Retries cannot be negative")
+	}
 
 	return nil
 }

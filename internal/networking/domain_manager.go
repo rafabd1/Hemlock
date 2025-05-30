@@ -45,6 +45,10 @@ type DomainBucket struct {
 	maxRPSAuto               float64 // dm.config.DefaultMaxInternalRPS (teto para modo auto)
 	consecutiveSuccesses       int     // Contador de sucessos para aumentar RPS
 	consecutiveNonCriticalErrors int     // Contador de erros de servidor/rede graves para diminuir RPS
+
+	// Campos para descarte de domínio devido a 429s repetidos
+	current429Retries int  // Contador de 429s consecutivos para este domínio
+	discarded           bool // True se o domínio foi descartado
 }
 
 // refill atualiza os tokens no bucket com base no tempo passado desde a última recarga.
@@ -95,20 +99,12 @@ func (dm *DomainManager) getOrCreateDomainBucket(domain string) *DomainBucket {
 
 			if currentRate <= 0 { // Fallback se InitialTargetRPS for inválido
 				currentRate = 1.0
-				dm.logger.Warnf("[DomainManager] AutoMode: InitialTargetRPS for '%s' was invalid, using fallback 1.0 req/s", domain)
-			}
-			if dm.config.VerbosityLevel >= 1 {
-				dm.logger.Infof("[DomainManager] Domain '%s' entering AUTO rate limit mode. Initial: %.2f, Min: %.2f, MaxAuto: %.2f req/s",
-					domain, currentRate, minRate, maxAutoRate)
 			}
 		} else { // Modo Manual (targetRate > 0)
 			isAuto = false
 			currentRate = targetRate // No modo manual, currentRPS é o targetRate fixo.
 			minRate = targetRate     // Não há ajuste dinâmico, então min/max são o próprio targetRate.
 			maxAutoRate = targetRate
-			if dm.config.VerbosityLevel >= 1 {
-				dm.logger.Infof("[DomainManager] Domain '%s' entering MANUAL rate limit mode: %.2f req/s", domain, currentRate)
-			}
 		}
 
 		bucket = &DomainBucket{
@@ -126,6 +122,8 @@ func (dm *DomainManager) getOrCreateDomainBucket(domain string) *DomainBucket {
 			maxRPSAuto:               maxAutoRate,
 			consecutiveSuccesses:       0,
 			consecutiveNonCriticalErrors: 0,
+			current429Retries:          0, // Inicializa contador de retries 429
+			discarded:                  false, // Domínio não descartado inicialmente
 		}
 		dm.domainStatus[domain] = bucket
 		if dm.config.VerbosityLevel >= 2 { // -vv
@@ -161,6 +159,14 @@ func (dm *DomainManager) CanRequest(domain string) (bool, time.Duration) {
 				domain, waitTime, bucket.standbyUntil.Format(time.RFC3339))
 		}
 		return false, waitTime
+	}
+
+	// 1.5 Verificar se o domínio foi descartado (NOVO)
+	if bucket.discarded {
+		if dm.config.VerbosityLevel >= 1 {
+			dm.logger.Warnf("[DomainManager] Domain '%s' is DISCARDED due to repeated 429 errors. No requests allowed.", domain)
+		}
+		return false, time.Hour * 24 // Retorna um tempo de espera muito longo para domínios descartados
 	}
 
 	// 2. Reabastecer tokens
@@ -221,9 +227,19 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		previousTokens := bucket.tokens
 		bucket.tokens = 0 // Zera os tokens para forçar espera pela recarga após o standby.
 
+		bucket.current429Retries++ // Incrementa o contador de retries 429 para o domínio
+
 		if dm.config.VerbosityLevel >= 1 {
-			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Tokens zeroed (was %.2f). Applying standby for %s until %s.",
-				domain, previousTokens, appliedStandbyDuration, bucket.standbyUntil.Format(time.RFC3339))
+			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Tokens zeroed (was %.2f). Applying standby for %s until %s. Domain 429 retries: %d/%d.",
+				domain, previousTokens, appliedStandbyDuration, bucket.standbyUntil.Format(time.RFC3339), bucket.current429Retries, dm.config.MaxDomain429Retries)
+		}
+
+		// Verifica se o limite de retries 429 do domínio foi atingido
+		if bucket.current429Retries >= dm.config.MaxDomain429Retries {
+			bucket.discarded = true
+			dm.logger.Errorf("[DomainManager] Domain '%s' DISCARDED permanently after %d (>=%d) repeated 429 errors.",
+				domain, bucket.current429Retries, dm.config.MaxDomain429Retries)
+			// O domínio agora está marcado como descartado. CanRequest irá bloqueá-lo.
 		}
 
 		// Aumentar a duração do próximo standby
@@ -235,17 +251,22 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 
 		// No modo automático, resetar RPS para o mínimo após um 429.
 		if bucket.isAutoMode {
-			if bucket.currentRPS != bucket.minRPS { // Só logar se houver mudança
-				dm.logger.Infof("[DomainManager] AUTO MODE: Domain '%s' (Status 429) - Resetting RPS from %.2f to MinRPS %.2f.",
-					domain, bucket.currentRPS, bucket.minRPS)
-				bucket.currentRPS = bucket.minRPS
-				bucket.refillRate = bucket.currentRPS
-				bucket.maxTokens = bucket.currentRPS // O balde deve ser capaz de conter tokens para a nova taxa
-			}
+			bucket.currentRPS = bucket.minRPS
+			bucket.refillRate = bucket.currentRPS
+			bucket.maxTokens = bucket.currentRPS // O balde deve ser capaz de conter tokens para a nova taxa
 		}
 		bucket.consecutiveSuccesses = 0       // Resetar contadores
 		bucket.consecutiveNonCriticalErrors = 0
 		return // Tratamento de 429 concluído
+	}
+
+	// Se chegou aqui, não foi um 429. Resetar o contador de retries 429 do domínio.
+	if bucket.current429Retries > 0 { // Só logar se havia retries para resetar
+		if dm.config.VerbosityLevel >= 1 {
+			dm.logger.Infof("[DomainManager] Domain '%s' successful request (status %d, err: %v). Resetting domain 429 retries from %d to 0.",
+				domain, statusCode, err, bucket.current429Retries)
+		}
+		bucket.current429Retries = 0
 	}
 
 	// --- Lógica de Ajuste Dinâmico de RPS (Apenas para Modo Automático) ---
@@ -263,8 +284,6 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		if isClientSideOrNetworkError {
 			// Erro do lado do cliente/rede: Logar, mas NÃO ajustar RPS nem contadores de RPS.
 			if dm.config.VerbosityLevel >= 1 {
-				dm.logger.Warnf("[DomainManager] AUTO MODE: Client-side/network error for domain '%s' (Status Code from client: %d, Err: %v). RPS %.2f NOT changed by this error.",
-					domain, statusCode, err, bucket.currentRPS)
 			}
 			// Não resetamos consecutiveSuccesses, pois o servidor pode estar ok.
 			// Não incrementamos consecutiveNonCriticalErrors, pois não é um erro de servidor 5xx.
@@ -272,26 +291,18 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 			// err != nil, MAS NÃO é um erro de cliente/rede conhecido (acima).
 			// Tratar como um problema que justifica a redução de RPS (ex: connection reset by peer, etc.)
 			// pois pode indicar que o servidor está sobrecarregado ou rejeitando na taxa atual.
-			dm.logger.Warnf("[DomainManager] AUTO MODE: Unclassified network error for domain '%s' (Status: %d, Err: %v). Treating as issue for RPS adjustment. CurrentRPS: %.2f",
-				domain, statusCode, err, bucket.currentRPS)
 			bucket.consecutiveSuccesses = 0 // Erro de rede quebra a sequência de sucessos.
 			bucket.consecutiveNonCriticalErrors++
 
 			if bucket.consecutiveNonCriticalErrors >= DefaultTransientErrorThreshold {
 				if bucket.currentRPS > bucket.minRPS {
-					oldRPS := bucket.currentRPS
 					newRPS := bucket.currentRPS * DefaultRPSReductionFactorOnError
 					bucket.currentRPS = math.Max(newRPS, bucket.minRPS)
 					bucket.refillRate = bucket.currentRPS
 					bucket.maxTokens = bucket.currentRPS
-					dm.logger.Warnf("[DomainManager] AUTO MODE: Domain '%s' RPS reduced from %.2f to %.2f (Min: %.2f) after %d unclassified network/server errors.",
-						domain, oldRPS, bucket.currentRPS, bucket.minRPS, bucket.consecutiveNonCriticalErrors)
 					bucket.consecutiveNonCriticalErrors = 0 // Resetar após redução
 				} else {
 					bucket.consecutiveNonCriticalErrors = 0 // Já no mínimo, resetar.
-					if dm.config.VerbosityLevel >= 2 { 
-						dm.logger.Debugf("[DomainManager] AUTO MODE: Domain '%s' already at MinRPS (%.2f) despite unclassified network/server errors. Error counter reset.", domain, bucket.minRPS)
-					}
 				}
 			}
 		} else { // err == nil. A decisão é baseada apenas no statusCode.
@@ -299,49 +310,31 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 			if !isServerError { // Sucesso Genuíno (err é nil, statusCode não é 5xx)
 				bucket.consecutiveNonCriticalErrors = 0 // Resetar contador de erros de SERVIDOR em sucesso
 				bucket.consecutiveSuccesses++
-				if dm.config.VerbosityLevel >= 2 { // -vv para log de contagem de sucesso
-					dm.logger.Debugf("[DomainManager] AUTO MODE: Success for domain '%s'. Consecutive successes: %d/%d. CurrentRPS: %.2f",
-						domain, bucket.consecutiveSuccesses, config.DefaultSuccessThreshold, bucket.currentRPS)
-				}
 
 				if bucket.consecutiveSuccesses >= config.DefaultSuccessThreshold {
 					if bucket.currentRPS < bucket.maxRPSAuto {
-						oldRPS := bucket.currentRPS
 						newRPS := bucket.currentRPS + config.DefaultRPSIncrement
 						bucket.currentRPS = math.Min(newRPS, bucket.maxRPSAuto)
 						bucket.refillRate = bucket.currentRPS
 						bucket.maxTokens = bucket.currentRPS
-						dm.logger.Infof("[DomainManager] AUTO MODE: Domain '%s' RPS increased from %.2f to %.2f (Max: %.2f) after %d successes.",
-							domain, oldRPS, bucket.currentRPS, bucket.maxRPSAuto, bucket.consecutiveSuccesses)
 						bucket.consecutiveSuccesses = 0 // Resetar após aumento
 					} else {
 						bucket.consecutiveSuccesses = 0 // Já no máximo, resetar para evitar overflow
-						if dm.config.VerbosityLevel >= 2 { // -vv para log de "já no máximo"
-							dm.logger.Debugf("[DomainManager] AUTO MODE: Domain '%s' already at MaxAutoRPS (%.2f). Success counter reset.", domain, bucket.maxRPSAuto)
-						}
 					}
 				}
 			} else { // Erro de Servidor (5xx), e err era nil (pode acontecer se o client HTTP não retornar um err para 5xx)
 				bucket.consecutiveSuccesses = 0 // Erro de servidor quebra a sequência de sucessos.
 				bucket.consecutiveNonCriticalErrors++
-				dm.logger.Warnf("[DomainManager] AUTO MODE: Server error (5xx) for domain '%s' (Status: %d, Err: nil). Consecutive server errors: %d/%d. CurrentRPS: %.2f",
-					domain, statusCode, bucket.consecutiveNonCriticalErrors, DefaultTransientErrorThreshold, bucket.currentRPS)
 
 				if bucket.consecutiveNonCriticalErrors >= DefaultTransientErrorThreshold {
 					if bucket.currentRPS > bucket.minRPS {
-						oldRPS := bucket.currentRPS
 						newRPS := bucket.currentRPS * DefaultRPSReductionFactorOnError
 						bucket.currentRPS = math.Max(newRPS, bucket.minRPS)
 						bucket.refillRate = bucket.currentRPS
 						bucket.maxTokens = bucket.currentRPS
-						dm.logger.Warnf("[DomainManager] AUTO MODE: Domain '%s' RPS reduced from %.2f to %.2f (Min: %.2f) after %d server errors.",
-							domain, oldRPS, bucket.currentRPS, bucket.minRPS, bucket.consecutiveNonCriticalErrors)
 						bucket.consecutiveNonCriticalErrors = 0 // Resetar após redução
 					} else {
 						bucket.consecutiveNonCriticalErrors = 0 // Já no mínimo, resetar.
-						if dm.config.VerbosityLevel >= 2 { // -vv para log de "já no mínimo" com erros de servidor
-							dm.logger.Debugf("[DomainManager] AUTO MODE: Domain '%s' already at MinRPS (%.2f) despite repeated server errors. Error counter reset.", domain, bucket.minRPS)
-						}
 					}
 				}
 			}
@@ -371,11 +364,19 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 // func (dm *DomainManager) BlockDomain(domain string) { ... }
 
 // IsStandby checks if the domain is currently in a forced standby period.
+// Esta função agora também implicitamente cobre domínios descartados se CanRequest for usado primeiro.
 func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
-	bucket := dm.getOrCreateDomainBucket(domain) 
-	
+	bucket := dm.getOrCreateDomainBucket(domain)
+
+	if bucket.discarded { // Checagem explícita de descarte aqui também para clareza
+		if dm.config.VerbosityLevel >= 1 {
+			dm.logger.Warnf("[DomainManager] IsStandby: Domain '%s' is DISCARDED.", domain)
+		}
+		return true, time.Now().Add(time.Hour * 24 * 365) // Retorna um standby "eterno"
+	}
+
 	if bucket.standbyUntil.IsZero() || time.Now().After(bucket.standbyUntil) {
 		if dm.config.VerbosityLevel >= 2 {
 			dm.logger.Debugf("[DomainManager] IsStandby: Domain '%s' is NOT in standby.", domain)
@@ -386,6 +387,17 @@ func (dm *DomainManager) IsStandby(domain string) (bool, time.Time) {
 		dm.logger.Infof("[DomainManager] IsStandby: Domain '%s' IS in standby until %s.", domain, bucket.standbyUntil.Format(time.RFC3339))
 	}
 	return true, bucket.standbyUntil
+}
+
+// IsDomainDiscarded verifica se um domínio foi marcado como descartado.
+func (dm *DomainManager) IsDomainDiscarded(domain string) bool {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	bucket, exists := dm.domainStatus[domain]
+	if !exists {
+		return false // Domínio não conhecido não está descartado
+	}
+	return bucket.discarded
 }
 
 // GetDomainStatus (optional) could provide insights into a domain's current state for reporting or debugging.
