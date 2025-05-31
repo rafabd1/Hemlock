@@ -81,13 +81,7 @@ func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
 		Transport: c.defaultTransport,
 		Timeout:   cfg.RequestTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			if cfg.VerbosityLevel >= 2 { // -vv
-				c.logger.Debugf("Redirect detectado de %s para %s", via[len(via)-1].URL, req.URL)
-			}
-			return nil
+			return http.ErrUseLastResponse // Always return the last response (e.g. the 302 itself)
 		},
 	}
 
