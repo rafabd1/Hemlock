@@ -287,3 +287,47 @@ func (l *NoOpLogger) Warnf(format string, args ...interface{})  {}
 func (l *NoOpLogger) Errorf(format string, args ...interface{}) {}
 func (l *NoOpLogger) Fatalf(format string, args ...interface{}) {}
 func (l *NoOpLogger) Successf(format string, args ...interface{}) {} 
+
+// Contains checks if a string is present in a slice of strings.
+func Contains(slice []string, str string) bool {
+	for _, item := range slice {
+		if item == str {
+			return true
+		}
+	}
+	return false
+}
+
+// AddCacheBuster adds a cache-busting query parameter to a URL string.
+func AddCacheBuster(rawURL string, busterValue string) (string, error) {
+	if busterValue == "" {
+		// If no buster value is provided, return the original URL.
+		return rawURL, nil
+	}
+	
+	// Handle cases where the URL might have a non-standard ending like a backslash
+	// before parsing, to avoid parsing errors.
+	endsWithBackslash := strings.HasSuffix(rawURL, `\`)
+	tempURL := rawURL
+	if endsWithBackslash {
+		tempURL = strings.TrimSuffix(rawURL, `\`)
+	}
+
+	u, err := url.Parse(tempURL)
+	if err != nil {
+		return "", err
+	}
+	
+	q := u.Query()
+	q.Set("cacheBuster", busterValue) // Use Set to ensure only one cacheBuster
+	u.RawQuery = q.Encode()
+	
+	finalURL := u.String()
+	
+	// Re-append the backslash if it was originally there
+	if endsWithBackslash {
+		finalURL += `\`
+	}
+	
+	return finalURL, nil
+} 

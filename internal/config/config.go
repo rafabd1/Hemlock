@@ -64,11 +64,10 @@ type Config struct {
 	// New field for probe concurrency within a single URL job
 	ProbeConcurrency int `mapstructure:"probe-concurrency"`
 
-	// New fields for controlling test types and parameter fuzzing
-	DisableHeaderTests  bool     `mapstructure:"disable-header-tests"`
-	EnableParamFuzzing  bool     `mapstructure:"enable-param-fuzzing"`
-	ParamWordlistFile   string   `mapstructure:"param-wordlist-file"` // Path to a file containing parameters for fuzzing
-	ParamsToFuzz        []string // Loaded parameters from ParamWordlistFile
+	// New fields for controlling test types
+	TestModes         []string `mapstructure:"test-modes"`
+	ParamWordlistFile string   `mapstructure:"param-wordlist-file"` // Path to a file containing parameters for fuzzing
+	ParamsToFuzz      []string // Loaded parameters from ParamWordlistFile
 
 	// New field for domain-level 429 retries
 	MaxDomain429Retries int `mapstructure:"max-domain-429-retries"`
@@ -173,10 +172,9 @@ func GetDefaultConfig() *Config {
 		ProbeConcurrency: 4, // Default number of concurrent probes per URL
 
 		// Defaults for new test type and param fuzzing fields
-		DisableHeaderTests:  false, // Headers tests enabled by default (DisableHeaderTests is false)
-		EnableParamFuzzing:  false, // Parameter fuzzing disabled by default
-		ParamWordlistFile:   "",    // No custom param wordlist by default
-		ParamsToFuzz:        []string{},
+		TestModes:         []string{"header"}, // Headers tests enabled by default
+		ParamWordlistFile: "",                 // No custom param wordlist by default
+		ParamsToFuzz:      []string{},
 
 		// Default for domain-level 429 retries
 		MaxDomain429Retries: 4, // Default maximum 429 retries for a domain before discarding it
@@ -341,28 +339,15 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate that at least one test type is enabled
-	if c.DisableHeaderTests && !c.EnableParamFuzzing {
-		return fmt.Errorf("no test types enabled: please enable parameter fuzzing (--enable-param-fuzzing=true) or ensure header tests are not disabled (--disable-header-tests=false)")
+	if len(c.TestModes) == 0 {
+		return fmt.Errorf("no test modes enabled: use --test-modes to specify at least one mode (e.g., 'header', 'param', 'deception')")
 	}
 	
-	// If header tests are not disabled, ensure HeadersToTest is not empty.
-	// This check is primarily handled in main.go after attempting to load the headers file,
-	// as c.HeadersToTest might be empty here if the load hasn't happened or failed.
-	// However, adding a check here for completeness if it was somehow populated and then disabled.
-	if !c.DisableHeaderTests && len(c.HeadersToTest) == 0 {
-		// This scenario should ideally be caught by main.go, which ensures HeadersToTest is populated
-		// if DisableHeaderTests is false. If it reaches here, it implies a logic flaw elsewhere
-		// or direct manipulation of the Config struct post-initialization.
-		// For robustness, we can keep a check, though its practical trigger should be rare.
-		// return fmt.Errorf("header tests are enabled (DisableHeaderTests is false), but no headers were loaded. This is an unexpected state.")
-		// Deferring this specific validation to main.go as it's more about load state vs config state.
-	}
-
-	// If param fuzzing is enabled, ensure ParamsToFuzz is not empty (implicitly, a wordlist must have been loaded)
-	// This check is better done in main.go after attempting to load the wordlist,
-	// as c.ParamsToFuzz might be empty here if the load hasn't happened or failed.
-	// However, we can check if ParamWordlistFile implies ParamsToFuzz should exist.
-	// For now, we'll rely on main.go to error out if EnableParamFuzzing is true and no params are loaded.
+	// If header tests are enabled, ensure HeadersToTest is not empty.
+	// This validation is deferred to main.go where the file is actually loaded.
+	
+	// If param fuzzing is enabled, ensure a wordlist is loaded.
+	// This validation is deferred to main.go.
 
 	if c.MaxDomain429Retries < 0 {
 		return fmt.Errorf("maxDomain429Retries cannot be negative")
