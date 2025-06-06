@@ -186,6 +186,22 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 
 		resp, err := currentHttpClient.Do(req)
 		if err != nil {
+			// Check if the error indicates a rate-limiting issue from a proxy/CDN that doesn't return a proper 429 response.
+			if strings.Contains(strings.ToLower(err.Error()), "too many requests") {
+				if c.config.VerbosityLevel >= 2 { // Only log this for -vv
+					c.logger.Debugf("Request to %s failed but error indicates rate limiting ('Too Many Requests'). Treating as a 429 response.", reqData.URL)
+				}
+				// Create a mock 429 response to propagate the rate-limiting signal
+				finalRespData.Response = &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Status:     "429 Too Many Requests (Inferred from error)",
+					Header:     make(http.Header),
+					Request:    req,
+				}
+				finalRespData.Error = nil // Clear the original error as we are now handling it as a 429 response
+				return finalRespData
+			}
+
 			finalRespData.Error = fmt.Errorf("failed to execute request for %s (attempt %d/%d): %w", reqData.URL, attempt+1, c.config.MaxRetries+1, err)
 			if reqData.Ctx.Err() == context.DeadlineExceeded {
 				c.logger.Debugf("Request to %s timed out (attempt %d/%d)", reqData.URL, attempt+1, c.config.MaxRetries+1)

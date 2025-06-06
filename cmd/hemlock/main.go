@@ -360,7 +360,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		// We only need uniqueBaseURLs here for logging purposes.
 		// The scheduler will perform its own full preprocessing.
 		// Capturamos totalParamsFound e numURLsWithParams para o log.
-		_, uniqueBaseURLs, totalParamsFound, numURLsWithParams := utils.PreprocessAndGroupURLs(cfg.Targets, logger)
+		_, uniqueBaseURLs, totalParamsFound, numURLsWithParams := utils.PreprocessAndGroupURLs(cfg.Targets, &cfg, logger)
 		// No error is returned by PreprocessAndGroupURLs; it logs errors internally.
 
 		// Calculate numUniqueDomains from uniqueBaseURLs

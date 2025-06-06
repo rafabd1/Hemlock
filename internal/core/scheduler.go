@@ -183,7 +183,7 @@ func (s *Scheduler) performRequestWithDomainManagement(domain string, reqData ne
 // StartScan begins the scanning process based on the scheduler's configuration.
 func (s *Scheduler) StartScan() []*report.Finding {
 	s.logger.Debugf("Scheduler: Initializing scan...")
-	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.logger)
+	groupedBaseURLsAndParams, uniqueBaseURLs, _, _ := utils.PreprocessAndGroupURLs(s.config.Targets, s.config, s.logger)
 
 	// Defer para limpeza finalíssima da última instância da barra e contexto do scheduler
 	defer func() {
@@ -1574,19 +1574,24 @@ func (s *Scheduler) processURLJob(workerID int, job TargetURLJob) {
 	}
 
 	if finalJobStatusError != nil || jobWasExplicitlyAbortedByFailures { // Job did not complete successfully
-		if job.JobType == JobTypeFullProbe { // Only compensate for Phase 2 FullProbe jobs
-			probesDoneCount := probesActuallyCompletedForThisJob.Load()
-			probesToCompensate := estimatedProbesForThisJob - int(probesDoneCount)
+		// If a FullProbe job was aborted, the probes it didn't run should not count towards "completed" for the bar.
+		// Probes that *did* run before abortion would have already incremented s.completedProbesInPhase.
+		// Therefore, we remove the explicit compensation logic here that was causing the progress bar to exceed 100%.
+		/*
+			if job.JobType == JobTypeFullProbe { // Only compensate for Phase 2 FullProbe jobs
+				probesDoneCount := probesActuallyCompletedForThisJob.Load()
+				probesToCompensate := estimatedProbesForThisJob - int(probesDoneCount)
 
-			if probesToCompensate > 0 {
-				s.logger.Debugf("[Worker %03d] Job %s did not complete all probes (done: %d, estimated: %d). Compensating %d probes in progress bar.",
-					workerID, job.URLString, probesDoneCount, estimatedProbesForThisJob, probesToCompensate)
-				s.completedProbesInPhase.Add(uint64(probesToCompensate))
-				if s.progressBar != nil {
-					s.progressBar.Update(int(s.completedProbesInPhase.Load()))
+				if probesToCompensate > 0 {
+					s.logger.Debugf("[Worker %03d] Job %s did not complete all probes (done: %d, estimated: %d). Compensating %d probes in progress bar.",
+						workerID, job.URLString, probesDoneCount, estimatedProbesForThisJob, probesToCompensate)
+					s.completedProbesInPhase.Add(uint64(probesToCompensate))
+					if s.progressBar != nil {
+						s.progressBar.Update(int(s.completedProbesInPhase.Load()))
+					}
 				}
 			}
-		}
+		*/
 		s.handleJobOutcome(job, false, finalJobStatusError, 0) // statusCode 0 as it's a general job failure
 	} else {
 		// Job completou todas as suas operações sem ser abortado por falhas ou contexto.
@@ -1642,8 +1647,9 @@ func (s *Scheduler) handleProbeNetworkFailure(
 			return true // Signal to stop this probe's execution; job abortion is in progress.
 		}
 
-		// This is a new, genuine failure (or context.Canceled NOT due to jobAborted yet).
-		currentFailures := jobFailures.Add(1)
+		// This is a new, genuine failure. We log it, but we no longer abort the entire job based on a threshold of probe failures.
+		// The job-level retry/discard logic is handled by handleJobOutcome based on critical failures (e.g., baseline failure).
+		jobFailures.Add(1) // We can still count them for potential future heuristics, but it won't trigger an abort here.
 		errMsgLog := ""
 		if respData.Error != nil {
 			errMsgLog = respData.Error.Error()
@@ -1652,27 +1658,26 @@ func (s *Scheduler) handleProbeNetworkFailure(
 		}
 
 		if s.config.VerbosityLevel >= 1 {
-			s.logger.Warnf("[Worker %03d] %s for '%s' on %s failed (Error: %s, ConsecutiveFailures: %d/%d).",
-				workerID, probeName, inputIdentifier, targetURL, errMsgLog, currentFailures, s.config.MaxRetries+1)
+			s.logger.Warnf("[Worker %03d] %s for '%s' on %s failed (Error: %s). This individual probe will not be analyzed, but the job will continue with other probes.",
+				workerID, probeName, inputIdentifier, targetURL, errMsgLog)
 		}
 
-		if currentFailures > int32(s.config.MaxRetries) {
-			if jobAborted.CompareAndSwap(false, true) { // Abort the job ONCE
-				s.logger.Errorf("[Worker %03d] Max consecutive network failures (%d) reached for job involving URL %s (during %s for '%s'). Aborting this entire job.",
-					workerID, s.config.MaxRetries+1, targetURL, probeName, inputIdentifier) // Clarified targetURL is probe's URL.
-				cancelJobFunc() // Cancel the main job context
-			}
-			return true // Signal to stop this probe's execution; job is being aborted.
-		}
-		return false // Failure, but below threshold. Probe should not proceed with analysis but job continues.
+		// REMOVED: Logic to abort the job after s.config.MaxRetries consecutive probe failures.
+		// if currentFailures > int32(s.config.MaxRetries) { ... }
+		
+		return true // Return true to indicate this specific probe's execution path should terminate, but without cancelling the parent job context.
 
 	} else if isRateLimitError {
-		s.logger.Warnf("[Worker %03d] %s for '%s' on %s got 429. Aborting this entire job.",
-			workerID, probeName, inputIdentifier, targetURL)
-		if jobAborted.CompareAndSwap(false, true) { // Abort the job ONCE
-			cancelJobFunc() // Cancel the main job context
+		// A 429 error occurred. Let the DomainManager handle it.
+		// Stop this probe, but the job will continue/be re-queued.
+		if s.config.VerbosityLevel >= 2 { // Only log this for -vv
+			s.logger.Debugf("[Worker %03d] Probe %s for '%s' on %s got 429. This probe is stopped, and DomainManager will place the domain on standby. The job will be re-queued later.",
+				workerID, probeName, inputIdentifier, targetURL)
 		}
-		return true // Signal to stop this probe's execution; job is being aborted (due to 429).
+		
+		// REMOVED: Logic that immediately aborted the job on a 429.
+
+		return true // Signal to stop this probe's execution path.
 	}
 
 	// If not a network/server error and not a 429 (e.g., 200 OK, 404, 403 etc.)
