@@ -116,20 +116,17 @@ type Scheduler struct {
 	wg            sync.WaitGroup
 	mu            sync.Mutex // For thread-safe access to findings slice
 
-	workerJobQueue chan TargetURLJob // Queue from which workers will pull jobs
+	workerJobQueue   chan TargetURLJob // Queue from which workers will pull jobs
 	pendingJobsQueue chan TargetURLJob // NEW: Queue for jobs waiting for NextAttemptAt or DomainManager approval
 
-	activeJobs    int32         // Counter for all active jobs (main + retry)
-	maxRetries    int           // From config
-	doneChan      chan struct{}   // Signals all processing is complete
-	closeDoneChanOnce sync.Once // Garante que doneChan seja fechado apenas uma vez
-
-	progressBar             *output.ProgressBar
-	totalJobsForProgressBar int // This will now represent the total for the *current phase* being displayed
-	completedJobsInPhaseForBar int // Counter for jobs completed in the current phase for progress bar
-
-	totalProbesExecutedGlobal atomic.Uint64 // Contador global de todas as probes
-	completedProbesInPhase    atomic.Uint64 // Contador de probes para a barra da FASE ATUAL (Fase 2)
+	activeJobs                 int32       // Counter for all active jobs (main + retry)
+	maxRetries                 int         // From config
+	doneChan                   chan struct{} // Signals all processing is complete
+	closeDoneChanOnce          sync.Once   // Garante que doneChan seja fechado apenas uma vez
+	progressBar                *output.ProgressBar
+	totalJobsForProgressBar    int           // This will now represent the total for the *current phase* being displayed
+	completedJobsInPhaseForBar int           // Counter for jobs completed in the current phase for progress bar
+	completedProbesInPhase     atomic.Uint64 // Contador de probes para a barra da FASE ATUAL (Fase 2)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -1189,7 +1186,7 @@ func (s *Scheduler) performHeaderTests(
 			probeARespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAReqData)
 			cancelReqProbeA()
 
-			if s.handleProbeNetworkFailure(workerID, job.URLString, "Header Probe A", hn, probeARespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+			if s.handleProbeNetworkFailure(workerID, job.URLString, "Header Probe A", hn, probeARespData, jobFailures, jobAborted, jobCtx) {
 				return
 			}
 			if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1200,7 +1197,7 @@ func (s *Scheduler) performHeaderTests(
 			probeBRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBReqData)
 			cancelReqProbeB()
 
-			if s.handleProbeNetworkFailure(workerID, job.URLString, "Header Probe B", hn, probeBRespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+			if s.handleProbeNetworkFailure(workerID, job.URLString, "Header Probe B", hn, probeBRespData, jobFailures, jobAborted, jobCtx) {
 				return
 			}
 			if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1305,7 +1302,7 @@ func (s *Scheduler) runParamTests(
 				probeAParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAParamReqData)
 				cancelReqParamProbeA()
 
-				if s.handleProbeNetworkFailure(workerID, probeAURL, testType+" Probe A", pn, probeAParamRespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+				if s.handleProbeNetworkFailure(workerID, probeAURL, testType+" Probe A", pn, probeAParamRespData, jobFailures, jobAborted, jobCtx) {
 					return
 				}
 				if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1316,7 +1313,7 @@ func (s *Scheduler) runParamTests(
 				probeBParamRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBParamReqData)
 				cancelReqParamProbeB()
 
-				if s.handleProbeNetworkFailure(workerID, job.URLString, testType+" Probe B", pn, probeBParamRespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+				if s.handleProbeNetworkFailure(workerID, job.URLString, testType+" Probe B", pn, probeBParamRespData, jobFailures, jobAborted, jobCtx) {
 					return
 				}
 				if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1380,7 +1377,11 @@ func (s *Scheduler) performDeceptionTests(
 	}
 
 	mutators := map[string]func(string) string{
-		"Backslash Suffix": func(u string) string { return u + `\` },
+		"Backslash Suffix":   func(u string) string { return u + `\` },
+		"Semicolon Suffix":   func(u string) string { return u + ";" },
+		"Hash Suffix":        func(u string) string { return u + "#" },
+		"Dot-Slash Suffix":   func(u string) string { return u + "/." },
+		"Double-Slash Suffix": func(u string) string { return u + "//" },
 	}
 
 	var deceptionWg sync.WaitGroup
@@ -1415,7 +1416,7 @@ func (s *Scheduler) performDeceptionTests(
 			probeARespData := s.performRequestWithDomainManagement(job.BaseDomain, probeAReqData)
 			cancelReqProbeA()
 			
-			if s.handleProbeNetworkFailure(workerID, mutatedURL, "Deception Probe A", tn, probeARespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+			if s.handleProbeNetworkFailure(workerID, mutatedURL, "Deception Probe A", tn, probeARespData, jobFailures, jobAborted, jobCtx) {
 				return
 			}
 			if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1429,7 +1430,7 @@ func (s *Scheduler) performDeceptionTests(
 			probeBRespData := s.performRequestWithDomainManagement(job.BaseDomain, probeBReqData)
 			cancelReqProbeB()
 
-			if s.handleProbeNetworkFailure(workerID, mutatedURL, "Deception Probe B", tn, probeBRespData, jobFailures, jobAborted, jobCtx, cancelJob) {
+			if s.handleProbeNetworkFailure(workerID, mutatedURL, "Deception Probe B", tn, probeBRespData, jobFailures, jobAborted, jobCtx) {
 				return
 			}
 			if jobAborted.Load() || s.isJobContextDone(jobCtx) { return }
@@ -1486,7 +1487,6 @@ func (s *Scheduler) handleProbeNetworkFailure(
 	jobFailures *atomic.Int32,
 	jobAborted *atomic.Bool,
 	jobCtx context.Context, // Added
-	cancelJobFunc context.CancelFunc,
 ) bool {
 	// If the job's main context is already done (e.g. scheduler shutting down, or *this job* was cancelled),
 	// treat this probe as effectively cancelled.

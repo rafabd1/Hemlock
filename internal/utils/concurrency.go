@@ -44,7 +44,7 @@ func NewWorkerPool(parentCtx context.Context, numWorkers int, queueSize int) *Wo
 func (wp *WorkerPool) start() {
 	wp.shutdownWg.Add(wp.numWorkers)
 	for i := 0; i < wp.numWorkers; i++ {
-		go wp.worker(i)
+		go wp.worker()
 	}
 
 	// Goroutine to clean up channels once all workers are done with current jobs after ctx is cancelled
@@ -56,36 +56,36 @@ func (wp *WorkerPool) start() {
 }
 
 // worker is the internal function executed by each goroutine in the pool.
-func (wp *WorkerPool) worker(id int) {
+func (wp *WorkerPool) worker() {
 	defer wp.shutdownWg.Done()
-	// fmt.Printf("Worker %d starting\n", id) // For debugging
+	// fmt.Printf("Worker starting\n") // For debugging
 	for {
 		select {
 		case job, ok := <-wp.jobQueue:
 			if !ok {
-				// fmt.Printf("Worker %d: jobQueue closed, exiting.\n", id) // For debugging
+				// fmt.Printf("Worker: jobQueue closed, exiting.\n") // For debugging
 				return // Job queue was closed, exit worker
 			}
 			// Execute the job
-			// fmt.Printf("Worker %d processing job\n", id) // For debugging
+			// fmt.Printf("Worker processing job\n") // For debugging
 			result, err := job()
 			if err != nil {
 				select {
 				case wp.errors <- err:
 				case <-wp.ctx.Done(): // If context is cancelled while trying to send error
-					// fmt.Printf("Worker %d: context cancelled while sending error. Error: %v\n", id, err) // For debugging
+					// fmt.Printf("Worker: context cancelled while sending error. Error: %v\n", err) // For debugging
 					return
 				}
 			} else if result != nil { // Only send non-nil results
 				select {
 				case wp.results <- result:
 				case <-wp.ctx.Done(): // If context is cancelled while trying to send result
-					// fmt.Printf("Worker %d: context cancelled while sending result.\n", id) // For debugging
+					// fmt.Printf("Worker: context cancelled while sending result.\n", id) // For debugging
 					return
 				}
 			}
 		case <-wp.ctx.Done(): // Context was cancelled (e.g., by Shutdown)
-			// fmt.Printf("Worker %d: context cancelled, exiting.\n", id) // For debugging
+			// fmt.Printf("Worker: context cancelled, exiting.\n") // For debugging
 			return
 		}
 	}

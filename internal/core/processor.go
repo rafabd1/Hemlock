@@ -48,6 +48,56 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 		p.logger.Debugf("[Processor] Analyzing probes for URL: %s, InputType: %s, InputName: %s, Value: %s", targetURL, inputType, inputName, injectedValue)
 	}
 
+	// --- Heuristic 3: Cache Deception Attack ---
+	if inputType == "deception" {
+		if p.config.VerbosityLevel >= 2 {
+			p.logger.Debugf("[Processor H3] Starting Cache Deception analysis for %s. Test: '%s'", probeA.URL, inputName)
+		}
+		
+		// Condição 1: A probe mutada (A) obteve uma resposta de erro (e.g., 404), enquanto a baseline não.
+		probeA_isErrorStatus := probeA.Response != nil && probeA.Response.StatusCode >= 400
+		baseline_isSuccessStatus := baseline.Response != nil && baseline.Response.StatusCode < 400
+
+		if probeA_isErrorStatus && baseline_isSuccessStatus {
+			// Condição 2: A resposta da probe A era cacheável.
+			probeA_wasCacheable := utils.IsCacheable(probeA.Response)
+			if !probeA_wasCacheable {
+				if p.config.VerbosityLevel >= 2 {
+					p.logger.Debugf("[Processor H3] Deception Probe A for %s resulted in error status %d, but was not cacheable. Skipping.", probeA.URL, probeA.Response.StatusCode)
+				}
+				return nil, nil // Not a vulnerability if the error page isn't cached.
+			}
+
+			// Condição 3: A probe de confirmação (B) também obteve a mesma resposta de erro.
+			probeB_isSameErrorStatus := probeB.Response != nil && probeB.Response.StatusCode == probeA.Response.StatusCode
+
+			if probeB_isSameErrorStatus {
+				// Condição 4: A probe B indica um HIT de cache.
+				probeB_isCacheHit := utils.IsCacheHit(probeB.Response)
+
+				description := fmt.Sprintf("A request with a mutated path ('%s') resulted in a '%s' response, while the baseline was successful. This error response was cached.", probeA.URL, probeA.Response.Status)
+				evidence := fmt.Sprintf("Baseline URL '%s' returned status %d. Mutated URL '%s' returned cacheable status %d. Confirmation request to mutated URL also returned %d and indicated a cache HIT: %t.",
+					baseline.URL, baseline.Response.StatusCode, probeA.URL, probeA.Response.StatusCode, probeB.Response.StatusCode, probeB_isCacheHit)
+
+				// A confirmação mais forte é um HIT de cache explícito.
+				if probeB_isCacheHit {
+					return &report.Finding{
+						URL:           targetURL, // Report against the original non-mutated URL
+						Vulnerability: "Web Cache Deception",
+						Description:   description,
+						InputType:     inputType,
+						InputName:     inputName,    // e.g., "Backslash Suffix"
+						Payload:       probeA.URL, // The payload is the mutated URL itself
+						Evidence:      evidence,
+						Status:        report.StatusConfirmed,
+					}, nil
+				}
+			}
+		}
+		// Se a lógica de deception falhar, retornamos nil para permitir que outras heurísticas (se houver) rodem.
+		return nil, nil // No deception finding
+	}
+
 	// --- Basic Sanity Checks & Error Handling ---
 	if baseline.Error != nil {
 		p.logger.Warnf("[Processor] Baseline probe for %s had an error: %v. Analysis might be unreliable.", targetURL, baseline.Error)
