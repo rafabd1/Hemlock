@@ -371,8 +371,9 @@ func (s *Scheduler) StartScan() []*report.Finding {
 				estimatedTotalProbesInPhase2 += len(phase2Jobs) * len(s.config.ParamsToFuzz) * numBasePayloads
 			}
 			if utils.Contains(s.config.TestModes, "deception") {
-				// Por enquanto, consideramos 1 tipo de teste de deception por job.
-				estimatedTotalProbesInPhase2 += len(phase2Jobs)
+				// Each deception job runs multiple mutation tests (currently 5).
+				const numDeceptionMutators = 5
+				estimatedTotalProbesInPhase2 += len(phase2Jobs) * numDeceptionMutators
 			}
 		}
 		if estimatedTotalProbesInPhase2 == 0 && len(phase2Jobs) > 0 {
@@ -999,8 +1000,9 @@ func calculateEstimatedProbesForJob(job TargetURLJob, cfg *config.Config, logger
 
 	// Deception probes
 	if utils.Contains(cfg.TestModes, "deception") {
-		// Currently 1 deception test (backslash). This can be adjusted if more are added.
-		estimatedProbes += 1
+		// This should match the number of mutators in performDeceptionTests.
+		const numDeceptionMutators = 5
+		estimatedProbes += numDeceptionMutators
 	}
 
 	if estimatedProbes == 0 && job.JobType == JobTypeFullProbe {

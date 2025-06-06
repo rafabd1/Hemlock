@@ -205,7 +205,7 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 			}
 			cfg.HeadersToTest = loadedHeaders
 		} else {
-			logger.Infof("Header tests are disabled (mode not specified in --test-modes). Skipping header list loading.")
+			logger.Debugf("Header tests are disabled (mode not specified in --test-modes). Skipping header list loading.")
 			cfg.HeadersToTest = []string{} // Ensure it's empty if disabled
 		}
 

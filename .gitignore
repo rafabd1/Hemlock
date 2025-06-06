@@ -56,3 +56,5 @@ dev/
 output.*
 
 proxies.txt
+
+out.txt

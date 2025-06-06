@@ -266,9 +266,6 @@ func (c *Config) Validate() error {
 	if len(c.Targets) == 0 {
 		return fmt.Errorf("targets cannot be empty")
 	}
-	if len(c.HeadersToTest) == 0 {
-		return fmt.Errorf("headersToTest cannot be empty")
-	}
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("maxRetries cannot be negative")
 	}

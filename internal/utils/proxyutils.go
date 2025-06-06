@@ -163,7 +163,7 @@ func ParseProxyInput(proxyInput string, logger Logger) ([]config.ProxyEntry, err
 	if len(proxyStrings) > 0 && len(parsedProxies) == 0 {
 		return nil, fmt.Errorf("proxy input '%s' provided, but no valid proxies could be parsed", proxyInput)
 	} else if len(parsedProxies) > 0 {
-	    logger.Infof("Successfully parsed %d proxies.", len(parsedProxies))
+	    logger.Debugf("Successfully parsed %d proxies.", len(parsedProxies))
 	    for _, p := range parsedProxies {
 	        // Use p.String() which should be defined in config.ProxyEntry and handles formatting.
 	        // Or, if logging specific parsed components:
