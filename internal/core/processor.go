@@ -118,18 +118,26 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 	reflectedInA_Body := utils.BodyContains(probeA.Body, []byte(injectedValue))
 	reflectedInA_Headers := utils.HeadersContain(probeA.RespHeaders, injectedValue)
 	probeA_wasCacheable := utils.IsCacheable(probeA.Response) // Check cacheability of Probe A early
+	var reflectedFinding *report.Finding
 
 	// Log payload reflection in Probe A if it occurs
 	if (reflectedInA_Body || reflectedInA_Headers) && p.config.VerbosityLevel >= 0 && !p.config.Silent {
-		reflectionLocationA := ""
-		if reflectedInA_Body { reflectionLocationA = "body" }
-		if reflectedInA_Headers {
-			if reflectionLocationA != "" { reflectionLocationA += " and " }
-			reflectionLocationA += "headers"
-		}
+		reflectionLocationA := getReflectionLocation(reflectedInA_Body, reflectedInA_Headers)
 
 		logMessageFormat := "REFLECTED: Input '%s: %s' (type: %s) reflected in Probe A's %s for %s. Cacheable: %t"
 		formattedMessage := fmt.Sprintf(logMessageFormat, inputName, injectedValue, inputType, reflectionLocationA, targetURL, probeA_wasCacheable)
+
+		// Create a "Reflected" finding immediately. We might upgrade it to Potential or Confirmed later.
+		reflectedFinding = &report.Finding{
+			URL:           targetURL,
+			Vulnerability: "Reflected Input",
+			Description:   fmt.Sprintf("Input was reflected in the response from Probe A in the %s. This is informational and does not confirm caching.", reflectionLocationA),
+			InputType:     inputType,
+			InputName:     inputName,
+			Payload:       injectedValue,
+			Evidence:      fmt.Sprintf("Probe A was cacheable: %t.", probeA_wasCacheable),
+			Status:        report.StatusReflected,
+		}
 
 		if !p.config.NoColor {
 			// Constantes de cor de internal/utils/logger.go
@@ -281,8 +289,15 @@ func (p *Processor) AnalyzeProbes(targetURL string, inputType string, inputName 
 		
 	}
 
+	// If we reach this point and haven't returned a Confirmed/Potential finding,
+	// but we did find a reflection, return the Reflected finding.
+	if reflectedFinding != nil {
+		return reflectedFinding, nil
+	}
+
+	// Default: No vulnerability found by any heuristic
 	if p.config.VerbosityLevel >= 2 { // -vv
-		p.logger.Debugf("[Processor] No definitive cache poisoning vector found for %s with input %s (type %s) by current heuristics.", targetURL, inputName, inputType)
+		p.logger.Debugf("[Processor] No cache poisoning indicators found for %s with input '%s'", targetURL, inputName)
 	}
 	return nil, nil
 }

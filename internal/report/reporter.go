@@ -11,6 +11,7 @@ import (
 const (
 	StatusConfirmed = "Confirmed"
 	StatusPotential = "Potential"
+	StatusReflected = "Reflected"
 )
 
 // Finding represents a detected potential cache poisoning vulnerability.
@@ -65,6 +66,7 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 	case "text":
 		foundConfirmed := false
 		foundPotential := false
+		foundReflected := false
 		for _, finding := range findings {
 			if finding.Status == StatusConfirmed {
 				foundConfirmed = true
@@ -78,9 +80,14 @@ func GenerateReport(findings []*Finding, outputPath string, format string) error
 				_, err := fmt.Fprintf(outputWriter, "%s -> Potentially Vulnerable (Input: %s '%s', Payload: '%s', Reason: %s, Evidence: %s)\n", 
 					finding.URL, finding.InputType, finding.InputName, finding.Payload, finding.Description, finding.Evidence)
 				if err != nil { return fmt.Errorf("error writing potential finding to report: %w", err) }
+			} else if finding.Status == StatusReflected {
+				foundReflected = true
+				_, err := fmt.Fprintf(outputWriter, "%s -> Reflected Payload (Input: %s '%s', Payload: '%s', Description: %s)\n",
+					finding.URL, finding.InputType, finding.InputName, finding.Payload, finding.Description)
+				if err != nil { return fmt.Errorf("error writing reflected finding to report: %w", err) }
 			}
 		}
-		if !foundConfirmed && !foundPotential { // Caso todos os findings fossem de um status desconhecido (improvável)
+		if !foundConfirmed && !foundPotential && !foundReflected { // Caso todos os findings fossem de um status desconhecido (improvável)
 		    fmt.Fprintln(outputWriter, "No recognized vulnerabilities or potential issues found.")
 		}
 	default:
