@@ -735,6 +735,18 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 	// Este job da Fase 1 será concluído (e s.phase1CompletionWg.Done() chamado)
 	// após todas as tentativas internas ou sucesso.
 
+	// In simulation mode, we bypass the actual cacheability check and assume it's cacheable
+	// to allow Phase 2 (probing) to run, which is what we want to test.
+	if s.config.Simulate {
+		s.logger.Debugf("[Worker %03d] [CacheCheck] Simulation mode is active. Assuming URL %s is cacheable to proceed to Phase 2.", workerID, initialJob.URLString)
+		s.mu.Lock()
+		s.confirmedCacheableBaseURLs[initialJob.URLString] = true
+		s.mu.Unlock()
+		s.phase1CompletionWg.Done()
+		s.decrementActiveJobs()
+		return
+	}
+
 	var job = initialJob // Copia para modificar retries localmente, embora não usemos job.Retries aqui
 	var finalError error
 	var isCacheable bool // Mantida para armazenar o resultado da verificação

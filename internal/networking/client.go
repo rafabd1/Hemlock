@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 
 	// "net/http/httputil" // Removido pois não está sendo usado
@@ -290,14 +289,14 @@ func (c *Client) performSimulatedRequest(reqData ClientRequestData) ClientRespon
 	var poisonValue string
 
 	// Check for header poisoning payload
-	if fwdHost := reqData.RequestHeaders.Get("X-Forwarded-Host"); fwdHost != "" {
+	if fwdHost := reqData.RequestHeaders.Get("X-Forwarded-Host"); strings.HasPrefix(fwdHost, "hemlock-") {
 		isPoisoningProbeA = true
 		poisonValue = fwdHost
 		body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonValue + "</p>"
 	}
 
 	// Check for param poisoning payload
-	if utmContent := u.Query().Get("utm_content"); utmContent != "" {
+	if utmContent := u.Query().Get("utm_content"); strings.HasPrefix(utmContent, "hemlock-") {
 		isPoisoningProbeA = true
 		poisonValue = utmContent
 		body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonValue + "</p>"
@@ -332,7 +331,7 @@ func (c *Client) performSimulatedRequest(reqData ClientRequestData) ClientRespon
 				body = poisonedValue
 			} else if strings.HasPrefix(poisonedValue, "hemlock-header-") {
 				body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonedValue + "</p>"
-			} else if strings.HasPrefix(poisonedValue, "hemlock-paramval") {
+			} else if strings.HasPrefix(poisonedValue, "hemlock-param") {
 				body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonedValue + "</p>"
 			} else {
 				body = "<h1>Poisoned Page</h1><p>" + poisonedValue + "</p>"
@@ -361,7 +360,7 @@ func (c *Client) performSimulatedRequest(reqData ClientRequestData) ClientRespon
 	resp := &http.Response{
 		StatusCode: statusCode,
 		Header:     headers,
-		Body:       ioutil.NopCloser(bytes.NewBufferString(body)),
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
 		Request:    &http.Request{Method: reqData.Method, URL: u},
 	}
 
