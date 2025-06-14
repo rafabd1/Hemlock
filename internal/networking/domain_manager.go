@@ -214,32 +214,52 @@ func (dm *DomainManager) RecordRequestSent(domain string) {
 	}
 }
 
-// RecordRequestResult analisa o resultado de uma requisição e atualiza o estado do domínio.
+// RecordRequestResult atualiza o estado de um domínio com base no resultado de uma requisição.
+// Esta função é chamada *após* a requisição ter sido feita.
 func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err error) {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
+
 	bucket := dm.getOrCreateDomainBucket(domain)
 
-	// --- Tratamento específico para 429 (Rate Limit Explícito) ---
-	if statusCode == 429 {
-		appliedStandbyDuration := bucket.currentStandbyDuration
-		bucket.standbyUntil = time.Now().Add(appliedStandbyDuration)
-		previousTokens := bucket.tokens
-		bucket.tokens = 0 // Zera os tokens para forçar espera pela recarga após o standby.
+	// Se o domínio já foi descartado, não há nada a fazer.
+	if bucket.discarded {
+		return
+	}
 
-		bucket.current429Retries++ // Incrementa o contador de retries 429 para o domínio
+	// Lógica de Standby por Código de Status (ex: 429)
+	isStandbyStatusCode := false
+	for _, code := range DefaultStatusCodesToBlock {
+		if statusCode == code {
+			isStandbyStatusCode = true
+			break
+		}
+	}
 
-		if dm.config.VerbosityLevel >= 1 {
-			dm.logger.Warnf("[DomainManager] Domain '%s' (Status 429). Tokens zeroed (was %.2f). Applying standby for %s until %s. Domain 429 retries: %d/%d.",
-				domain, previousTokens, appliedStandbyDuration, bucket.standbyUntil.Format(time.RFC3339), bucket.current429Retries, dm.config.MaxDomain429Retries)
+	if isStandbyStatusCode {
+		bucket.current429Retries++
+		bucket.consecutiveSuccesses = 0 // Reseta sucessos em caso de 429
+		bucket.consecutiveNonCriticalErrors = 0 // Reseta outros erros também
+
+		// Verificar se o domínio deve ser descartado permanentemente
+		if bucket.current429Retries >= dm.config.MaxDomain429Retries {
+			// A verificação 'if !bucket.discarded' é feita no início da função agora.
+			// Se chegamos aqui, significa que o bucket não estava descartado antes, e agora será.
+			// Este é o único lugar onde 'discarded' se torna true.
+			bucket.discarded = true
+			dm.logger.Warnf("[DomainManager] Domain '%s' DISCARDED permanently after %d (>=%d) repeated 429 errors.",
+				domain, bucket.current429Retries, dm.config.MaxDomain429Retries)
+			// Não precisa mais de standby, pois está descartado.
+			bucket.standbyUntil = time.Now().Add(time.Hour * 24) // Coloca em standby "infinito" como segurança
+			return // Sai da função após descartar
 		}
 
-		// Verifica se o limite de retries 429 do domínio foi atingido
-		if bucket.current429Retries >= dm.config.MaxDomain429Retries {
-			bucket.discarded = true
-			dm.logger.Warnf("Domain '%s' DISCARDED permanently after %d (>=%d) repeated 429 errors.",
-				domain, bucket.current429Retries, dm.config.MaxDomain429Retries)
-			// O domínio agora está marcado como descartado. CanRequest irá bloqueá-lo.
+		// Se não foi descartado, configurar o standby normal
+		standbyDuration := bucket.currentStandbyDuration
+		bucket.standbyUntil = time.Now().Add(standbyDuration)
+		if dm.config.VerbosityLevel >= 1 {
+			dm.logger.Infof("[DomainManager] Placing domain '%s' in STANDBY for %s due to status code %d (429 Retries: %d/%d).",
+				domain, standbyDuration, statusCode, bucket.current429Retries, dm.config.MaxDomain429Retries)
 		}
 
 		// Aumentar a duração do próximo standby
@@ -247,65 +267,60 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 		if bucket.currentStandbyDuration > dm.config.MaxStandbyDuration {
 			bucket.currentStandbyDuration = dm.config.MaxStandbyDuration
 		}
-		dm.logger.Debugf("[DomainManager] Domain '%s' next standby duration for 429s increased to %s.", domain, bucket.currentStandbyDuration)
-
-		// No modo automático, resetar RPS para o mínimo após um 429.
-		if bucket.isAutoMode {
-			bucket.currentRPS = bucket.minRPS
-			bucket.refillRate = bucket.currentRPS
-			bucket.maxTokens = bucket.currentRPS // O balde deve ser capaz de conter tokens para a nova taxa
-		}
-		bucket.consecutiveSuccesses = 0       // Resetar contadores
-		bucket.consecutiveNonCriticalErrors = 0
-		return // Tratamento de 429 concluído
+		return // Retorna para não processar outras lógicas de erro/sucesso
 	}
 
-	// Se chegou aqui, não foi um 429. Resetar o contador de retries 429 do domínio.
-	if bucket.current429Retries > 0 { // Só logar se havia retries para resetar
-		if dm.config.VerbosityLevel >= 1 {
-			dm.logger.Infof("[DomainManager] Domain '%s' successful request (status %d, err: %v). Resetting domain 429 retries from %d to 0.",
-				domain, statusCode, err, bucket.current429Retries)
-		}
-		bucket.current429Retries = 0
-	}
-
-	// --- Lógica de Ajuste Dinâmico de RPS (Apenas para Modo Automático) ---
-	if bucket.isAutoMode {
-		isClientSideOrNetworkError := false
-		if err != nil {
-			// Verifica erros específicos do lado do cliente/rede
-			// Adicionar "dial tcp" para capturar erros de conexão mais genéricos que não são timeouts ou DNS.
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
-				(err.Error() != "" && (strings.Contains(err.Error(), "no such host") || strings.Contains(err.Error(), "lookup") || strings.Contains(err.Error(), "dial tcp"))) {
-				isClientSideOrNetworkError = true
-			}
-		}
-
-		if isClientSideOrNetworkError {
-			// Erro do lado do cliente/rede: Logar, mas NÃO ajustar RPS nem contadores de RPS.
+	// Lógica de Erro Genérico (se não for um erro de standby)
+	if err != nil {
+		// Se chegou aqui, não foi um 429. Resetar o contador de retries 429 do domínio.
+		if bucket.current429Retries > 0 { // Só logar se havia retries para resetar
 			if dm.config.VerbosityLevel >= 1 {
+				dm.logger.Infof("[DomainManager] Domain '%s' successful request (status %d, err: %v). Resetting domain 429 retries from %d to 0.",
+					domain, statusCode, err, bucket.current429Retries)
 			}
-			// Não resetamos consecutiveSuccesses, pois o servidor pode estar ok.
-			// Não incrementamos consecutiveNonCriticalErrors, pois não é um erro de servidor 5xx.
-		} else if err != nil {
-			// err != nil, MAS NÃO é um erro de cliente/rede conhecido (acima).
-			// Tratar como um problema que justifica a redução de RPS (ex: connection reset by peer, etc.)
-			// pois pode indicar que o servidor está sobrecarregado ou rejeitando na taxa atual.
-			bucket.consecutiveSuccesses = 0 // Erro de rede quebra a sequência de sucessos.
-			bucket.consecutiveNonCriticalErrors++
+			bucket.current429Retries = 0
+		}
 
-			if bucket.consecutiveNonCriticalErrors >= DefaultTransientErrorThreshold {
-				if bucket.currentRPS > bucket.minRPS {
-					newRPS := bucket.currentRPS * DefaultRPSReductionFactorOnError
-					bucket.currentRPS = math.Max(newRPS, bucket.minRPS)
-					bucket.refillRate = bucket.currentRPS
-					bucket.maxTokens = bucket.currentRPS
-					bucket.consecutiveNonCriticalErrors = 0 // Resetar após redução
-				} else {
-					bucket.consecutiveNonCriticalErrors = 0 // Já no mínimo, resetar.
+		// --- Lógica de Ajuste Dinâmico de RPS (Apenas para Modo Automático) ---
+		if bucket.isAutoMode {
+			// Verifica se o erro é do lado do cliente/rede, que não deve impactar o RPS.
+			isClientSideOrNetworkError := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+				(err.Error() != "" && (strings.Contains(err.Error(), "no such host") || strings.Contains(err.Error(), "lookup") || strings.Contains(err.Error(), "dial tcp")))
+
+			if isClientSideOrNetworkError {
+				// Erro do lado do cliente/rede: Logar, mas NÃO ajustar RPS nem contadores de RPS.
+				// Não resetamos consecutiveSuccesses, pois o servidor pode estar ok.
+				// Não incrementamos consecutiveNonCriticalErrors, pois não é um erro de servidor 5xx.
+				if dm.config.VerbosityLevel >= 2 {
+					dm.logger.Debugf("[DomainManager] Client-side/network error for '%s', not adjusting RPS: %v", domain, err)
+				}
+			} else {
+				// Para todos os outros erros (não 429, não client-side), tratamos como um problema que justifica a redução de RPS.
+				// Ex: connection reset by peer, que indica que o servidor pode estar sobrecarregado.
+				bucket.consecutiveSuccesses = 0 // Erro de rede quebra a sequência de sucessos.
+				bucket.consecutiveNonCriticalErrors++
+
+				if bucket.consecutiveNonCriticalErrors >= DefaultTransientErrorThreshold {
+					if bucket.currentRPS > bucket.minRPS {
+						newRPS := bucket.currentRPS * DefaultRPSReductionFactorOnError
+						bucket.currentRPS = math.Max(newRPS, bucket.minRPS)
+						bucket.refillRate = bucket.currentRPS
+						bucket.maxTokens = bucket.currentRPS
+						bucket.consecutiveNonCriticalErrors = 0 // Resetar após redução
+					} else {
+						bucket.consecutiveNonCriticalErrors = 0 // Já no mínimo, resetar.
+					}
 				}
 			}
-		} else { // err == nil. A decisão é baseada apenas no statusCode.
+		} else { // Modo Manual - Apenas logar o resultado
+			if dm.config.VerbosityLevel >= 1 {
+				dm.logger.Warnf("[DomainManager] MANUAL MODE: Request error for domain '%s' (Status: %d, Tokens: %.2f, RefillRate: %.2f/s): %v.",
+					domain, statusCode, bucket.tokens, bucket.refillRate, err)
+			}
+		}
+	} else { // err == nil.
+		// --- Lógica de Ajuste Dinâmico de RPS (Apenas para Modo Automático) ---
+		if bucket.isAutoMode {
 			isServerError := statusCode >= 500 && statusCode <= 599
 			if !isServerError { // Sucesso Genuíno (err é nil, statusCode não é 5xx)
 				bucket.consecutiveNonCriticalErrors = 0 // Resetar contador de erros de SERVIDOR em sucesso
@@ -338,22 +353,17 @@ func (dm *DomainManager) RecordRequestResult(domain string, statusCode int, err 
 					}
 				}
 			}
-		}
-	} else { // Modo Manual - Apenas logar o resultado
-		if err != nil {
-			if dm.config.VerbosityLevel >= 1 {
-				dm.logger.Warnf("[DomainManager] MANUAL MODE: Request error for domain '%s' (Status: %d, Tokens: %.2f, RefillRate: %.2f/s): %v.",
-					domain, statusCode, bucket.tokens, bucket.refillRate, err)
-			}
-		} else if statusCode >= 400 { // Erros HTTP como 400, 401, 403, 404 etc.
-			if dm.config.VerbosityLevel >= 1 { // Logar erros HTTP no modo manual se verbosidade for info ou debug
-				dm.logger.Infof("[DomainManager] MANUAL MODE: HTTP error status %d for domain '%s'. Tokens: %.2f. RefillRate: %.2f/s",
-					statusCode, domain, bucket.tokens, bucket.refillRate)
-			}
-		} else { // Sucesso (2xx, 3xx)
-			if dm.config.VerbosityLevel >= 2 { // -vv
-				dm.logger.Debugf("[DomainManager] MANUAL MODE: Successful request (status: %d) for '%s'. Tokens: %.2f. RefillRate: %.2f/s",
-					statusCode, domain, bucket.tokens, bucket.refillRate)
+		} else { // Modo Manual
+			if statusCode >= 400 { // Erros HTTP como 400, 401, 403, 404 etc.
+				if dm.config.VerbosityLevel >= 1 { // Logar erros HTTP no modo manual se verbosidade for info ou debug
+					dm.logger.Infof("[DomainManager] MANUAL MODE: HTTP error status %d for domain '%s'. Tokens: %.2f. RefillRate: %.2f/s",
+						statusCode, domain, bucket.tokens, bucket.refillRate)
+				}
+			} else { // Sucesso (2xx, 3xx)
+				if dm.config.VerbosityLevel >= 2 { // -vv
+					dm.logger.Debugf("[DomainManager] MANUAL MODE: Successful request (status: %d) for '%s'. Tokens: %.2f. RefillRate: %.2f/s",
+						statusCode, domain, bucket.tokens, bucket.refillRate)
+				}
 			}
 		}
 	}

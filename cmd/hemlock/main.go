@@ -90,6 +90,9 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
 		cfg.StandbyDurationIncrementSeconds = vp.GetInt("standby-duration-increment")
 		cfg.StandbyDurationIncrement = time.Duration(cfg.StandbyDurationIncrementSeconds) * time.Second
 
+		// Adicionar a nova flag de simulação
+		cfg.Simulate = vp.GetBool("simulate")
+
 		testModesRaw := vp.GetString("test-modes")
 		if testModesRaw != "" {
 			// User provided the flag, so we use it exclusively.
@@ -467,6 +470,9 @@ func init() {
 
 	// Proxy
 	rootCmd.PersistentFlags().String("proxy", defaults.ProxyInput, "Proxy to use (URL, CSV list, or file path)")
+
+	// Nova flag para modo de simulação
+	rootCmd.PersistentFlags().Bool("simulate", defaults.Simulate, "Enable simulation mode to test logic without real network requests")
 
 	// Adicionar descrição para a nova flag de probes
 	if err := rootCmd.PersistentFlags().SetAnnotation("probes", "description", []string{"Number of concurrent probes (e.g., header/param tests) per URL"}); err != nil {

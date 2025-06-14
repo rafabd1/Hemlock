@@ -282,7 +282,12 @@ func (s *Scheduler) StartScan() []*report.Finding {
 
 		// DEBUG LOGS IMEDIATAMENTE APÓS A FASE 1 COMPLETAR
 		s.mu.Lock()
-		numCacheable := len(s.confirmedCacheableBaseURLs)
+		numCacheable := 0
+		for _, isCacheable := range s.confirmedCacheableBaseURLs {
+			if isCacheable {
+				numCacheable++
+			}
+		}
 		s.mu.Unlock()
 		initialActiveJobsAfterPhase1 := atomic.LoadInt32(&s.activeJobs)
 		s.logger.Debugf("[Orchestrator-Debug] After Phase 1 Wait: numCacheable=%d, initialActiveJobsAfterPhase1=%d", 
@@ -555,7 +560,9 @@ func (s *Scheduler) jobFeederLoop() {
 
 			// VERIFICAR SE O DOMÍNIO FOI DESCARTADO (NOVO - para jobs da pendingJobsQueue)
 			if s.domainManager.IsDomainDiscarded(job.BaseDomain) {
-				s.logger.Warnf("[JobFeeder] Job %s for DISCARDED domain %s (from pendingJobsQueue). Discarding job and compensating progress.", job.URLString, job.BaseDomain)
+				if s.config.VerbosityLevel >= 2 { // -vv
+					s.logger.Debugf("[JobFeeder] Job %s for DISCARDED domain %s (from pendingJobsQueue). Discarding job and compensating progress.", job.URLString, job.BaseDomain)
+				}
 				s.handleDiscardedDomainJob(job)
 				// Não adiciona ao heap, apenas continua para o próximo select
 			} else {
@@ -572,7 +579,9 @@ func (s *Scheduler) jobFeederLoop() {
 
 				// VERIFICAR SE O DOMÍNIO FOI DESCARTADO (NOVO - para jobs do heap via timer)
 				if s.domainManager.IsDomainDiscarded(item.Job.BaseDomain) {
-					s.logger.Warnf("[JobFeeder] Job %s for DISCARDED domain %s (from heap timer). Discarding job and compensating progress.", item.Job.URLString, item.Job.BaseDomain)
+					if s.config.VerbosityLevel >= 2 { // -vv
+						s.logger.Debugf("[JobFeeder] Job %s for DISCARDED domain %s (from heap timer). Discarding job and compensating progress.", item.Job.URLString, item.Job.BaseDomain)
+					}
 					s.handleDiscardedDomainJob(item.Job)
 					continue // Pular para o próximo item do heap que está pronto
 				}
@@ -614,7 +623,9 @@ func (s *Scheduler) trySendToWorkerOrRequeue(job TargetURLJob, pq *JobPriorityQu
 	// ou caso a lógica de chamada mude. Se o job chegou aqui, ele já deveria ter passado
 	// pela verificação no loop principal do jobFeederLoop.
 	if s.domainManager.IsDomainDiscarded(job.BaseDomain) {
-		s.logger.Warnf("[JobFeeder/trySend] Job %s for DISCARDED domain %s. Discarding instead of sending/re-queuing.", job.URLString, job.BaseDomain)
+		if s.config.VerbosityLevel >= 2 { // -vv
+			s.logger.Debugf("[JobFeeder/trySend] Job %s for DISCARDED domain %s. Discarding instead of sending/re-queuing.", job.URLString, job.BaseDomain)
+		}
 		s.handleDiscardedDomainJob(job) // Lida com a compensação de progresso e decremento
 		return
 	}
@@ -914,7 +925,11 @@ func (s *Scheduler) processCacheabilityCheckJob(workerID int, initialJob TargetU
 // isActuallyCacheableHelper determines if a URL is effectively cacheable for poisoning tests.
 func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeData) bool {
 	// Basic check: Was the first response generally cacheable by its headers?
-	if !utils.IsCacheable(probe0.Response) {
+	isProbe0Cacheable := utils.IsCacheable(probe0.Response)
+	if s.config.VerbosityLevel >= 2 {
+		s.logger.Debugf("[CacheCheckHelper] Probe 0 URL: %s. IsCacheable result: %t. Headers: %v", probe0.URL, isProbe0Cacheable, probe0.Response.Header)
+	}
+	if !isProbe0Cacheable {
 		if s.config.VerbosityLevel >= 2 {
 			s.logger.Debugf("[CacheCheckHelper] Probe 0 for %s not cacheable by its own headers.", probe0.URL)
 		}
@@ -923,6 +938,9 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 
 	// Did the second response indicate a cache hit according to headers?
 	hitByHeaders := utils.IsCacheHit(probe01.Response)
+	if s.config.VerbosityLevel >= 2 {
+		s.logger.Debugf("[CacheCheckHelper] Probe 0.1 URL: %s. IsCacheHit result: %t. Headers: %v", probe01.URL, hitByHeaders, probe01.Response.Header)
+	}
 	if !hitByHeaders {
 		if s.config.VerbosityLevel >= 2 {
 			s.logger.Debugf("[CacheCheckHelper] Probe 0.1 for %s did not indicate a cache HIT by headers (IsCacheHit returned false).", probe01.URL)
@@ -953,7 +971,15 @@ func (s *Scheduler) isActuallyCacheableHelper(probe0 ProbeData, probe01 ProbeDat
 	// This helps filter out cases where a 'HIT' might be indicated but content changes (e.g., anti-CSRF tokens in page)
 	// For cache poisoning, we need the *poisoned* static content to be served.
 	// Using a high similarity threshold.
-	if !utils.BodiesAreSimilar(probe0.Body, probe01.Body, 0.98) { // 98% similarity
+	areBodiesSimilar := utils.BodiesAreSimilar(probe0.Body, probe01.Body, 0.98)
+	if s.config.VerbosityLevel >= 2 {
+		s.logger.Debugf("[CacheCheckHelper] URL %s. Bodies are similar result: %t.", probe0.URL, areBodiesSimilar)
+		if !areBodiesSimilar {
+			s.logger.Debugf("[CacheCheckHelper] Probe 0 Body (first 200 bytes): %s", string(probe0.Body[:200]))
+			s.logger.Debugf("[CacheCheckHelper] Probe 0.1 Body (first 200 bytes): %s", string(probe01.Body[:200]))
+		}
+	}
+	if !areBodiesSimilar { // 98% similarity
 		if s.config.VerbosityLevel >= 1 { // -v
 			s.logger.Warnf("[CacheCheckHelper] URL %s indicated cache HIT by headers and consistent ETag/Last-Modified (if present), but bodies differ significantly. Treating as not reliably cacheable for tests.", probe0.URL)
 		}

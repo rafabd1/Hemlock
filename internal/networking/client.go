@@ -1,10 +1,12 @@
 package networking
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 
 	// "net/http/httputil" // Removido pois não está sendo usado
@@ -16,6 +18,10 @@ import (
 	"github.com/rafabd1/Hemlock/internal/config"
 	"github.com/rafabd1/Hemlock/internal/utils"
 )
+
+// simulationState stores the poisoned value for a given path during a simulated test.
+var simulationState = make(map[string]string)
+var simMutex sync.Mutex
 
 const (
 	// DefaultRetryDelayBaseMs is the base delay for exponential backoff.
@@ -65,6 +71,7 @@ func NewClient(cfg *config.Config, logger utils.Logger) (*Client, error) {
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   true,
 	}
 
 	c := &Client{
@@ -119,7 +126,12 @@ func (c *Client) getProxyForDomain(targetDomain string) *url.URL {
 }
 
 // PerformRequest executes an HTTP request based on the provided ClientRequestData.
+// If simulation mode is enabled in the config, it will perform a simulated request instead.
 func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
+	if c.config.Simulate {
+		return c.performSimulatedRequest(reqData)
+	}
+
 	var finalRespData ClientResponseData
 
 	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
@@ -151,6 +163,12 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 					req.Header.Set(headerName, headerValue)
 				}
 			}
+		}
+
+		// NOVO: Forçar o header Host se ele for especificado nos headers da requisição.
+		// Isso é crucial para virtual hosting e testes como os do Varnish.
+		if hostHeaderValue := req.Header.Get("Host"); hostHeaderValue != "" {
+			req.Host = hostHeaderValue
 		}
 
 		// Determinar o cliente HTTP a ser usado (com ou sem proxy)
@@ -246,5 +264,112 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 		return finalRespData
 	}
 	return finalRespData
+}
+
+// performSimulatedRequest generates a mock response based on the request data.
+// This is used to test the tool's logic without making real network requests.
+func (c *Client) performSimulatedRequest(reqData ClientRequestData) ClientResponseData {
+	simMutex.Lock()
+	defer simMutex.Unlock()
+
+	u, _ := url.Parse(reqData.URL)
+	// Use a consistent key for state: the hostname.
+	stateKey := u.Host
+
+	body := ""
+	headers := http.Header{}
+	statusCode := 200
+	
+	// Default cache headers that indicate a cacheable response
+	headers.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	headers.Set("Content-Type", "text/html")
+	headers.Set("Cache-Control", "public, max-age=3600")
+
+	// --- Logic to detect probe type and manage state ---
+	isPoisoningProbeA := false
+	var poisonValue string
+
+	// Check for header poisoning payload
+	if fwdHost := reqData.RequestHeaders.Get("X-Forwarded-Host"); fwdHost != "" {
+		isPoisoningProbeA = true
+		poisonValue = fwdHost
+		body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonValue + "</p>"
+	}
+
+	// Check for param poisoning payload
+	if utmContent := u.Query().Get("utm_content"); utmContent != "" {
+		isPoisoningProbeA = true
+		poisonValue = utmContent
+		body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonValue + "</p>"
+	}
+
+	// Check for cache deception payload by looking for the path mutations used in performDeceptionTests
+	mutatedPath := u.Path
+	if strings.HasSuffix(mutatedPath, `\`) || strings.HasSuffix(mutatedPath, `;`) || strings.HasSuffix(mutatedPath, `#`) || strings.HasSuffix(mutatedPath, `/.`) || strings.HasSuffix(mutatedPath, `//`) {
+		isPoisoningProbeA = true
+		// The "poison" is the content of the page that shouldn't be cached for the base path.
+		poisonValue = "<h1>Cache Deception Content</h1>"
+		body = poisonValue
+		// The stateKey is already set to the host, which correctly isolates the test.
+	}
+	
+
+	if isPoisoningProbeA {
+		// This is Probe A. Store the value and return a MISS.
+		simulationState[stateKey] = poisonValue
+		headers.Set("X-Cache", "MISS")
+		headers.Set("Age", "0")
+		c.logger.Debugf("[SIMULATOR] Stored state for key '%s': '%s'", stateKey, poisonValue)
+	} else {
+		// This is Probe B (or a baseline request). Check for a poisoned state.
+		if poisonedValue, ok := simulationState[stateKey]; ok {
+			// State found! This is a poisoned cache hit.
+			headers.Set("X-Cache", "HIT")
+			headers.Set("Age", "10")
+			
+			// Craft body based on the stored poisoned value
+			if strings.Contains(poisonedValue, "<h1>Cache Deception Content</h1>") {
+				body = poisonedValue
+			} else if strings.HasPrefix(poisonedValue, "hemlock-header-") {
+				body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonedValue + "</p>"
+			} else if strings.HasPrefix(poisonedValue, "hemlock-paramval") {
+				body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonedValue + "</p>"
+			} else {
+				body = "<h1>Poisoned Page</h1><p>" + poisonedValue + "</p>"
+			}
+
+			delete(simulationState, stateKey) // Clean up state after use
+			c.logger.Debugf("[SIMULATOR] Hit and cleared state for key '%s'. Reflected value.", stateKey)
+		} else {
+			// No state found. This is a normal MISS or a HIT on un-poisoned content.
+			body = "<h1>Baseline Page for " + u.Host + "</h1>"
+			headers.Set("X-Cache", "MISS") 
+			headers.Set("Age", "0")
+			c.logger.Debugf("[SIMULATOR] No state for key '%s'. Treating as baseline.", stateKey)
+		}
+	}
+	
+	// Set a default status code if the host is not one of our test cases
+	if u.Host != "deception.test" && u.Host != "header-poisoning.test" && u.Host != "param-poisoning.test" && u.Host != "control.test" {
+		if !isPoisoningProbeA {
+			body = "<h1>Default Simulated Page</h1>"
+			statusCode = 404
+		}
+	}
+
+
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Header:     headers,
+		Body:       ioutil.NopCloser(bytes.NewBufferString(body)),
+		Request:    &http.Request{Method: reqData.Method, URL: u},
+	}
+
+	return ClientResponseData{
+		Response:    resp,
+		Body:        []byte(body),
+		RespHeaders: headers,
+		Error:       nil,
+	}
 }
 

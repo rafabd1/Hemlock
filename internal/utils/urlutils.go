@@ -182,14 +182,14 @@ func PreprocessAndGroupURLs(rawURLs []string, cfg *config.Config, logger Logger)
 				normalizedPathForGrouping += "/"
 			}
 		} else {
-			// For root ("/") or single segment paths (e.g., "/segment"), use the cleaned path as is.
-			// Ensure single segment paths also end with a slash if they are meant to represent a directory-like base.
-			// Example: /segment -> /segment/
-			// Root "/" should remain "/"
-			if cleanedPath != "/" && !strings.HasSuffix(cleanedPath, "/") {
+			// For root ("/") or single-segment paths.
+			// If it looks like a directory (no '.' in the last part), add a trailing slash for consistency.
+			// If it looks like a file (e.g., /index.html), keep it as is.
+			lastSegment := path.Base(cleanedPath)
+			if cleanedPath != "/" && !strings.HasSuffix(cleanedPath, "/") && !strings.Contains(lastSegment, ".") {
 				normalizedPathForGrouping = cleanedPath + "/"
 			} else {
-				normalizedPathForGrouping = cleanedPath // Already ends with / or is "/"
+				normalizedPathForGrouping = cleanedPath
 			}
 		}
 		
