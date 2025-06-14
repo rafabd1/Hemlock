@@ -1,0 +1,80 @@
+name: Release Hemlock
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24'
+          
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+        
+      - name: Build for all platforms
+        run: |
+          # Build for Windows
+          GOOS=windows GOARCH=amd64 go build -ldflags "-X main.version=${{ env.VERSION }}" -o hemlock-${{ env.VERSION }}-windows-amd64.exe ./cmd/hemlock/
+          
+          # Build for Linux
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=${{ env.VERSION }}" -o hemlock-${{ env.VERSION }}-linux-amd64 ./cmd/hemlock/
+          
+          # Build for macOS (Intel)
+          GOOS=darwin GOARCH=amd64 go build -ldflags "-X main.version=${{ env.VERSION }}" -o hemlock-${{ env.VERSION }}-darwin-amd64 ./cmd/hemlock/
+
+          # Build for macOS (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags "-X main.version=${{ env.VERSION }}" -o hemlock-${{ env.VERSION }}-darwin-arm64 ./cmd/hemlock/
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Hemlock v${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          files: |
+            hemlock-${{ env.VERSION }}-windows-amd64.exe
+            hemlock-${{ env.VERSION }}-linux-amd64
+            hemlock-${{ env.VERSION }}-darwin-amd64
+            hemlock-${{ env.VERSION }}-darwin-arm64
+          body: |
+            # Hemlock v${{ env.VERSION }}
+
+            This is the initial release of Hemlock, a powerful and fast tool for detecting Web Cache Poisoning vulnerabilities.
+
+            ## Core Features
+            - **Multi-faceted Scanning**: Detects cache poisoning vulnerabilities via unkeyed headers, unkeyed parameters, and cache deception techniques.
+            - **Two-Phase Analysis**: A robust two-phase process first identifies cacheable targets and then performs in-depth probing for vulnerabilities.
+            - **Concurrent Architecture**: Leverages Go's concurrency to perform fast, parallel scans across multiple targets and probes.
+            - **Domain-Aware Rate Limiting**: Smartly manages request rates per domain to avoid being blocked.
+            - **Simulation Mode**: Includes a `--simulate` flag to test the tool's logic and analysis engine without sending real network requests, perfect for CI/CD and debugging.
+            - **Flexible Configuration**: Highly configurable via CLI flags for concurrency, timeouts, test modes, custom headers, and more.
+            - **Multiple Output Formats**: Supports both `text` and `json` output formats for easy integration with other tools.
+
+            ## Installation
+            
+            Download the appropriate binary for your platform from the assets below and make it executable.
+            
+            For Go users:
+            ```
+            go install github.com/rafabd1/Hemlock/cmd/hemlock@latest
+            ``` 

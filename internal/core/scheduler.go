@@ -205,7 +205,7 @@ func (s *Scheduler) StartScan() []*report.Finding {
 	// pendingJobsQueue será inicializado após calcularmos os jobs da Fase 1 ou um total preliminar.
 
 	// --- PHASE 1: Cacheability Checks ---
-	s.logger.Infof("Scheduler: Starting Phase 1 - Cacheability Checks for %d unique base URLs.", len(uniqueBaseURLs))
+	s.logger.Infof("Starting Phase 1 - Cacheability Checks for %d unique base URLs.", len(uniqueBaseURLs))
 	s.confirmedCacheableBaseURLs = make(map[string]bool)
 	
 	var phase1Jobs []TargetURLJob

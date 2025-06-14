@@ -19,8 +19,11 @@ import (
 	"github.com/spf13/viper"
 )
 
-var cfg config.Config
-var logger utils.Logger
+var (
+	cfg     config.Config
+	logger  utils.Logger
+	version = "dev" // This will be overwritten by goreleaser or build flags
+)
 
 const defaultWordlistDir = "wordlists"
 const defaultHeadersFilename = "headers.txt"
@@ -295,7 +298,6 @@ Uses probing techniques to verify if injected payloads are reflected and cached.
   | |  | |  __/ | | | | | | (_) | (__|   < 
   |_|  |_|\___|_| |_| |_|_|\___/ \___|_|\_\
 `
-			version := "v0.1.0" // Atualizar conforme necessário
 			author := "github.com/rafabd1"
 
 			// Apply color to the banner string
