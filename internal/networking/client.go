@@ -1,7 +1,6 @@
 package networking
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -265,110 +264,100 @@ func (c *Client) PerformRequest(reqData ClientRequestData) ClientResponseData {
 	return finalRespData
 }
 
-// performSimulatedRequest generates a mock response based on the request data.
-// This is used to test the tool's logic without making real network requests.
+// performSimulatedRequest handles requests when the --simulate flag is active.
+// It mimics the behavior of a cache being poisoned and serving stale content.
 func (c *Client) performSimulatedRequest(reqData ClientRequestData) ClientResponseData {
 	simMutex.Lock()
 	defer simMutex.Unlock()
 
+	// Use a normalized path (without query params) as the key for our state map
 	u, _ := url.Parse(reqData.URL)
-	// Use a consistent key for state: the hostname.
-	stateKey := u.Host
+	pathKey := u.Scheme + "://" + u.Host + u.Path
 
-	body := ""
-	headers := http.Header{}
-	statusCode := 200
-	
-	// Default cache headers that indicate a cacheable response
-	headers.Set("Date", time.Now().UTC().Format(http.TimeFormat))
-	headers.Set("Content-Type", "text/html")
-	headers.Set("Cache-Control", "public, max-age=3600")
+	var injectedValue string
 
-	// --- Logic to detect probe type and manage state ---
-	isPoisoningProbeA := false
-	var poisonValue string
-
-	// Check for header poisoning payload
-	if fwdHost := reqData.RequestHeaders.Get("X-Forwarded-Host"); strings.HasPrefix(fwdHost, "hemlock-") {
-		isPoisoningProbeA = true
-		poisonValue = fwdHost
-		body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonValue + "</p>"
-	}
-
-	// Check for param poisoning payload
-	if utmContent := u.Query().Get("utm_content"); strings.HasPrefix(utmContent, "hemlock-") {
-		isPoisoningProbeA = true
-		poisonValue = utmContent
-		body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonValue + "</p>"
-	}
-
-	// Check for cache deception payload by looking for the path mutations used in performDeceptionTests
-	mutatedPath := u.Path
-	if strings.HasSuffix(mutatedPath, `\`) || strings.HasSuffix(mutatedPath, `;`) || strings.HasSuffix(mutatedPath, `#`) || strings.HasSuffix(mutatedPath, `/.`) || strings.HasSuffix(mutatedPath, `//`) {
-		isPoisoningProbeA = true
-		// The "poison" is the content of the page that shouldn't be cached for the base path.
-		poisonValue = "<h1>Cache Deception Content</h1>"
-		body = poisonValue
-		// The stateKey is already set to the host, which correctly isolates the test.
-	}
-	
-
-	if isPoisoningProbeA {
-		// This is Probe A. Store the value and return a MISS.
-		simulationState[stateKey] = poisonValue
-		headers.Set("X-Cache", "MISS")
-		headers.Set("Age", "0")
-		c.logger.Debugf("[SIMULATOR] Stored state for key '%s': '%s'", stateKey, poisonValue)
-	} else {
-		// This is Probe B (or a baseline request). Check for a poisoned state.
-		if poisonedValue, ok := simulationState[stateKey]; ok {
-			// State found! This is a poisoned cache hit.
-			headers.Set("X-Cache", "HIT")
-			headers.Set("Age", "10")
-			
-			// Craft body based on the stored poisoned value
-			if strings.Contains(poisonedValue, "<h1>Cache Deception Content</h1>") {
-				body = poisonedValue
-			} else if strings.HasPrefix(poisonedValue, "hemlock-header-") {
-				body = "<h1>Header Poisoning Test</h1><p>Reflected Host: " + poisonedValue + "</p>"
-			} else if strings.HasPrefix(poisonedValue, "hemlock-param") {
-				body = "<h1>Param Poisoning Test</h1><p>Content: " + poisonedValue + "</p>"
-			} else {
-				body = "<h1>Poisoned Page</h1><p>" + poisonedValue + "</p>"
+	// Check if this request is a "Probe A" (attempting to poison)
+	for _, headerValues := range reqData.CustomHeaders {
+		for _, headerValue := range headerValues {
+			if strings.HasPrefix(headerValue, c.config.DefaultPayloadPrefix) {
+				injectedValue = headerValue
+				break
 			}
+		}
+		if injectedValue != "" {
+			break
+		}
+	}
 
-			delete(simulationState, stateKey) // Clean up state after use
-			c.logger.Debugf("[SIMULATOR] Hit and cleared state for key '%s'. Reflected value.", stateKey)
-		} else {
-			// No state found. This is a normal MISS or a HIT on un-poisoned content.
-			body = "<h1>Baseline Page for " + u.Host + "</h1>"
-			headers.Set("X-Cache", "MISS") 
-			headers.Set("Age", "0")
-			c.logger.Debugf("[SIMULATOR] No state for key '%s'. Treating as baseline.", stateKey)
+	// Also check for parameters trying to poison
+	for _, paramValue := range u.Query() {
+		if len(paramValue) > 0 && strings.HasPrefix(paramValue[0], c.config.DefaultPayloadPrefix) {
+			injectedValue = paramValue[0]
+			break
 		}
 	}
 	
-	// Set a default status code if the host is not one of our test cases
-	if u.Host != "deception.test" && u.Host != "header-poisoning.test" && u.Host != "param-poisoning.test" && u.Host != "control.test" {
-		if !isPoisoningProbeA {
-			body = "<h1>Default Simulated Page</h1>"
-			statusCode = 404
+	// Case 1: This is Probe A - it contains a poison payload.
+	if injectedValue != "" {
+		c.logger.Debugf("[SIMULATE] Poisoning request detected for path '%s' with value '%s'. Storing state.", pathKey, injectedValue)
+		// Store the poison value for this path
+		simulationState[pathKey] = injectedValue
+
+		// Return a response that reflects the payload.
+		// This simulates the backend processing the unkeyed input.
+		body := fmt.Sprintf("<html><body><h1>Welcome!</h1><p>Reflected content: %s</p></body></html>", injectedValue)
+		resp := &http.Response{
+			StatusCode: 200,
+			Status:     "200 OK",
+			Header: http.Header{
+				"Content-Type":   []string{"text/html"},
+				"Cache-Control":  []string{"public, max-age=3600"},
+				"X-Cache":        []string{"MISS"},
+				"Content-Length": []string{fmt.Sprintf("%d", len(body))},
+			},
 		}
+		return ClientResponseData{Response: resp, Body: []byte(body), RespHeaders: resp.Header, Error: nil}
 	}
 
+	// Case 2: This is Probe B or a baseline request - no poison payload in the request itself.
+	// Check if there is poisoned state for this path.
+	if poisonedValue, ok := simulationState[pathKey]; ok {
+		c.logger.Debugf("[SIMULATE] State found for path '%s'. Returning POISONED response with CACHE HIT.", pathKey)
+		
+		// This is the crucial part. We are simulating a cache HIT.
+		// The response body contains the *poisoned* value from the previous request,
+		// and the headers indicate a cache hit.
+		body := fmt.Sprintf("<html><body><h1>Welcome!</h1><p>Reflected content: %s</p></body></html>", poisonedValue)
+		resp := &http.Response{
+			StatusCode: 200,
+			Status:     "200 OK",
+			Header: http.Header{
+				"Content-Type":   []string{"text/html"},
+				"Cache-Control":  []string{"public, max-age=3600"},
+				"X-Cache":        []string{"HIT"}, // <-- Key Change: Indicate a HIT
+				"Age":            []string{"10"},  // <-- Key Change: Show it's from cache
+				"Content-Length": []string{fmt.Sprintf("%d", len(body))},
+			},
+		}
+		// Clear the state after serving it once to ensure the next baseline is clean.
+		// delete(simulationState, pathKey)
+		return ClientResponseData{Response: resp, Body: []byte(body), RespHeaders: resp.Header, Error: nil}
+	}
 
+	// Case 3: No poison payload in request and no poisoned state exists.
+	// This is a normal baseline request.
+	c.logger.Debugf("[SIMULATE] No state for path '%s'. Returning clean baseline response.", pathKey)
+	body := "<html><body><h1>Welcome!</h1><p>This is the default page.</p></body></html>"
 	resp := &http.Response{
-		StatusCode: statusCode,
-		Header:     headers,
-		Body:       io.NopCloser(bytes.NewBufferString(body)),
-		Request:    &http.Request{Method: reqData.Method, URL: u},
+		StatusCode: 200,
+		Status:     "200 OK",
+		Header: http.Header{
+			"Content-Type":   []string{"text/html"},
+			"Cache-Control":  []string{"public, max-age=3600"},
+			"X-Cache":        []string{"MISS"},
+			"Content-Length": []string{fmt.Sprintf("%d", len(body))},
+		},
 	}
-
-	return ClientResponseData{
-		Response:    resp,
-		Body:        []byte(body),
-		RespHeaders: headers,
-		Error:       nil,
-	}
+	return ClientResponseData{Response: resp, Body: []byte(body), RespHeaders: resp.Header, Error: nil}
 }
 
